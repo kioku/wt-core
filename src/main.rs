@@ -2,6 +2,7 @@ mod cli;
 mod domain;
 mod error;
 mod git;
+mod output;
 
 use clap::Parser;
 
