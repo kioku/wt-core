@@ -12,7 +12,12 @@ fn add_creates_worktree_and_branch() {
     let repo = fixtures::TestRepo::new();
 
     let output = wt_core()
-        .args(["add", "feature/login", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "feature/login",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success()
         .get_output()
@@ -89,13 +94,23 @@ fn add_fails_when_branch_exists() {
 
     // Create branch first
     wt_core()
-        .args(["add", "dupe-branch", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "dupe-branch",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success();
 
     // Second add should fail
     wt_core()
-        .args(["add", "dupe-branch", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "dupe-branch",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .failure()
         .code(5) // Conflict exit code
@@ -142,7 +157,12 @@ fn remove_deletes_worktree_and_branch() {
 
     // Add a worktree first
     wt_core()
-        .args(["add", "to-remove", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "to-remove",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success();
 
@@ -188,7 +208,12 @@ fn remove_json_includes_removed_path() {
     let repo = fixtures::TestRepo::new();
 
     wt_core()
-        .args(["add", "json-rm", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "json-rm",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success();
 

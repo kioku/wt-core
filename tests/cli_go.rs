@@ -13,13 +13,23 @@ fn go_resolves_existing_worktree() {
 
     // Create a worktree first
     wt_core()
-        .args(["add", "go-target", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "go-target",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success();
 
     // Go should resolve it
     let output = wt_core()
-        .args(["go", "go-target", "--repo", &repo.path().display().to_string()])
+        .args([
+            "go",
+            "go-target",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success()
         .get_output()
@@ -64,7 +74,12 @@ fn go_json_returns_structured_response() {
     let repo = fixtures::TestRepo::new();
 
     wt_core()
-        .args(["add", "go-json", "--repo", &repo.path().display().to_string()])
+        .args([
+            "add",
+            "go-json",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
         .assert()
         .success();
 
