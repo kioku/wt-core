@@ -47,6 +47,7 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             remove_fmt(json, print_paths),
         ),
+        Command::Init { shell } => cmd_init(&shell),
         Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
     }
 }
@@ -214,6 +215,22 @@ fn cmd_remove(
     if let Some(w) = &result.warning {
         eprintln!("warning: {w}");
     }
+    Ok(())
+}
+
+fn cmd_init(shell: &str) -> Result<()> {
+    let script = match shell {
+        "bash" => include_str!("../bindings/bash/wt.bash"),
+        "zsh" => include_str!("../bindings/zsh/wt.zsh"),
+        "fish" => include_str!("../bindings/fish/wt.fish"),
+        "nu" => include_str!("../bindings/nu/wt.nu"),
+        _ => {
+            return Err(AppError::usage(format!(
+                "unknown shell '{shell}'. Supported shells: bash, zsh, fish, nu"
+            )));
+        }
+    };
+    print!("{script}");
     Ok(())
 }
 
