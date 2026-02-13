@@ -5,6 +5,20 @@ edition = "2021"
 rust-version = "1.75"
 description = "Portable Git worktree lifecycle manager"
 license = "MIT"
+authors = ["kioku"]
+repository = "https://github.com/kioku/wt-core"
+homepage = "https://github.com/kioku/wt-core"
+documentation = "https://github.com/kioku/wt-core#readme"
+readme = "README.md"
+keywords = ["git", "worktree", "cli", "developer-tools"]
+categories = ["command-line-utilities", "development-tools"]
+exclude = [
+    ".github/",
+    ".ast-grep/",
+    "scripts/",
+    "sgconfig.yml",
+    "AGENTS.md",
+]
 
 [[bin]]
 name = "wt-core"
