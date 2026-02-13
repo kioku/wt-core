@@ -38,7 +38,8 @@ fn init_nu_emits_binding() {
         .args(["init", "nu"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("export def"));
+        .stdout(predicate::str::contains("def wt ["))
+        .stdout(predicate::str::contains("export def \"wt list\""));
 }
 
 #[test]

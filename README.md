@@ -63,12 +63,19 @@ JSON envelope:
 
 Each binding wraps the binary and handles `cd` in the parent shell.
 
+You can either source files from `bindings/` directly, or generate them with
+`wt-core init <shell>`.
+
 <details>
 <summary><strong>Nushell</strong></summary>
 
+```bash
+wt-core init nu > ~/.config/nushell/wt.nu
+```
+
 ```nu
 # ~/.config/nushell/config.nu
-source path/to/bindings/nu/wt.nu
+source ~/.config/nushell/wt.nu
 ```
 </details>
 
@@ -76,8 +83,8 @@ source path/to/bindings/nu/wt.nu
 <summary><strong>Bash</strong></summary>
 
 ```bash
-# ~/.bashrc
-source path/to/bindings/bash/wt.bash
+wt-core init bash > ~/.config/wt/wt.bash
+echo 'source ~/.config/wt/wt.bash' >> ~/.bashrc
 ```
 </details>
 
@@ -85,8 +92,8 @@ source path/to/bindings/bash/wt.bash
 <summary><strong>Zsh</strong></summary>
 
 ```zsh
-# ~/.zshrc
-source path/to/bindings/zsh/wt.zsh
+wt-core init zsh > ~/.config/wt/wt.zsh
+echo 'source ~/.config/wt/wt.zsh' >> ~/.zshrc
 ```
 </details>
 
@@ -94,8 +101,7 @@ source path/to/bindings/zsh/wt.zsh
 <summary><strong>Fish</strong></summary>
 
 ```fish
-# ~/.config/fish/conf.d/wt.fish
-source path/to/bindings/fish/wt.fish
+wt-core init fish > ~/.config/fish/conf.d/wt.fish
 ```
 </details>
 

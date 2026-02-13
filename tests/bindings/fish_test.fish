@@ -25,6 +25,7 @@ end
 # ── Setup ────────────────────────────────────────────────────────────
 git init "$WORK/repo" >/dev/null 2>&1
 cd "$WORK/repo"
+set REPO_PATH (realpath "$PWD")
 git config user.name  "test"
 git config user.email "test@test.com"
 git commit --allow-empty -m "initial" >/dev/null 2>&1
@@ -39,7 +40,7 @@ else
     fail "wt add: expected cwd inside .worktrees/…feat-one…, got $PWD"
 end
 
-set WT_PATH "$PWD"
+set WT_PATH (realpath "$PWD")
 
 # ── wt list ──────────────────────────────────────────────────────────
 set output (wt list 2>&1)
@@ -50,20 +51,20 @@ else
 end
 
 # ── wt go ────────────────────────────────────────────────────────────
-cd "$WORK/repo"
+cd "$REPO_PATH"
 wt go feat-one >/dev/null 2>&1
-if test "$PWD" = "$WT_PATH"
+if test (realpath "$PWD") = "$WT_PATH"
     pass "wt go: cd into existing worktree"
 else
-    fail "wt go: expected $WT_PATH, got $PWD"
+    fail "wt go: expected $WT_PATH, got "(realpath "$PWD")
 end
 
 # ── wt remove (from inside worktree) ────────────────────────────────
 wt remove feat-one 2>&1
-if test "$PWD" = "$WORK/repo"
+if test (realpath "$PWD") = "$REPO_PATH"
     pass "wt remove: cd back to repo root"
 else
-    fail "wt remove: expected $WORK/repo, got $PWD"
+    fail "wt remove: expected $REPO_PATH, got "(realpath "$PWD")
 end
 
 if not test -d "$WT_PATH"

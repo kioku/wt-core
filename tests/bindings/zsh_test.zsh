@@ -17,6 +17,7 @@ fail() { printf '  ✗ %s\n' "$1"; exit 1 }
 # ── Setup ────────────────────────────────────────────────────────────
 git init "$WORK/repo" >/dev/null 2>&1
 cd "$WORK/repo"
+REPO_PATH="$(pwd -P)"
 git config user.name  "test"
 git config user.email "test@test.com"
 git commit --allow-empty -m "initial" >/dev/null 2>&1
@@ -29,7 +30,7 @@ wt add feat-one >/dev/null 2>&1
     && pass "wt add: cd into new worktree" \
     || fail "wt add: expected cwd inside .worktrees/…feat-one…, got $PWD"
 
-WT_PATH="$PWD"
+WT_PATH="$(pwd -P)"
 
 # ── wt list ──────────────────────────────────────────────────────────
 output=$(wt list 2>&1)
@@ -38,17 +39,17 @@ echo "$output" | grep -q "feat-one" \
     || fail "wt list: 'feat-one' not found in output"
 
 # ── wt go ────────────────────────────────────────────────────────────
-cd "$WORK/repo"
+cd "$REPO_PATH"
 wt go feat-one >/dev/null 2>&1
-[[ "$PWD" == "$WT_PATH" ]] \
+[[ "$(pwd -P)" == "$WT_PATH" ]] \
     && pass "wt go: cd into existing worktree" \
-    || fail "wt go: expected $WT_PATH, got $PWD"
+    || fail "wt go: expected $WT_PATH, got $(pwd -P)"
 
 # ── wt remove (from inside worktree) ────────────────────────────────
 wt remove feat-one 2>&1
-[[ "$PWD" == "$WORK/repo" ]] \
+[[ "$(pwd -P)" == "$REPO_PATH" ]] \
     && pass "wt remove: cd back to repo root" \
-    || fail "wt remove: expected $WORK/repo, got $PWD"
+    || fail "wt remove: expected $REPO_PATH, got $(pwd -P)"
 
 [[ ! -d "$WT_PATH" ]] \
     && pass "wt remove: worktree directory deleted" \

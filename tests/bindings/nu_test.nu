@@ -2,7 +2,7 @@
 # Integration tests for the Nushell binding.
 # Requires wt-core on PATH.
 
-use ../../bindings/nu/wt.nu *
+source ../../bindings/nu/wt.nu
 
 def pass [msg: string] { print $"  ✓ ($msg)" }
 def fail [msg: string] { print $"  ✗ ($msg)"; exit 1 }
@@ -16,6 +16,21 @@ cd $"($work)/repo"
 ^git commit --allow-empty -m "initial" o+e>| ignore
 
 print "Running nu binding tests..."
+
+# ── wt / wt --help ───────────────────────────────────────────────────
+let root_output = (wt)
+if ($root_output | str contains "Portable Git worktree lifecycle manager") {
+    pass "wt: root command available"
+} else {
+    fail "wt: missing expected core help output"
+}
+
+let help_output = (wt --help)
+if ($help_output | str contains "wt add") and ($help_output | str contains "Subcommands") {
+    pass "wt --help: root command help available"
+} else {
+    fail "wt --help: missing expected command help output"
+}
 
 # ── wt add ───────────────────────────────────────────────────────────
 wt add feat-one
@@ -46,10 +61,12 @@ if $env.PWD == $wt_path {
 
 # ── wt remove (from inside worktree) ────────────────────────────────
 wt remove feat-one
-if $env.PWD == $"($work)/repo" {
+let expected_repo = ($"($work)/repo" | path expand)
+let actual_pwd = ($env.PWD | path expand)
+if $actual_pwd == $expected_repo {
     pass "wt remove: cd back to repo root"
 } else {
-    fail $"wt remove: expected ($work)/repo, got ($env.PWD)"
+    fail $"wt remove: expected ($expected_repo), got ($actual_pwd)"
 }
 
 if not ($wt_path | path exists) {

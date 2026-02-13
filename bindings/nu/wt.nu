@@ -2,6 +2,21 @@
 # Source this file in your config.nu:
 #   source path/to/bindings/nu/wt.nu
 
+# Root entrypoint (for `wt` / `wt --help` ergonomics).
+#
+# Intentionally non-exported: Nushell disallows exporting a command with the
+# same name as the module (`wt`). This still works when sourced, which is the
+# intended integration path (`wt-core init nu`).
+def wt [
+    ...args: string  # Optional passthrough args for wt-core
+] {
+    if ($args | is-empty) {
+        ^wt-core --help
+    } else {
+        ^wt-core ...$args
+    }
+}
+
 # List all worktrees
 export def "wt list" [
     --repo: path  # Repository path (defaults to cwd)
