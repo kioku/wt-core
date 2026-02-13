@@ -51,7 +51,11 @@ pub enum Command {
     /// Switch to an existing worktree
     Go {
         /// Branch name of the worktree to switch to
-        branch: String,
+        branch: Option<String>,
+
+        /// Force the interactive picker
+        #[arg(short, long)]
+        interactive: bool,
 
         /// Repository path (defaults to current directory)
         #[arg(long)]
