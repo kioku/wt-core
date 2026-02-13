@@ -20,23 +20,34 @@
       packages = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
+          fs = pkgs.lib.fileset;
+          src = fs.toSource {
+            root = ./.;
+            fileset = fs.unions [
+              ./Cargo.toml
+              ./Cargo.lock
+              ./src
+              ./tests
+              ./bindings
+            ];
+          };
         in
         {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "wt-core";
-            version = "0.1.0";
+            version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
 
-            src = ./.;
+            inherit src;
 
             cargoLock.lockFile = ./Cargo.lock;
 
-            nativeBuildInputs = [ pkgs.git ];
-
-            propagatedBuildInputs = [ pkgs.git ];
+            nativeBuildInputs = [ pkgs.git pkgs.makeWrapper ];
 
             postInstall = ''
               mkdir -p $out/share/wt-core
               cp -r bindings $out/share/wt-core/bindings
+              wrapProgram $out/bin/wt-core \
+                --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
             '';
 
             meta = with pkgs.lib; {
