@@ -115,8 +115,9 @@ jobs:
       - name: Generate coverage
         run: cargo llvm-cov --lcov --output-path target/coverage.lcov
 
-      - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
         with:
-          name: coverage-lcov
-          path: target/coverage.lcov
+          files: target/coverage.lcov
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: true
