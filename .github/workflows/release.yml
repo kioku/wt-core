@@ -85,6 +85,8 @@ jobs:
             os: macos-latest
           - target: aarch64-apple-darwin
             os: macos-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -106,18 +108,30 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package
+      - name: Package (unix)
+        if: runner.os != 'Windows'
         run: |
           mkdir -p staging
           cp target/${{ matrix.target }}/release/wt-core staging/
           cp LICENSE README.md staging/
           tar -czf wt-core-${{ needs.validate.outputs.version }}-${{ matrix.target }}.tar.gz -C staging .
 
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p staging
+          cp target/${{ matrix.target }}/release/wt-core.exe staging/
+          cp LICENSE README.md staging/
+          cd staging && 7z a ../wt-core-${{ needs.validate.outputs.version }}-${{ matrix.target }}.zip *
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: wt-core-${{ matrix.target }}
-          path: wt-core-*.tar.gz
+          path: |
+            wt-core-*.tar.gz
+            wt-core-*.zip
 
   # ── Publish to crates.io ───────────────────────────────────────────
   publish:
