@@ -58,5 +58,6 @@ if not ($wt_path | path exists) {
     fail $"wt remove: ($wt_path) still exists"
 }
 
+cd /tmp
 ^rm -rf $work
 print "All nu binding tests passed."
