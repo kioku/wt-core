@@ -211,6 +211,9 @@ fn cmd_remove(
             println!("Removed worktree and branch '{branch_name}' ({removed_str})");
         }
     }
+    if let Some(w) = &result.warning {
+        eprintln!("warning: {w}");
+    }
     Ok(())
 }
 

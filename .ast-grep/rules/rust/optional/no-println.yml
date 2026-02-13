@@ -26,6 +26,8 @@ ignores:
   - "**/benches/**"
   # CLI binary with user-facing output
   - "**/src/main.rs"
+  - "**/src/commands.rs"
+  - "**/src/output.rs"
 
 rule:
   any:

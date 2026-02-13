@@ -23,6 +23,8 @@ pub struct RemoveResult {
     pub removed_path: PathBuf,
     pub branch: BranchName,
     pub repo_root: PathBuf,
+    /// Non-fatal warning (e.g. branch deletion failed after worktree removal).
+    pub warning: Option<String>,
 }
 
 /// Diagnostic from the `doctor` command.
@@ -137,15 +139,16 @@ pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Resu
 
     // Remove worktree first, then branch.
     git::remove_worktree(repo, &removed_path, force)?;
-    // Branch deletion: best-effort — warn on failure instead of blocking.
-    if let Err(e) = git::delete_branch(repo, &target_branch, force) {
-        eprintln!("warning: worktree removed but branch deletion failed: {e}");
-    }
+    // Branch deletion: best-effort — bubble warning instead of blocking.
+    let warning = git::delete_branch(repo, &target_branch, force)
+        .err()
+        .map(|e| format!("worktree removed but branch deletion failed: {e}"));
 
     Ok(RemoveResult {
         removed_path,
         branch: target_branch,
         repo_root: repo.to_path_buf(),
+        warning,
     })
 }
 
