@@ -88,6 +88,12 @@ pub enum Command {
         print_paths: bool,
     },
 
+    /// Print shell bindings to stdout
+    Init {
+        /// Shell to generate bindings for (bash, zsh, fish, nu)
+        shell: String,
+    },
+
     /// Diagnose worktree and repository health
     Doctor {
         /// Repository path (defaults to current directory)
