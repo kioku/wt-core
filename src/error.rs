@@ -16,6 +16,9 @@ pub enum ExitCode {
     Invariant = 4,
     /// 5 — state conflict (dirty worktree, existing path, branch conflict)
     Conflict = 5,
+    // Note: exit code 130 (128 + SIGINT) is used for interactive picker
+    // cancellation (Esc / Ctrl-C) via std::process::exit(130) in commands.rs.
+    // It is not modeled here because it bypasses the error-handling path.
 }
 
 impl From<ExitCode> for process::ExitCode {

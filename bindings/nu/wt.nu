@@ -36,16 +36,23 @@ export def --env "wt add" [
 
 # Switch to an existing worktree
 export def --env "wt go" [
-    branch: string  # Branch name of the worktree
-    --repo: path    # Repository path (defaults to cwd)
-    --json          # Output as JSON (no cd)
+    branch?: string       # Branch name (omit for interactive picker)
+    --repo: path          # Repository path (defaults to cwd)
+    --json                # Output as JSON (no cd)
+    --interactive(-i)     # Force the interactive picker (skip auto-select)
 ] {
+    mut args = ["go"]
+    if $branch != null { $args = ($args | append $branch) }
+    if $interactive { $args = ($args | append "--interactive") }
+
     if $json {
-        let args = (build-args ["go" $branch] $repo true false)
-        ^wt-core ...$args | from json
+        let full_args = (build-args $args $repo true false)
+        ^wt-core ...$full_args | from json
     } else {
-        let args = (build-args ["go" $branch] $repo false true)
-        let target = (^wt-core ...$args | str trim)
+        # --print-cd-path works with the interactive picker:
+        # the picker UI renders on stderr/tty, the path goes to stdout.
+        let full_args = (build-args $args $repo false true)
+        let target = (^wt-core ...$full_args | str trim)
         cd $target
     }
 }
