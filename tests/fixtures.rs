@@ -29,7 +29,10 @@ impl TestRepo {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.dir.path().to_path_buf()
+        self.dir
+            .path()
+            .canonicalize()
+            .expect("failed to canonicalize temp dir")
     }
 }
 
