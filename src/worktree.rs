@@ -52,10 +52,8 @@ pub fn add(repo: &RepoRoot, branch: &str, base: Option<&str>) -> Result<AddResul
     }
 
     // Validate base revision if specified.
-    if let Some(rev) = base {
-        if !git::rev_exists(repo, rev) {
-            return Err(AppError::git(format!("revision '{rev}' not found")));
-        }
+    if let Some(rev) = base.filter(|rev| !git::rev_exists(repo, rev)) {
+        return Err(AppError::git(format!("revision '{rev}' not found")));
     }
 
     let wt_dir = repo.worktrees_dir().join(branch_name.to_dir_name());
@@ -170,19 +168,20 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
 
     let managed_paths: Vec<_> = worktrees.iter().map(|wt| &wt.path).collect();
 
-    if let Ok(entries) = std::fs::read_dir(&wt_dir) {
-        for entry in entries.flatten() {
-            let entry_path = entry.path();
-            if entry_path.is_dir() && !managed_paths.contains(&&entry_path) {
-                diags.push(Diagnostic {
-                    level: DiagLevel::Warn,
-                    message: format!(
-                        "orphaned directory not tracked by git: {}",
-                        entry_path.display()
-                    ),
-                });
-            }
-        }
+    let orphaned = std::fs::read_dir(&wt_dir)
+        .into_iter()
+        .flat_map(|entries| entries.flatten())
+        .map(|entry| entry.path())
+        .filter(|p| p.is_dir() && !managed_paths.contains(&p));
+
+    for orphan in orphaned {
+        diags.push(Diagnostic {
+            level: DiagLevel::Warn,
+            message: format!(
+                "orphaned directory not tracked by git: {}",
+                orphan.display()
+            ),
+        });
     }
 
     // Check each worktree has a valid branch.

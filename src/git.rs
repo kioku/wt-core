@@ -36,55 +36,75 @@ pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     parse_worktree_porcelain(&raw, repo)
 }
 
-/// Parse porcelain output from `git worktree list --porcelain`.
-fn parse_worktree_porcelain(raw: &str, repo: &RepoRoot) -> Result<Vec<Worktree>> {
-    let mut worktrees = Vec::new();
+/// A raw worktree entry parsed from porcelain lines.
+struct RawEntry {
+    path: PathBuf,
+    commit: String,
+    branch: Option<String>,
+    is_bare: bool,
+}
+
+/// Parse a single porcelain block (lines between blank separators).
+fn parse_porcelain_block(block: &str) -> Option<RawEntry> {
     let mut path: Option<PathBuf> = None;
     let mut commit = String::new();
-    let mut branch: Option<String> = None;
+    let mut branch = None;
     let mut is_bare = false;
 
-    for line in raw.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            path = Some(PathBuf::from(p));
-            commit.clear();
-            branch = None;
-            is_bare = false;
-        } else if let Some(h) = line.strip_prefix("HEAD ") {
-            commit = h[..7.min(h.len())].to_string();
-        } else if let Some(b) = line.strip_prefix("branch ") {
-            // branch is like refs/heads/main
-            branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
-        } else if line == "bare" {
-            is_bare = true;
-        } else if line.is_empty() {
-            if let Some(wt_path) = path.take() {
-                if is_bare {
-                    continue;
-                }
-                let is_main = wt_path == repo.0;
-                worktrees.push(Worktree {
-                    path: wt_path,
-                    branch: branch.take(),
-                    commit: commit.clone(),
-                    is_main,
-                });
-            }
-        }
+    for line in block.lines() {
+        apply_porcelain_line(line, &mut path, &mut commit, &mut branch, &mut is_bare);
     }
 
-    // Handle last entry if no trailing blank line.
-    if let Some(wt_path) = path.take() {
-        if !is_bare {
-            let is_main = wt_path == repo.0;
-            worktrees.push(Worktree {
-                path: wt_path,
-                branch,
-                commit,
-                is_main,
-            });
-        }
+    path.map(|p| RawEntry {
+        path: p,
+        commit,
+        branch,
+        is_bare,
+    })
+}
+
+fn apply_porcelain_line(
+    line: &str,
+    path: &mut Option<PathBuf>,
+    commit: &mut String,
+    branch: &mut Option<String>,
+    is_bare: &mut bool,
+) {
+    if let Some(p) = line.strip_prefix("worktree ") {
+        *path = Some(PathBuf::from(p));
+        return;
     }
+    if let Some(h) = line.strip_prefix("HEAD ") {
+        *commit = h[..7.min(h.len())].to_string();
+        return;
+    }
+    if let Some(b) = line.strip_prefix("branch ") {
+        *branch = Some(b.strip_prefix("refs/heads/").unwrap_or(b).to_string());
+        return;
+    }
+    if line == "bare" {
+        *is_bare = true;
+    }
+}
+
+/// Parse porcelain output from `git worktree list --porcelain`.
+fn parse_worktree_porcelain(raw: &str, repo: &RepoRoot) -> Result<Vec<Worktree>> {
+    let blocks: Vec<&str> = raw.split("\n\n").collect();
+
+    let worktrees = blocks
+        .iter()
+        .filter_map(|block| parse_porcelain_block(block))
+        .filter(|entry| !entry.is_bare)
+        .map(|entry| {
+            let is_main = entry.path == repo.0;
+            Worktree {
+                path: entry.path,
+                branch: entry.branch,
+                commit: entry.commit,
+                is_main,
+            }
+        })
+        .collect();
 
     Ok(worktrees)
 }
