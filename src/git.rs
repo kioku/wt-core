@@ -43,9 +43,21 @@ fn git(args: &[&str], cwd: &Path) -> Result<String> {
 /// Inspect git stderr to map known error patterns to the correct exit code.
 fn classify_git_error(msg: String) -> AppError {
     let lower = msg.to_lowercase();
-    if lower.contains("unmerged") || lower.contains("modified") || lower.contains("dirty") {
+
+    if lower.contains("not a git repository") {
+        return AppError::not_a_repo(msg);
+    }
+
+    if lower.contains("unmerged")
+        || lower.contains("modified")
+        || lower.contains("dirty")
+        || lower.contains("already exists")
+        || lower.contains("already checked out")
+        || lower.contains("is not fully merged")
+    {
         return AppError::conflict(msg);
     }
+
     AppError::git(msg)
 }
 
@@ -259,5 +271,45 @@ bare
         let result = parse_worktree_porcelain(raw, &repo).expect("should parse");
         assert_eq!(result.len(), 1);
         assert!(result[0].is_main);
+    }
+
+    #[test]
+    fn classify_not_a_repo() {
+        let err = classify_git_error(
+            "fatal: not a git repository (or any of the parent directories)".to_string(),
+        );
+        assert_eq!(err.code, crate::error::ExitCode::NotARepo);
+    }
+
+    #[test]
+    fn classify_already_exists_is_conflict() {
+        let err = classify_git_error("fatal: 'feature/x' already exists".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_already_checked_out_is_conflict() {
+        let err = classify_git_error(
+            "fatal: 'feature/x' is already checked out at '/repo/.worktrees/feat'".to_string(),
+        );
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_not_fully_merged() {
+        let err = classify_git_error("error: the branch 'x' is not fully merged".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_dirty_is_conflict() {
+        let err = classify_git_error("error: dirty worktree, use --force".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_unknown_falls_to_git() {
+        let err = classify_git_error("fatal: something unexpected".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Git);
     }
 }
