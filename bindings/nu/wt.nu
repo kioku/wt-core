@@ -23,11 +23,11 @@ export def --env "wt add" [
     --json              # Output as JSON (no cd)
 ] {
     if $json {
-        let args = (build-args ["add" $branch] $repo true false)
+        mut args = (build-args ["add" $branch] $repo true false)
         if $base != null { $args = ($args | append ["--base" $base]) }
         ^wt-core ...$args | from json
     } else {
-        let args = (build-args ["add" $branch] $repo false true)
+        mut args = (build-args ["add" $branch] $repo false true)
         if $base != null { $args = ($args | append ["--base" $base]) }
         let target = (^wt-core ...$args | str trim)
         cd $target
@@ -63,11 +63,8 @@ export def --env "wt remove" [
     if $branch != null { $args = ($args | append $branch) }
     if $force { $args = ($args | append "--force") }
 
-    let full_args = if $json {
-        build-args $args $repo true false
-    } else {
-        build-args $args $repo true false
-    }
+    # Always use --json internally so we can inspect removed_path for cd
+    let full_args = (build-args $args $repo true false)
 
     let result = (^wt-core ...$full_args | from json)
 

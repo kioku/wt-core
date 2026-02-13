@@ -44,7 +44,7 @@ pub enum Command {
         json: bool,
 
         /// Print only the worktree path (for shell wrappers)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         print_cd_path: bool,
     },
 
@@ -62,7 +62,7 @@ pub enum Command {
         json: bool,
 
         /// Print only the worktree path (for shell wrappers)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "json")]
         print_cd_path: bool,
     },
 

@@ -27,18 +27,29 @@ function wt --description "Git worktree manager"
 
         case remove
             set -e argv[1]
+            # Detect if the caller explicitly asked for --json
+            set -l want_json false
+            for arg in $argv
+                if test "$arg" = "--json"
+                    set want_json true
+                end
+            end
+
             set -l cwd_before (pwd)
             set -l result (wt-core remove $argv --json 2>/dev/null)
             set -l rc $status
             if test $rc -eq 0
-                # Extract fields with string manipulation (no jq required)
                 set -l removed_path (echo $result | string match -r '"removed_path":\s*"([^"]*)"' | tail -1)
                 set -l repo_root (echo $result | string match -r '"repo_root":\s*"([^"]*)"' | tail -1)
                 set -l branch (echo $result | string match -r '"branch":\s*"([^"]*)"' | tail -1)
                 if string match -q "$removed_path*" "$cwd_before"
                     cd "$repo_root"; or true
                 end
-                echo "Removed worktree and branch '$branch'"
+                if test "$want_json" = true
+                    echo $result
+                else
+                    echo "Removed worktree and branch '$branch'"
+                end
             else
                 wt-core remove $argv
                 return $status
@@ -48,6 +59,6 @@ function wt --description "Git worktree manager"
             wt-core --help
 
         case '*'
-            wt-core $argv
+            wt-core $argv  # $argv still includes the subcommand
     end
 end

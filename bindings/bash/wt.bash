@@ -31,13 +31,18 @@ wt() {
             ;;
         remove)
             shift
+            # Detect if the caller explicitly asked for --json
+            local want_json=false
+            for arg in "$@"; do
+                case "$arg" in --json) want_json=true ;; esac
+            done
+
             local cwd_before
             cwd_before=$(pwd)
             local result
             result=$(wt-core remove "$@" --json 2>/dev/null)
             local rc=$?
             if [ $rc -eq 0 ]; then
-                # Check if we need to leave the removed directory
                 local removed_path repo_root branch
                 removed_path=$(printf '%s' "$result" | grep '"removed_path"' | sed 's/.*": "//;s/".*//')
                 repo_root=$(printf '%s' "$result" | grep '"repo_root"' | sed 's/.*": "//;s/".*//')
@@ -47,9 +52,12 @@ wt() {
                         cd "$repo_root" || true
                         ;;
                 esac
-                echo "Removed worktree and branch '${branch}'"
+                if [ "$want_json" = true ]; then
+                    printf '%s\n' "$result"
+                else
+                    echo "Removed worktree and branch '${branch}'"
+                fi
             else
-                # Re-run to show error
                 wt-core remove "$@"
                 return $?
             fi
@@ -58,7 +66,7 @@ wt() {
             wt-core --help
             ;;
         *)
-            wt-core "$cmd" "$@"
+            wt-core "$@"
             ;;
     esac
 }

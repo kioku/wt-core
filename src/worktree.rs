@@ -139,8 +139,10 @@ pub fn remove(repo: &RepoRoot, branch: Option<&str>, force: bool) -> Result<Remo
 
     // Remove worktree first, then branch.
     git::remove_worktree(repo, &removed_path, force)?;
-    // Branch deletion: best-effort. If the branch was already deleted upstream, ignore error.
-    let _ = git::delete_branch(repo, &target_branch, force);
+    // Branch deletion: best-effort — warn on failure instead of blocking.
+    if let Err(e) = git::delete_branch(repo, &target_branch, force) {
+        eprintln!("warning: worktree removed but branch deletion failed: {e}");
+    }
 
     Ok(RemoveResult {
         removed_path,
