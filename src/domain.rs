@@ -1,9 +1,9 @@
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Root path of a git repository (the directory containing `.git`).
 #[derive(Debug, Clone)]
-pub struct RepoRoot(pub PathBuf);
+pub struct RepoRoot(pub(crate) PathBuf);
 
 impl RepoRoot {
     /// The `.worktrees/` directory under the repo root.
@@ -12,13 +12,37 @@ impl RepoRoot {
     }
 }
 
+impl AsRef<Path> for RepoRoot {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl std::ops::Deref for RepoRoot {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl fmt::Display for RepoRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0.display())
+    }
+}
+
 /// A sanitized branch name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchName(pub String);
+pub struct BranchName(pub(crate) String);
 
 impl BranchName {
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
+    }
+
+    /// Return the branch name as a string slice.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 
     /// Convert the branch name to a collision-safe directory slug.

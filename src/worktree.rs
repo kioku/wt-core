@@ -7,21 +7,21 @@ use crate::git;
 /// Result of a successful `add` operation.
 pub struct AddResult {
     pub worktree_path: PathBuf,
-    pub branch: String,
+    pub branch: BranchName,
     pub repo_root: PathBuf,
 }
 
 /// Result of a successful `go` operation.
 pub struct GoResult {
     pub worktree_path: PathBuf,
-    pub branch: String,
+    pub branch: BranchName,
     pub repo_root: PathBuf,
 }
 
 /// Result of a successful `remove` operation.
 pub struct RemoveResult {
     pub removed_path: PathBuf,
-    pub branch: String,
+    pub branch: BranchName,
     pub repo_root: PathBuf,
 }
 
@@ -41,13 +41,12 @@ pub enum DiagLevel {
 }
 
 /// Create a new worktree for the given branch.
-pub fn add(repo: &RepoRoot, branch: &str, base: Option<&str>) -> Result<AddResult> {
-    let branch_name = BranchName::new(branch);
-
+pub fn add(repo: &RepoRoot, branch: &BranchName, base: Option<&str>) -> Result<AddResult> {
     // Refuse if branch already exists locally.
     if git::branch_exists(repo, branch) {
         return Err(AppError::conflict(format!(
-            "branch '{branch}' already exists"
+            "branch '{}' already exists",
+            branch
         )));
     }
 
@@ -56,7 +55,7 @@ pub fn add(repo: &RepoRoot, branch: &str, base: Option<&str>) -> Result<AddResul
         return Err(AppError::git(format!("revision '{rev}' not found")));
     }
 
-    let wt_dir = repo.worktrees_dir().join(branch_name.to_dir_name());
+    let wt_dir = repo.worktrees_dir().join(branch.to_dir_name());
 
     if wt_dir.exists() {
         return Err(AppError::conflict(format!(
@@ -69,24 +68,24 @@ pub fn add(repo: &RepoRoot, branch: &str, base: Option<&str>) -> Result<AddResul
 
     Ok(AddResult {
         worktree_path: wt_dir,
-        branch: branch.to_string(),
-        repo_root: repo.0.clone(),
+        branch: branch.clone(),
+        repo_root: repo.to_path_buf(),
     })
 }
 
 /// Resolve and return the path of an existing worktree for the given branch.
-pub fn go(repo: &RepoRoot, branch: &str) -> Result<GoResult> {
+pub fn go(repo: &RepoRoot, branch: &BranchName) -> Result<GoResult> {
     let worktrees = git::list_worktrees(repo)?;
 
     let found = worktrees
         .iter()
-        .find(|wt| wt.branch.as_ref().is_some_and(|b| b == branch));
+        .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
 
     match found {
         Some(wt) => Ok(GoResult {
             worktree_path: wt.path.clone(),
-            branch: branch.to_string(),
-            repo_root: repo.0.clone(),
+            branch: branch.clone(),
+            repo_root: repo.to_path_buf(),
         }),
         None => Err(AppError::usage(format!(
             "no worktree found for branch '{branch}'"
@@ -95,22 +94,21 @@ pub fn go(repo: &RepoRoot, branch: &str) -> Result<GoResult> {
 }
 
 /// Remove a worktree and delete its local branch.
-pub fn remove(repo: &RepoRoot, branch: Option<&str>, force: bool) -> Result<RemoveResult> {
+pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Result<RemoveResult> {
     let worktrees = git::list_worktrees(repo)?;
 
     // Resolve which branch to remove.
     let target_branch = match branch {
-        Some(b) => b.to_string(),
+        Some(b) => b.clone(),
         None => {
             // Infer from cwd: find worktree whose path matches cwd.
             let cwd = std::env::current_dir()
                 .map_err(|e| AppError::usage(format!("cannot determine cwd: {e}")))?;
             let found = worktrees.iter().find(|wt| cwd.starts_with(&wt.path));
             match found {
-                Some(wt) => wt
-                    .branch
-                    .clone()
-                    .ok_or_else(|| AppError::usage("current worktree has no branch".to_string()))?,
+                Some(wt) => BranchName::new(wt.branch.clone().ok_or_else(|| {
+                    AppError::usage("current worktree has no branch".to_string())
+                })?),
                 None => {
                     return Err(AppError::usage(
                         "no branch specified and cwd is not inside a worktree".to_string(),
@@ -123,7 +121,7 @@ pub fn remove(repo: &RepoRoot, branch: Option<&str>, force: bool) -> Result<Remo
     // Find the worktree entry.
     let wt = worktrees
         .iter()
-        .find(|wt| wt.branch.as_deref() == Some(&target_branch))
+        .find(|wt| wt.branch.as_deref() == Some(target_branch.as_str()))
         .ok_or_else(|| {
             AppError::usage(format!("no worktree found for branch '{target_branch}'"))
         })?;
@@ -147,7 +145,7 @@ pub fn remove(repo: &RepoRoot, branch: Option<&str>, force: bool) -> Result<Remo
     Ok(RemoveResult {
         removed_path,
         branch: target_branch,
-        repo_root: repo.0.clone(),
+        repo_root: repo.to_path_buf(),
     })
 }
 

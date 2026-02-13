@@ -2,12 +2,28 @@ use serde::Serialize;
 
 use crate::domain::Worktree;
 
-/// The output format requested by the user.
+/// Output format for commands that produce a navigable path (add, go).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
+pub enum NavigationFormat {
     Human,
     Json,
     CdPath,
+}
+
+/// Output format for commands that produce status/list output (list, doctor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFormat {
+    Human,
+    Json,
+}
+
+/// Output format for the remove command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveFormat {
+    Human,
+    Json,
+    /// `--print-paths`: prints removed_path, repo_root, and branch (one per line).
+    PrintPaths,
 }
 
 /// JSON envelope for single-operation responses.
@@ -99,4 +115,45 @@ impl JsonListResponse {
             worktrees: worktrees.iter().map(JsonWorktreeEntry::from).collect(),
         }
     }
+}
+
+/// JSON envelope for doctor responses.
+#[derive(Debug, Serialize)]
+pub struct JsonDoctorResponse {
+    pub ok: bool,
+    pub diagnostics: Vec<JsonDiagEntry>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonDiagEntry {
+    pub level: crate::worktree::DiagLevel,
+    pub message: String,
+}
+
+impl JsonDoctorResponse {
+    pub fn from_diagnostics(diags: &[crate::worktree::Diagnostic]) -> Self {
+        let has_errors = diags
+            .iter()
+            .any(|d| d.level == crate::worktree::DiagLevel::Error);
+        Self {
+            ok: !has_errors,
+            diagnostics: diags
+                .iter()
+                .map(|d| JsonDiagEntry {
+                    level: d.level,
+                    message: d.message.clone(),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Serialize a value as pretty-printed JSON to stdout.
+pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value)
+            .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
+    );
+    Ok(())
 }

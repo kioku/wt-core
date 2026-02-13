@@ -236,3 +236,77 @@ fn remove_json_includes_removed_path() {
     assert!(json["removed_path"].as_str().is_some());
     assert!(json["repo_root"].as_str().is_some());
 }
+
+#[test]
+fn remove_print_paths_returns_three_lines() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Add with a slashed branch name to verify we get the real name, not the slug
+    wt_core()
+        .args(["add", "feature/paths-rm", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "feature/paths-rm",
+            "--repo",
+            &repo_str,
+            "--print-paths",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout}");
+
+    // Line 1: removed worktree path (under .worktrees/)
+    assert!(
+        lines[0].contains(".worktrees/"),
+        "line 1 should be removed path: {}",
+        lines[0]
+    );
+
+    // Line 2: repo root (not under .worktrees/)
+    assert!(
+        !lines[1].contains(".worktrees/"),
+        "line 2 should be repo root, not a worktree path: {}",
+        lines[1]
+    );
+
+    // Line 3: actual branch name (not the sanitized slug)
+    assert_eq!(
+        lines[2], "feature/paths-rm",
+        "line 3 should be the real branch name, not the slug"
+    );
+
+    // No line should be JSON
+    assert!(!lines[0].starts_with('{'));
+}
+
+#[test]
+fn remove_print_paths_conflicts_with_json() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args([
+            "remove",
+            "any-branch",
+            "--repo",
+            &repo_str,
+            "--print-paths",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::prelude::predicate::str::contains(
+            "cannot be used with",
+        ));
+}

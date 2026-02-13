@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 
-use crate::domain::{RepoRoot, Worktree};
+use crate::domain::{BranchName, RepoRoot, Worktree};
 use crate::error::{AppError, Result};
 
 /// Environment variables that can leak from parent git processes (e.g. hooks)
@@ -43,9 +43,21 @@ fn git(args: &[&str], cwd: &Path) -> Result<String> {
 /// Inspect git stderr to map known error patterns to the correct exit code.
 fn classify_git_error(msg: String) -> AppError {
     let lower = msg.to_lowercase();
-    if lower.contains("unmerged") || lower.contains("modified") || lower.contains("dirty") {
+
+    if lower.contains("not a git repository") {
+        return AppError::not_a_repo(msg);
+    }
+
+    if lower.contains("unmerged")
+        || lower.contains("modified")
+        || lower.contains("dirty")
+        || lower.contains("already exists")
+        || lower.contains("already checked out")
+        || lower.contains("is not fully merged")
+    {
         return AppError::conflict(msg);
     }
+
     AppError::git(msg)
 }
 
@@ -81,9 +93,9 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
 /// List all worktrees via `git worktree list --porcelain`.
 pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     // Prune stale worktrees first (matches current behavior expectation).
-    let _ = git(&["worktree", "prune"], &repo.0);
+    let _ = git(&["worktree", "prune"], repo.as_ref());
 
-    let raw = git(&["worktree", "list", "--porcelain"], &repo.0)?;
+    let raw = git(&["worktree", "list", "--porcelain"], repo.as_ref())?;
     parse_worktree_porcelain(&raw, repo)
 }
 
@@ -164,14 +176,20 @@ fn parse_worktree_porcelain(raw: &str, _repo: &RepoRoot) -> Result<Vec<Worktree>
 }
 
 /// Add a new worktree.
-pub fn add_worktree(repo: &RepoRoot, dir: &Path, branch: &str, base: Option<&str>) -> Result<()> {
+pub fn add_worktree(
+    repo: &RepoRoot,
+    dir: &Path,
+    branch: &BranchName,
+    base: Option<&str>,
+) -> Result<()> {
     let base_rev = base.unwrap_or("HEAD");
-    let mut args = vec!["worktree", "add", "-b", branch];
+    let branch_str = branch.as_str();
+    let mut args = vec!["worktree", "add", "-b", branch_str];
     let dir_str = dir.display().to_string();
     args.push(&dir_str);
     args.push(base_rev);
 
-    git(&args, &repo.0)?;
+    git(&args, repo.as_ref())?;
     Ok(())
 }
 
@@ -184,29 +202,26 @@ pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
     }
     args.push(&dir_str);
 
-    git(&args, &repo.0)?;
+    git(&args, repo.as_ref())?;
     Ok(())
 }
 
 /// Delete a local branch.
-pub fn delete_branch(repo: &RepoRoot, branch: &str, force: bool) -> Result<()> {
+pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Result<()> {
     let flag = if force { "-D" } else { "-d" };
-    git(&["branch", flag, branch], &repo.0)?;
+    git(&["branch", flag, branch.as_str()], repo.as_ref())?;
     Ok(())
 }
 
 /// Check if a local branch exists.
-pub fn branch_exists(repo: &RepoRoot, branch: &str) -> bool {
-    git(
-        &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
-        &repo.0,
-    )
-    .is_ok()
+pub fn branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
+    let refspec = format!("refs/heads/{}", branch.as_str());
+    git(&["rev-parse", "--verify", &refspec], repo.as_ref()).is_ok()
 }
 
 /// Resolve a revision to confirm it exists.
 pub fn rev_exists(repo: &RepoRoot, rev: &str) -> bool {
-    git(&["rev-parse", "--verify", rev], &repo.0).is_ok()
+    git(&["rev-parse", "--verify", rev], repo.as_ref()).is_ok()
 }
 
 #[cfg(test)]
@@ -259,5 +274,45 @@ bare
         let result = parse_worktree_porcelain(raw, &repo).expect("should parse");
         assert_eq!(result.len(), 1);
         assert!(result[0].is_main);
+    }
+
+    #[test]
+    fn classify_not_a_repo() {
+        let err = classify_git_error(
+            "fatal: not a git repository (or any of the parent directories)".to_string(),
+        );
+        assert_eq!(err.code, crate::error::ExitCode::NotARepo);
+    }
+
+    #[test]
+    fn classify_already_exists_is_conflict() {
+        let err = classify_git_error("fatal: 'feature/x' already exists".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_already_checked_out_is_conflict() {
+        let err = classify_git_error(
+            "fatal: 'feature/x' is already checked out at '/repo/.worktrees/feat'".to_string(),
+        );
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_not_fully_merged() {
+        let err = classify_git_error("error: the branch 'x' is not fully merged".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_dirty_is_conflict() {
+        let err = classify_git_error("error: dirty worktree, use --force".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Conflict);
+    }
+
+    #[test]
+    fn classify_unknown_falls_to_git() {
+        let err = classify_git_error("fatal: something unexpected".to_string());
+        assert_eq!(err.code, crate::error::ExitCode::Git);
     }
 }

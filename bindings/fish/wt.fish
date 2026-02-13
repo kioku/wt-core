@@ -35,21 +35,37 @@ function wt --description "Git worktree manager"
                 end
             end
 
+            if test "$want_json" = true
+                set -l cwd_before (pwd)
+                set -l output (wt-core remove $argv)
+                set -l rc $status
+                if test $rc -eq 0
+                    # Extract paths from JSON for cd-out-of-removed-worktree logic
+                    set -l removed_path (printf '%s\n' $output | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
+                    if test -n "$removed_path" -a -n "$repo_root"
+                        if string match -q "$removed_path*" "$cwd_before"
+                            cd "$repo_root"; or true
+                        end
+                    end
+                end
+                printf '%s\n' $output
+                return $rc
+            end
+
             set -l cwd_before (pwd)
-            set -l result (wt-core remove $argv --json 2>/dev/null)
+            # --print-paths outputs three lines: removed_path, repo_root, branch
+            set -l lines (wt-core remove $argv --print-paths 2>/dev/null)
             set -l rc $status
             if test $rc -eq 0
-                set -l removed_path (echo $result | string match -r '"removed_path":\s*"([^"]*)"' | tail -1)
-                set -l repo_root (echo $result | string match -r '"repo_root":\s*"([^"]*)"' | tail -1)
-                set -l branch (echo $result | string match -r '"branch":\s*"([^"]*)"' | tail -1)
+                set -l removed_path $lines[1]
+                set -l repo_root $lines[2]
+                set -l branch $lines[3]
+                # Check if cwd is under the removed worktree path
                 if string match -q "$removed_path*" "$cwd_before"
                     cd "$repo_root"; or true
                 end
-                if test "$want_json" = true
-                    echo $result
-                else
-                    echo "Removed worktree and branch '$branch'"
-                end
+                echo "Removed worktree and branch '$branch'"
             else
                 wt-core remove $argv
                 return $status

@@ -39,23 +39,40 @@ wt() {
                 [[ "$arg" == "--json" ]] && want_json=true
             done
 
+            if [[ "$want_json" == true ]]; then
+                local cwd_before="${PWD}"
+                local output
+                output=$(wt-core remove "$@")
+                local rc=$?
+                if [[ $rc -eq 0 ]]; then
+                    # Extract paths from JSON for cd-out-of-removed-worktree logic
+                    local removed_path repo_root
+                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
+                    if [[ -n "$removed_path" ]] && [[ -n "$repo_root" ]]; then
+                        if [[ "$cwd_before" == "${removed_path}"* ]]; then
+                            cd "$repo_root" || true
+                        fi
+                    fi
+                fi
+                printf '%s\n' "$output"
+                return $rc
+            fi
+
             local cwd_before="${PWD}"
+            # --print-paths outputs three lines: removed_path, repo_root, branch
             local result
-            result=$(wt-core remove "$@" --json 2>/dev/null)
+            result=$(wt-core remove "$@" --print-paths 2>/dev/null)
             local rc=$?
             if [[ $rc -eq 0 ]]; then
                 local removed_path repo_root branch
-                removed_path=$(printf '%s' "$result" | grep '"removed_path"' | sed 's/.*": "//;s/".*//')
-                repo_root=$(printf '%s' "$result" | grep '"repo_root"' | sed 's/.*": "//;s/".*//')
-                branch=$(printf '%s' "$result" | grep '"branch"' | sed 's/.*": "//;s/".*//')
+                removed_path=$(printf '%s\n' "$result" | sed -n '1p')
+                repo_root=$(printf '%s\n' "$result" | sed -n '2p')
+                branch=$(printf '%s\n' "$result" | sed -n '3p')
                 if [[ "$cwd_before" == "${removed_path}"* ]]; then
                     cd "$repo_root" || true
                 fi
-                if [[ "$want_json" == true ]]; then
-                    printf '%s\n' "$result"
-                else
-                    echo "Removed worktree and branch '${branch}'"
-                fi
+                echo "Removed worktree and branch '${branch}'"
             else
                 wt-core remove "$@"
                 return $?
