@@ -1,8 +1,10 @@
+mod cli;
 mod domain;
 mod error;
 
+use clap::Parser;
+
 fn main() {
-    let name = domain::BranchName::new("feature/auth");
-    let dir = name.to_dir_name();
-    eprintln!("wt-core: skeleton (example dir: {dir})");
+    let cli = cli::Cli::parse();
+    eprintln!("wt-core: parsed command: {cli:?}");
 }
