@@ -22,7 +22,7 @@ pub enum StatusFormat {
 pub enum RemoveFormat {
     Human,
     Json,
-    /// `--print-paths`: prints removed_path and repo_root, one per line.
+    /// `--print-paths`: prints removed_path, repo_root, and branch (one per line).
     PrintPaths,
 }
 
@@ -153,7 +153,7 @@ pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
         "{}",
         serde_json::to_string_pretty(value)
-            .map_err(|e| crate::error::AppError::git(format!("json error: {e}")))?
+            .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
     );
     Ok(())
 }
