@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser, Debug)]
-#[command(name = "wt-core", version, about = "Portable Git worktree lifecycle manager")]
+#[command(
+    name = "wt-core",
+    version,
+    about = "Portable Git worktree lifecycle manager"
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
