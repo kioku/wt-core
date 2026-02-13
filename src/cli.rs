@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -88,6 +88,12 @@ pub enum Command {
         print_paths: bool,
     },
 
+    /// Print shell bindings to stdout
+    Init {
+        /// Shell to generate bindings for
+        shell: Shell,
+    },
+
     /// Diagnose worktree and repository health
     Doctor {
         /// Repository path (defaults to current directory)
@@ -98,4 +104,12 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug)]
+pub enum Shell {
+    Bash,
+    Zsh,
+    Fish,
+    Nu,
 }
