@@ -119,3 +119,101 @@ fn go_fails_for_nonexistent_branch() {
         .code(1) // Usage error
         .stderr(predicate::str::contains("no worktree found"));
 }
+
+#[test]
+fn go_no_branch_non_tty_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    // Create two worktrees so auto-select does not kick in
+    for branch in &["picker-a", "picker-b"] {
+        wt_core()
+            .args(["add", branch, "--repo", &repo.path().display().to_string()])
+            .assert()
+            .success();
+    }
+
+    // Running without a branch in a non-TTY context should fail
+    wt_core()
+        .args(["go", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "interactive mode requires a terminal",
+        ));
+}
+
+#[test]
+fn go_no_branch_json_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    wt_core()
+        .args(["go", "--json", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "branch argument is required with --json or --print-cd-path",
+        ));
+}
+
+#[test]
+fn go_no_branch_print_cd_path_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    wt_core()
+        .args([
+            "go",
+            "--print-cd-path",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "branch argument is required with --json or --print-cd-path",
+        ));
+}
+
+#[test]
+fn go_no_branch_auto_selects_single_worktree() {
+    let repo = fixtures::TestRepo::new();
+
+    // Create exactly one worktree
+    wt_core()
+        .args([
+            "add",
+            "only-one",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // With only one non-main worktree, auto-select should kick in
+    // even without a TTY (it skips the picker entirely)
+    let output = wt_core()
+        .args(["go", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert!(stdout.contains("only-one"));
+}
+
+#[test]
+fn go_no_worktrees_to_select_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    // No worktrees created — only main exists
+    wt_core()
+        .args(["go", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no worktrees to select"));
+}
