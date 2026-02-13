@@ -36,8 +36,21 @@ function wt --description "Git worktree manager"
             end
 
             if test "$want_json" = true
-                wt-core remove $argv
-                return $status
+                set -l cwd_before (pwd)
+                set -l output (wt-core remove $argv)
+                set -l rc $status
+                if test $rc -eq 0
+                    # Extract paths from JSON for cd-out-of-removed-worktree logic
+                    set -l removed_path (printf '%s\n' $output | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
+                    if test -n "$removed_path" -a -n "$repo_root"
+                        if string match -q "$removed_path*" "$cwd_before"
+                            cd "$repo_root"; or true
+                        end
+                    end
+                end
+                printf '%s\n' $output
+                return $rc
             end
 
             set -l cwd_before (pwd)

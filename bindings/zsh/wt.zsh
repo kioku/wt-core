@@ -40,8 +40,23 @@ wt() {
             done
 
             if [[ "$want_json" == true ]]; then
-                wt-core remove "$@"
-                return $?
+                local cwd_before="${PWD}"
+                local output
+                output=$(wt-core remove "$@")
+                local rc=$?
+                if [[ $rc -eq 0 ]]; then
+                    # Extract paths from JSON for cd-out-of-removed-worktree logic
+                    local removed_path repo_root
+                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
+                    if [[ -n "$removed_path" ]] && [[ -n "$repo_root" ]]; then
+                        if [[ "$cwd_before" == "${removed_path}"* ]]; then
+                            cd "$repo_root" || true
+                        fi
+                    fi
+                fi
+                printf '%s\n' "$output"
+                return $rc
             fi
 
             local cwd_before="${PWD}"
