@@ -52,7 +52,13 @@ fn run(cli: Cli) -> error::Result<()> {
             force,
             repo,
             json,
-        } => cmd_remove(branch.as_deref(), force, repo, fmt_flag(json, false)),
+            print_paths,
+        } => cmd_remove(
+            branch.as_deref(),
+            force,
+            repo,
+            fmt_remove(json, print_paths),
+        ),
         Command::Doctor { repo, json } => cmd_doctor(repo, fmt_flag(json, false)),
     }
 }
@@ -60,6 +66,16 @@ fn run(cli: Cli) -> error::Result<()> {
 fn fmt_flag(json: bool, cd_path: bool) -> OutputFormat {
     if cd_path {
         OutputFormat::CdPath
+    } else if json {
+        OutputFormat::Json
+    } else {
+        OutputFormat::Human
+    }
+}
+
+fn fmt_remove(json: bool, print_paths: bool) -> OutputFormat {
+    if print_paths {
+        OutputFormat::RemovePaths
     } else if json {
         OutputFormat::Json
     } else {
@@ -91,7 +107,7 @@ fn cmd_list(repo: Option<PathBuf>, fmt: OutputFormat) -> error::Result<()> {
                     .map_err(|e| AppError::git(format!("json error: {e}")))?
             );
         }
-        OutputFormat::Human => {
+        OutputFormat::Human | OutputFormat::RemovePaths => {
             if worktrees.is_empty() {
                 println!("No worktrees found.");
                 return Ok(());
@@ -142,7 +158,7 @@ fn cmd_add(
                     .map_err(|e| AppError::git(format!("json error: {e}")))?
             );
         }
-        OutputFormat::Human => {
+        OutputFormat::Human | OutputFormat::RemovePaths => {
             println!("Created worktree for branch '{branch_name}' at {path_str}");
         }
     }
@@ -174,7 +190,7 @@ fn cmd_go(branch: &str, repo: Option<PathBuf>, fmt: OutputFormat) -> error::Resu
                     .map_err(|e| AppError::git(format!("json error: {e}")))?
             );
         }
-        OutputFormat::Human => {
+        OutputFormat::Human | OutputFormat::RemovePaths => {
             println!("Worktree for branch '{branch_name}' is at {path_str}");
         }
     }
@@ -195,6 +211,10 @@ fn cmd_remove(
     let branch_name = &result.branch;
 
     match fmt {
+        OutputFormat::RemovePaths => {
+            println!("{removed_str}");
+            println!("{root_str}");
+        }
         OutputFormat::Json | OutputFormat::CdPath => {
             let resp =
                 JsonResponse::success(format!("removed worktree for branch '{branch_name}'"))
@@ -248,7 +268,7 @@ fn cmd_doctor(repo: Option<PathBuf>, fmt: OutputFormat) -> error::Result<()> {
                     .map_err(|e| AppError::git(format!("json error: {e}")))?
             );
         }
-        OutputFormat::Human => {
+        OutputFormat::Human | OutputFormat::RemovePaths => {
             for d in &diags {
                 let icon = match d.level {
                     worktree::DiagLevel::Ok => "✓",

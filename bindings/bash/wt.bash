@@ -37,26 +37,28 @@ wt() {
                 case "$arg" in --json) want_json=true ;; esac
             done
 
+            if [ "$want_json" = true ]; then
+                wt-core remove "$@"
+                return $?
+            fi
+
             local cwd_before
             cwd_before=$(pwd)
             local result
-            result=$(wt-core remove "$@" --json 2>/dev/null)
+            result=$(wt-core remove "$@" --print-paths 2>/dev/null)
             local rc=$?
             if [ $rc -eq 0 ]; then
-                local removed_path repo_root branch
-                removed_path=$(printf '%s' "$result" | grep '"removed_path"' | sed 's/.*": "//;s/".*//')
-                repo_root=$(printf '%s' "$result" | grep '"repo_root"' | sed 's/.*": "//;s/".*//')
-                branch=$(printf '%s' "$result" | grep '"branch"' | sed 's/.*": "//;s/".*//')
+                local removed_path repo_root
+                removed_path=$(printf '%s' "$result" | sed -n '1p')
+                repo_root=$(printf '%s' "$result" | sed -n '2p')
                 case "$cwd_before" in
                     "${removed_path}"*)
                         cd "$repo_root" || true
                         ;;
                 esac
-                if [ "$want_json" = true ]; then
-                    printf '%s\n' "$result"
-                else
-                    echo "Removed worktree and branch '${branch}'"
-                fi
+                local branch
+                branch=$(basename "$removed_path" | sed 's/--[0-9a-f]*$//')
+                echo "Removed worktree and branch '${branch}'"
             else
                 wt-core remove "$@"
                 return $?

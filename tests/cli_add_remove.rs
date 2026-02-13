@@ -236,3 +236,65 @@ fn remove_json_includes_removed_path() {
     assert!(json["removed_path"].as_str().is_some());
     assert!(json["repo_root"].as_str().is_some());
 }
+
+#[test]
+fn remove_print_paths_returns_two_lines() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "paths-rm", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args(["remove", "paths-rm", "--repo", &repo_str, "--print-paths"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 2, "expected exactly 2 lines: {stdout}");
+
+    // Line 1: removed worktree path (under .worktrees/)
+    assert!(
+        lines[0].contains(".worktrees/"),
+        "line 1 should be removed path: {}",
+        lines[0]
+    );
+
+    // Line 2: repo root
+    assert!(
+        !lines[1].contains(".worktrees/"),
+        "line 2 should be repo root, not a worktree path: {}",
+        lines[1]
+    );
+
+    // Neither line should be JSON
+    assert!(!lines[0].starts_with('{'));
+    assert!(!lines[1].starts_with('{'));
+}
+
+#[test]
+fn remove_print_paths_conflicts_with_json() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args([
+            "remove",
+            "any-branch",
+            "--repo",
+            &repo_str,
+            "--print-paths",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::prelude::predicate::str::contains(
+            "cannot be used with",
+        ));
+}

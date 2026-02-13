@@ -51,6 +51,8 @@ export def --env "wt go" [
 }
 
 # Remove a worktree and its local branch
+# Note: Nu uses --json internally with `from json` which is safe (no grep/sed).
+# Other shells use --print-paths to avoid fragile JSON parsing.
 export def --env "wt remove" [
     branch?: string  # Branch name (defaults to current worktree)
     --force          # Force removal even if dirty

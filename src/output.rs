@@ -8,6 +8,8 @@ pub enum OutputFormat {
     Human,
     Json,
     CdPath,
+    /// For `remove --print-paths`: prints removed_path and repo_root, one per line.
+    RemovePaths,
 }
 
 /// JSON envelope for single-operation responses.

@@ -35,21 +35,23 @@ function wt --description "Git worktree manager"
                 end
             end
 
+            if test "$want_json" = true
+                wt-core remove $argv
+                return $status
+            end
+
             set -l cwd_before (pwd)
-            set -l result (wt-core remove $argv --json 2>/dev/null)
+            # --print-paths outputs two lines: removed_path then repo_root
+            set -l lines (wt-core remove $argv --print-paths 2>/dev/null)
             set -l rc $status
             if test $rc -eq 0
-                set -l removed_path (echo $result | string match -r '"removed_path":\s*"([^"]*)"' | tail -1)
-                set -l repo_root (echo $result | string match -r '"repo_root":\s*"([^"]*)"' | tail -1)
-                set -l branch (echo $result | string match -r '"branch":\s*"([^"]*)"' | tail -1)
+                set -l removed_path $lines[1]
+                set -l repo_root $lines[2]
+                # Check if cwd is under the removed worktree path
                 if string match -q "$removed_path*" "$cwd_before"
                     cd "$repo_root"; or true
                 end
-                if test "$want_json" = true
-                    echo $result
-                else
-                    echo "Removed worktree and branch '$branch'"
-                end
+                echo "Removed worktree and branch "(basename "$removed_path" | string replace -r -- '--[0-9a-f]*$' '')"'"
             else
                 wt-core remove $argv
                 return $status

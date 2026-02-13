@@ -82,6 +82,10 @@ pub enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Print removed_path and repo_root (one per line) for shell wrappers
+        #[arg(long, conflicts_with = "json")]
+        print_paths: bool,
     },
 
     /// Diagnose worktree and repository health
