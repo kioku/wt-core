@@ -1,6 +1,7 @@
 mod cli;
 mod domain;
 mod error;
+mod git;
 
 use clap::Parser;
 
