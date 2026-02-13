@@ -83,7 +83,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print removed_path and repo_root (one per line) for shell wrappers
+        /// Print removed_path, repo_root, and branch (one per line) for shell wrappers
         #[arg(long, conflicts_with = "json")]
         print_paths: bool,
     },

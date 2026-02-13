@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 /// Root path of a git repository (the directory containing `.git`).
 #[derive(Debug, Clone)]
-pub struct RepoRoot(pub PathBuf);
+pub struct RepoRoot(pub(crate) PathBuf);
 
 impl RepoRoot {
     /// The `.worktrees/` directory under the repo root.
@@ -33,7 +33,7 @@ impl fmt::Display for RepoRoot {
 
 /// A sanitized branch name.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BranchName(pub String);
+pub struct BranchName(pub(crate) String);
 
 impl BranchName {
     pub fn new(name: impl Into<String>) -> Self {

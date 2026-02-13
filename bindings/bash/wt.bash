@@ -44,20 +44,20 @@ wt() {
 
             local cwd_before
             cwd_before=$(pwd)
+            # --print-paths outputs three lines: removed_path, repo_root, branch
             local result
             result=$(wt-core remove "$@" --print-paths 2>/dev/null)
             local rc=$?
             if [ $rc -eq 0 ]; then
-                local removed_path repo_root
-                removed_path=$(printf '%s' "$result" | sed -n '1p')
-                repo_root=$(printf '%s' "$result" | sed -n '2p')
+                local removed_path repo_root branch
+                removed_path=$(printf '%s\n' "$result" | sed -n '1p')
+                repo_root=$(printf '%s\n' "$result" | sed -n '2p')
+                branch=$(printf '%s\n' "$result" | sed -n '3p')
                 case "$cwd_before" in
                     "${removed_path}"*)
                         cd "$repo_root" || true
                         ;;
                 esac
-                local branch
-                branch=$(basename "$removed_path" | sed 's/--[0-9a-f]*$//')
                 echo "Removed worktree and branch '${branch}'"
             else
                 wt-core remove "$@"

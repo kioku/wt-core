@@ -41,17 +41,18 @@ function wt --description "Git worktree manager"
             end
 
             set -l cwd_before (pwd)
-            # --print-paths outputs two lines: removed_path then repo_root
+            # --print-paths outputs three lines: removed_path, repo_root, branch
             set -l lines (wt-core remove $argv --print-paths 2>/dev/null)
             set -l rc $status
             if test $rc -eq 0
                 set -l removed_path $lines[1]
                 set -l repo_root $lines[2]
+                set -l branch $lines[3]
                 # Check if cwd is under the removed worktree path
                 if string match -q "$removed_path*" "$cwd_before"
                     cd "$repo_root"; or true
                 end
-                echo "Removed worktree and branch "(basename "$removed_path" | string replace -r -- '--[0-9a-f]*$' '')"'"
+                echo "Removed worktree and branch '$branch'"
             else
                 wt-core remove $argv
                 return $status

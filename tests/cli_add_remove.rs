@@ -238,17 +238,24 @@ fn remove_json_includes_removed_path() {
 }
 
 #[test]
-fn remove_print_paths_returns_two_lines() {
+fn remove_print_paths_returns_three_lines() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
+    // Add with a slashed branch name to verify we get the real name, not the slug
     wt_core()
-        .args(["add", "paths-rm", "--repo", &repo_str])
+        .args(["add", "feature/paths-rm", "--repo", &repo_str])
         .assert()
         .success();
 
     let output = wt_core()
-        .args(["remove", "paths-rm", "--repo", &repo_str, "--print-paths"])
+        .args([
+            "remove",
+            "feature/paths-rm",
+            "--repo",
+            &repo_str,
+            "--print-paths",
+        ])
         .assert()
         .success()
         .get_output()
@@ -257,7 +264,7 @@ fn remove_print_paths_returns_two_lines() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 2, "expected exactly 2 lines: {stdout}");
+    assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout}");
 
     // Line 1: removed worktree path (under .worktrees/)
     assert!(
@@ -266,16 +273,21 @@ fn remove_print_paths_returns_two_lines() {
         lines[0]
     );
 
-    // Line 2: repo root
+    // Line 2: repo root (not under .worktrees/)
     assert!(
         !lines[1].contains(".worktrees/"),
         "line 2 should be repo root, not a worktree path: {}",
         lines[1]
     );
 
-    // Neither line should be JSON
+    // Line 3: actual branch name (not the sanitized slug)
+    assert_eq!(
+        lines[2], "feature/paths-rm",
+        "line 3 should be the real branch name, not the slug"
+    );
+
+    // No line should be JSON
     assert!(!lines[0].starts_with('{'));
-    assert!(!lines[1].starts_with('{'));
 }
 
 #[test]

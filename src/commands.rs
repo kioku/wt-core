@@ -197,6 +197,7 @@ fn cmd_remove(
         RemoveFormat::PrintPaths => {
             println!("{removed_str}");
             println!("{root_str}");
+            println!("{branch_name}");
         }
         RemoveFormat::Json => {
             let resp =
