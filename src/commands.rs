@@ -201,10 +201,10 @@ fn resolve_interactive_branch(
     interactive: bool,
     fmt: NavigationFormat,
 ) -> Result<BranchName> {
-    // Machine-output modes must not hang waiting for input.
+    // Machine-output modes require an explicit branch argument.
     if fmt != NavigationFormat::Human {
         return Err(AppError::usage(
-            "interactive picker cannot be used with --json or --print-cd-path; provide a branch argument".to_string(),
+            "branch argument is required with --json or --print-cd-path".to_string(),
         ));
     }
 
@@ -217,8 +217,8 @@ fn resolve_interactive_branch(
         ));
     }
 
-    // Auto-select when there is exactly one candidate.
-    if candidates.len() == 1 {
+    // Auto-select when there is exactly one candidate (unless -i forces the picker).
+    if !interactive && candidates.len() == 1 {
         let branch = candidates[0]
             .branch
             .as_deref()
@@ -226,11 +226,10 @@ fn resolve_interactive_branch(
         return Ok(BranchName::new(branch));
     }
 
-    // Need a TTY for the interactive picker.
-    if !interactive && !std::io::stdin().is_terminal() {
+    // The interactive picker always requires a TTY.
+    if !std::io::stdin().is_terminal() {
         return Err(AppError::usage(
-            "no branch specified; interactive mode requires a terminal (use -i to force)"
-                .to_string(),
+            "no branch specified; interactive mode requires a terminal".to_string(),
         ));
     }
 

@@ -53,7 +53,7 @@ pub enum Command {
         /// Branch name of the worktree to switch to
         branch: Option<String>,
 
-        /// Force the interactive picker
+        /// Force the interactive picker (skip auto-select)
         #[arg(short, long, conflicts_with = "branch")]
         interactive: bool,
 

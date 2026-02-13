@@ -153,7 +153,7 @@ fn go_no_branch_json_errors() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains(
-            "interactive picker cannot be used with --json or --print-cd-path",
+            "branch argument is required with --json or --print-cd-path",
         ));
 }
 
@@ -172,7 +172,7 @@ fn go_no_branch_print_cd_path_errors() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains(
-            "interactive picker cannot be used with --json or --print-cd-path",
+            "branch argument is required with --json or --print-cd-path",
         ));
 }
 
