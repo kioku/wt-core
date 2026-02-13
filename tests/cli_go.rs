@@ -153,14 +153,16 @@ fn go_no_branch_json_errors() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains(
-            "branch argument is required with --json or --print-cd-path",
+            "branch argument is required with --json",
         ));
 }
 
 #[test]
-fn go_no_branch_print_cd_path_errors() {
+fn go_no_branch_print_cd_path_enters_interactive_path() {
     let repo = fixtures::TestRepo::new();
 
+    // --print-cd-path without a branch enters the interactive path,
+    // which errors here because no non-main worktrees exist.
     wt_core()
         .args([
             "go",
@@ -171,9 +173,42 @@ fn go_no_branch_print_cd_path_errors() {
         .assert()
         .failure()
         .code(1)
-        .stderr(predicate::str::contains(
-            "branch argument is required with --json or --print-cd-path",
-        ));
+        .stderr(predicate::str::contains("no worktrees to select"));
+}
+
+#[test]
+fn go_no_branch_print_cd_path_auto_selects_single_worktree() {
+    let repo = fixtures::TestRepo::new();
+
+    wt_core()
+        .args([
+            "add",
+            "sole-wt",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    // --print-cd-path auto-selects the only non-main worktree
+    let output = wt_core()
+        .args([
+            "go",
+            "--print-cd-path",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let path = String::from_utf8(output).expect("invalid utf8");
+    let path = path.trim();
+    assert!(path.starts_with('/'));
+    assert!(path.contains(".worktrees/"));
+    assert!(path.contains("sole-wt"));
 }
 
 #[test]

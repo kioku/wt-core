@@ -54,7 +54,7 @@ pub enum Command {
         branch: Option<String>,
 
         /// Force the interactive picker (skip auto-select)
-        #[arg(short, long, conflicts_with = "branch")]
+        #[arg(short, long, conflicts_with_all = ["branch", "json"])]
         interactive: bool,
 
         /// Repository path (defaults to current directory)

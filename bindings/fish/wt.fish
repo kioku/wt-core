@@ -17,12 +17,27 @@ function wt --description "Git worktree manager"
 
         case go
             set -e argv[1]
-            set -l target (wt-core go $argv --print-cd-path 2>/dev/null)
-            if test $status -eq 0 -a -n "$target"
-                cd "$target"
-            else
+            # Detect if the caller explicitly asked for --json
+            set -l want_json false
+            for arg in $argv
+                if test "$arg" = "--json"
+                    set want_json true
+                end
+            end
+
+            if test "$want_json" = true
                 wt-core go $argv
                 return $status
+            end
+
+            # --print-cd-path works with the interactive picker:
+            # the picker UI renders on stderr/tty, the path goes to stdout.
+            set -l target (wt-core go $argv --print-cd-path)
+            set -l rc $status
+            if test $rc -eq 0 -a -n "$target"
+                cd "$target"
+            else
+                return $rc
             end
 
         case remove

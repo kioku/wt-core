@@ -20,13 +20,26 @@ wt() {
             ;;
         go)
             shift
-            local target
-            target=$(wt-core go "$@" --print-cd-path 2>/dev/null)
-            if [ $? -eq 0 ] && [ -n "$target" ]; then
-                cd "$target" || return 1
-            else
+            # Detect if the caller explicitly asked for --json
+            local want_json=false
+            for arg in "$@"; do
+                case "$arg" in --json) want_json=true ;; esac
+            done
+
+            if [ "$want_json" = true ]; then
                 wt-core go "$@"
                 return $?
+            fi
+
+            local target rc
+            # --print-cd-path works with the interactive picker:
+            # the picker UI renders on stderr/tty, the path goes to stdout.
+            target=$(wt-core go "$@" --print-cd-path)
+            rc=$?
+            if [ $rc -eq 0 ] && [ -n "$target" ]; then
+                cd "$target" || return 1
+            else
+                return $rc
             fi
             ;;
         remove)

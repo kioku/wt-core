@@ -201,10 +201,12 @@ fn resolve_interactive_branch(
     interactive: bool,
     fmt: NavigationFormat,
 ) -> Result<BranchName> {
-    // Machine-output modes require an explicit branch argument.
-    if fmt != NavigationFormat::Human {
+    // JSON output is for machine consumers that pass an explicit branch.
+    // --print-cd-path is allowed because shell bindings need it to cd
+    // after the interactive picker (picker renders on stderr/tty).
+    if fmt == NavigationFormat::Json {
         return Err(AppError::usage(
-            "branch argument is required with --json or --print-cd-path".to_string(),
+            "branch argument is required with --json".to_string(),
         ));
     }
 
