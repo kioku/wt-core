@@ -54,7 +54,7 @@ pub enum Command {
         branch: Option<String>,
 
         /// Force the interactive picker
-        #[arg(short, long)]
+        #[arg(short, long, conflicts_with = "branch")]
         interactive: bool,
 
         /// Repository path (defaults to current directory)

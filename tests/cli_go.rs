@@ -153,7 +153,7 @@ fn go_no_branch_json_errors() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains(
-            "branch argument is required with --json or --print-cd-path",
+            "interactive picker cannot be used with --json or --print-cd-path",
         ));
 }
 
@@ -172,7 +172,7 @@ fn go_no_branch_print_cd_path_errors() {
         .failure()
         .code(1)
         .stderr(predicate::str::contains(
-            "branch argument is required with --json or --print-cd-path",
+            "interactive picker cannot be used with --json or --print-cd-path",
         ));
 }
 
@@ -203,6 +203,25 @@ fn go_no_branch_auto_selects_single_worktree() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     assert!(stdout.contains("only-one"));
+}
+
+#[test]
+fn go_branch_with_interactive_flag_conflicts() {
+    let repo = fixtures::TestRepo::new();
+
+    // Providing both a branch and -i is a clap conflict
+    wt_core()
+        .args([
+            "go",
+            "some-branch",
+            "-i",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .code(2) // clap exits with code 2 for usage errors
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]

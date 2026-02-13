@@ -204,7 +204,7 @@ fn resolve_interactive_branch(
     // Machine-output modes must not hang waiting for input.
     if fmt != NavigationFormat::Human {
         return Err(AppError::usage(
-            "branch argument is required with --json or --print-cd-path".to_string(),
+            "interactive picker cannot be used with --json or --print-cd-path; provide a branch argument".to_string(),
         ));
     }
 
@@ -255,7 +255,7 @@ fn pick_worktree(worktrees: &[domain::Worktree]) -> Result<BranchName> {
     let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
         .with_prompt("Select worktree")
         .items(&items)
-        .default(0)
+        .default(1) // skip main worktree (always index 0)
         .interact_opt()
         .map_err(|e| AppError::usage(format!("picker failed: {e}")))?;
 
@@ -266,6 +266,9 @@ fn pick_worktree(worktrees: &[domain::Worktree]) -> Result<BranchName> {
             })?;
             Ok(BranchName::new(branch))
         }
+        // Esc / Ctrl-C: dialoguer has already restored the terminal state
+        // before returning None, so destructors are not a concern here.
+        // Exit 130 (128 + SIGINT) is the Unix convention for user cancellation.
         None => std::process::exit(130),
     }
 }
