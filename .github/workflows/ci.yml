@@ -104,6 +104,32 @@ jobs:
       - name: Test nu binding
         run: nu tests/bindings/nu_test.nu
 
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixpkgs-unstable
+
+      - name: Flake check
+        run: nix flake check
+
+      - name: Build
+        run: nix build
+
+      - name: Verify binary
+        run: ./result/bin/wt-core --version
+
+      - name: Verify bindings installed
+        run: |
+          test -f ./result/share/wt-core/bindings/bash/wt.bash
+          test -f ./result/share/wt-core/bindings/zsh/wt.zsh
+          test -f ./result/share/wt-core/bindings/fish/wt.fish
+          test -f ./result/share/wt-core/bindings/nu/wt.nu
+
   coverage:
     runs-on: ubuntu-latest
     steps:
