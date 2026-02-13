@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, Shell};
 use crate::domain::{self, BranchName};
 use crate::error::{AppError, Result};
 use crate::git;
@@ -47,7 +47,7 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             remove_fmt(json, print_paths),
         ),
-        Command::Init { shell } => cmd_init(&shell),
+        Command::Init { shell } => cmd_init(shell),
         Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
     }
 }
@@ -218,17 +218,12 @@ fn cmd_remove(
     Ok(())
 }
 
-fn cmd_init(shell: &str) -> Result<()> {
+fn cmd_init(shell: Shell) -> Result<()> {
     let script = match shell {
-        "bash" => include_str!("../bindings/bash/wt.bash"),
-        "zsh" => include_str!("../bindings/zsh/wt.zsh"),
-        "fish" => include_str!("../bindings/fish/wt.fish"),
-        "nu" => include_str!("../bindings/nu/wt.nu"),
-        _ => {
-            return Err(AppError::usage(format!(
-                "unknown shell '{shell}'. Supported shells: bash, zsh, fish, nu"
-            )));
-        }
+        Shell::Bash => include_str!("../bindings/bash/wt.bash"),
+        Shell::Zsh => include_str!("../bindings/zsh/wt.zsh"),
+        Shell::Fish => include_str!("../bindings/fish/wt.fish"),
+        Shell::Nu => include_str!("../bindings/nu/wt.nu"),
     };
     print!("{script}");
     Ok(())

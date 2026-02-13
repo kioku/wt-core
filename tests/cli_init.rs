@@ -47,7 +47,10 @@ fn init_unknown_shell_fails() {
         .args(["init", "powershell"])
         .assert()
         .failure()
-        .code(1)
-        .stderr(predicate::str::contains("unknown shell 'powershell'"))
-        .stderr(predicate::str::contains("bash, zsh, fish, nu"));
+        .code(2)
+        .stderr(predicate::str::contains("invalid value 'powershell'"))
+        .stderr(predicate::str::contains("bash"))
+        .stderr(predicate::str::contains("zsh"))
+        .stderr(predicate::str::contains("fish"))
+        .stderr(predicate::str::contains("nu"));
 }
