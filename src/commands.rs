@@ -4,12 +4,15 @@ use crate::cli::{Cli, Command};
 use crate::domain::{self, BranchName};
 use crate::error::{AppError, Result};
 use crate::git;
-use crate::output::{print_json, JsonDoctorResponse, JsonListResponse, JsonResponse, OutputFormat};
+use crate::output::{
+    print_json, JsonDoctorResponse, JsonListResponse, JsonResponse, NavigationFormat, RemoveFormat,
+    StatusFormat,
+};
 use crate::worktree;
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::List { repo, json } => cmd_list(repo, fmt_flag(json, false)),
+        Command::List { repo, json } => cmd_list(repo, status_fmt(json)),
         Command::Add {
             branch,
             base,
@@ -20,7 +23,7 @@ pub fn run(cli: Cli) -> Result<()> {
             &BranchName::new(&branch),
             base.as_deref(),
             repo,
-            fmt_flag(json, print_cd_path),
+            nav_fmt(json, print_cd_path),
         ),
         Command::Go {
             branch,
@@ -30,7 +33,7 @@ pub fn run(cli: Cli) -> Result<()> {
         } => cmd_go(
             &BranchName::new(&branch),
             repo,
-            fmt_flag(json, print_cd_path),
+            nav_fmt(json, print_cd_path),
         ),
         Command::Remove {
             branch,
@@ -42,29 +45,37 @@ pub fn run(cli: Cli) -> Result<()> {
             branch.as_deref().map(BranchName::new),
             force,
             repo,
-            fmt_remove(json, print_paths),
+            remove_fmt(json, print_paths),
         ),
-        Command::Doctor { repo, json } => cmd_doctor(repo, fmt_flag(json, false)),
+        Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
     }
 }
 
-fn fmt_flag(json: bool, cd_path: bool) -> OutputFormat {
+fn nav_fmt(json: bool, cd_path: bool) -> NavigationFormat {
     if cd_path {
-        OutputFormat::CdPath
+        NavigationFormat::CdPath
     } else if json {
-        OutputFormat::Json
+        NavigationFormat::Json
     } else {
-        OutputFormat::Human
+        NavigationFormat::Human
     }
 }
 
-fn fmt_remove(json: bool, print_paths: bool) -> OutputFormat {
-    if print_paths {
-        OutputFormat::RemovePaths
-    } else if json {
-        OutputFormat::Json
+fn status_fmt(json: bool) -> StatusFormat {
+    if json {
+        StatusFormat::Json
     } else {
-        OutputFormat::Human
+        StatusFormat::Human
+    }
+}
+
+fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
+    if print_paths {
+        RemoveFormat::PrintPaths
+    } else if json {
+        RemoveFormat::Json
+    } else {
+        RemoveFormat::Human
     }
 }
 
@@ -79,15 +90,15 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<domain::RepoRoot> {
 
 // ── Commands ────────────────────────────────────────────────────────
 
-fn cmd_list(repo: Option<PathBuf>, fmt: OutputFormat) -> Result<()> {
+fn cmd_list(repo: Option<PathBuf>, fmt: StatusFormat) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let worktrees = git::list_worktrees(&repo)?;
 
     match fmt {
-        OutputFormat::Json | OutputFormat::CdPath => {
+        StatusFormat::Json => {
             print_json(&JsonListResponse::from_worktrees(&worktrees))?;
         }
-        OutputFormat::Human | OutputFormat::RemovePaths => {
+        StatusFormat::Human => {
             if worktrees.is_empty() {
                 println!("No worktrees found.");
                 return Ok(());
@@ -112,7 +123,7 @@ fn cmd_add(
     branch: &BranchName,
     base: Option<&str>,
     repo: Option<PathBuf>,
-    fmt: OutputFormat,
+    fmt: NavigationFormat,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let result = worktree::add(&repo, branch, base)?;
@@ -122,10 +133,10 @@ fn cmd_add(
     let branch_name = &result.branch;
 
     match fmt {
-        OutputFormat::CdPath => {
+        NavigationFormat::CdPath => {
             println!("{path_str}");
         }
-        OutputFormat::Json => {
+        NavigationFormat::Json => {
             let resp =
                 JsonResponse::success(format!("created worktree for branch '{branch_name}'"))
                     .with_repo_root(&root_str)
@@ -134,14 +145,14 @@ fn cmd_add(
                     .with_branch(branch_name.as_str());
             print_json(&resp)?;
         }
-        OutputFormat::Human | OutputFormat::RemovePaths => {
+        NavigationFormat::Human => {
             println!("Created worktree for branch '{branch_name}' at {path_str}");
         }
     }
     Ok(())
 }
 
-fn cmd_go(branch: &BranchName, repo: Option<PathBuf>, fmt: OutputFormat) -> Result<()> {
+fn cmd_go(branch: &BranchName, repo: Option<PathBuf>, fmt: NavigationFormat) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let result = worktree::go(&repo, branch)?;
 
@@ -150,10 +161,10 @@ fn cmd_go(branch: &BranchName, repo: Option<PathBuf>, fmt: OutputFormat) -> Resu
     let branch_name = &result.branch;
 
     match fmt {
-        OutputFormat::CdPath => {
+        NavigationFormat::CdPath => {
             println!("{path_str}");
         }
-        OutputFormat::Json => {
+        NavigationFormat::Json => {
             let resp =
                 JsonResponse::success(format!("resolved worktree for branch '{branch_name}'"))
                     .with_repo_root(&root_str)
@@ -162,7 +173,7 @@ fn cmd_go(branch: &BranchName, repo: Option<PathBuf>, fmt: OutputFormat) -> Resu
                     .with_branch(branch_name.as_str());
             print_json(&resp)?;
         }
-        OutputFormat::Human | OutputFormat::RemovePaths => {
+        NavigationFormat::Human => {
             println!("Worktree for branch '{branch_name}' is at {path_str}");
         }
     }
@@ -173,7 +184,7 @@ fn cmd_remove(
     branch: Option<BranchName>,
     force: bool,
     repo: Option<PathBuf>,
-    fmt: OutputFormat,
+    fmt: RemoveFormat,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let result = worktree::remove(&repo, branch.as_ref(), force)?;
@@ -183,11 +194,11 @@ fn cmd_remove(
     let branch_name = &result.branch;
 
     match fmt {
-        OutputFormat::RemovePaths => {
+        RemoveFormat::PrintPaths => {
             println!("{removed_str}");
             println!("{root_str}");
         }
-        OutputFormat::Json | OutputFormat::CdPath => {
+        RemoveFormat::Json => {
             let resp =
                 JsonResponse::success(format!("removed worktree for branch '{branch_name}'"))
                     .with_repo_root(&root_str)
@@ -195,22 +206,22 @@ fn cmd_remove(
                     .with_branch(branch_name.as_str());
             print_json(&resp)?;
         }
-        OutputFormat::Human => {
+        RemoveFormat::Human => {
             println!("Removed worktree and branch '{branch_name}' ({removed_str})");
         }
     }
     Ok(())
 }
 
-fn cmd_doctor(repo: Option<PathBuf>, fmt: OutputFormat) -> Result<()> {
+fn cmd_doctor(repo: Option<PathBuf>, fmt: StatusFormat) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let diags = worktree::doctor(&repo)?;
 
     match fmt {
-        OutputFormat::Json | OutputFormat::CdPath => {
+        StatusFormat::Json => {
             print_json(&JsonDoctorResponse::from_diagnostics(&diags))?;
         }
-        OutputFormat::Human | OutputFormat::RemovePaths => {
+        StatusFormat::Human => {
             for d in &diags {
                 let icon = match d.level {
                     worktree::DiagLevel::Ok => "✓",

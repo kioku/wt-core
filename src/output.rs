@@ -2,14 +2,28 @@ use serde::Serialize;
 
 use crate::domain::Worktree;
 
-/// The output format requested by the user.
+/// Output format for commands that produce a navigable path (add, go).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OutputFormat {
+pub enum NavigationFormat {
     Human,
     Json,
     CdPath,
-    /// For `remove --print-paths`: prints removed_path and repo_root, one per line.
-    RemovePaths,
+}
+
+/// Output format for commands that produce status/list output (list, doctor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFormat {
+    Human,
+    Json,
+}
+
+/// Output format for the remove command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveFormat {
+    Human,
+    Json,
+    /// `--print-paths`: prints removed_path and repo_root, one per line.
+    PrintPaths,
 }
 
 /// JSON envelope for single-operation responses.
