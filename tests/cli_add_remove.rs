@@ -7,6 +7,8 @@ fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
 }
 
+// ── Interactive remove picker (non-TTY fallback tests) ──────────────
+
 #[test]
 fn add_creates_worktree_and_branch() {
     let repo = fixtures::TestRepo::new();
@@ -309,4 +311,143 @@ fn remove_print_paths_conflicts_with_json() {
         .stderr(predicates::prelude::predicate::str::contains(
             "cannot be used with",
         ));
+}
+
+// ── Interactive picker fallback tests ───────────────────────────────
+//
+// These tests run in a non-TTY (CI) context, so the picker never opens.
+// They verify the fallback routing: machine formats use cwd inference,
+// non-TTY human format uses cwd inference, and appropriate errors are
+// shown when neither the picker nor cwd inference can resolve a branch.
+
+#[test]
+fn remove_no_branch_non_tty_inside_worktree_uses_cwd_inference() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Create a worktree
+    let output = wt_core()
+        .args(["add", "infer-rm", "--repo", &repo_str, "--print-cd-path"])
+        .output()
+        .expect("add failed");
+    let wt_path = String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+
+    // Remove from inside the worktree without specifying a branch.
+    // Non-TTY → falls back to cwd inference → removes current worktree.
+    wt_core()
+        .args(["remove"])
+        .current_dir(&wt_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("infer-rm"));
+}
+
+#[test]
+fn remove_no_branch_non_tty_from_main_worktree_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    // Running from the main worktree root without a branch.
+    // Non-TTY → cwd inference resolves to main → invariant error.
+    wt_core()
+        .args(["remove"])
+        .current_dir(repo.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing to remove the main worktree",
+        ))
+        .code(4);
+}
+
+#[test]
+fn remove_no_branch_non_tty_outside_any_worktree_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    // Running with --repo but cwd is NOT inside the repo at all.
+    // Non-TTY → cwd inference fails → usage error.
+    wt_core()
+        .args(["remove", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "no branch specified and cwd is not inside a worktree",
+        ))
+        .code(1);
+}
+
+#[test]
+fn remove_no_branch_json_uses_cwd_inference() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Create a worktree
+    let output = wt_core()
+        .args(["add", "json-infer", "--repo", &repo_str, "--print-cd-path"])
+        .output()
+        .expect("add failed");
+    let wt_path = String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+
+    // --json without a branch uses cwd inference
+    let output = wt_core()
+        .args(["remove", "--json"])
+        .current_dir(&wt_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "json-infer");
+}
+
+#[test]
+fn remove_no_branch_print_paths_uses_cwd_inference() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Create a worktree
+    let output = wt_core()
+        .args(["add", "paths-infer", "--repo", &repo_str, "--print-cd-path"])
+        .output()
+        .expect("add failed");
+    let wt_path = String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+
+    // --print-paths without a branch uses cwd inference
+    let output = wt_core()
+        .args(["remove", "--print-paths"])
+        .current_dir(&wt_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[2], "paths-infer");
+}
+
+#[test]
+fn remove_no_branch_no_worktrees_non_tty_errors() {
+    let repo = fixtures::TestRepo::new();
+
+    // No worktrees created, no branch specified, outside any worktree.
+    // In non-TTY, this falls through to cwd inference which finds the
+    // main worktree → invariant error.
+    wt_core()
+        .args(["remove", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .failure();
 }
