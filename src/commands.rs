@@ -329,10 +329,17 @@ fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<O
         ));
     }
 
-    // Determine pre-selection: find the candidate matching cwd.
-    let preselect = std::env::current_dir()
-        .ok()
-        .and_then(|cwd| candidates.iter().position(|wt| cwd.starts_with(&wt.path)));
+    // Determine pre-selection: find the candidate whose path is the longest
+    // prefix of cwd (most-specific match), consistent with the cwd inference
+    // logic in worktree::remove().
+    let preselect = std::env::current_dir().ok().and_then(|cwd| {
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| cwd.starts_with(&wt.path))
+            .max_by_key(|(_, wt)| wt.path.as_os_str().len())
+            .map(|(idx, _)| idx)
+    });
 
     pick_removable_worktree(&candidates, preselect).map(Some)
 }
@@ -371,6 +378,9 @@ fn pick_removable_worktree(
             })?;
             Ok(BranchName::new(branch))
         }
+        // Esc / Ctrl-C: dialoguer has already restored the terminal state
+        // before returning None, so destructors are not a concern here.
+        // Exit 130 (128 + SIGINT) is the Unix convention for user cancellation.
         None => std::process::exit(130),
     }
 }

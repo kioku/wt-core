@@ -7,8 +7,6 @@ fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
 }
 
-// ── Interactive remove picker (non-TTY fallback tests) ──────────────
-
 #[test]
 fn add_creates_worktree_and_branch() {
     let repo = fixtures::TestRepo::new();
