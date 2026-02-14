@@ -26,10 +26,10 @@ if ($root_output | str contains "Portable Git worktree lifecycle manager") {
 }
 
 let help_output = (wt --help)
-if ($help_output | str contains "wt add") and ($help_output | str contains "Subcommands") {
-    pass "wt --help: root command help available"
+if ($help_output | str contains "Usage: wt-core <COMMAND>") and ($help_output | str contains "Commands:") {
+    pass "wt --help: passthrough to core help"
 } else {
-    fail "wt --help: missing expected command help output"
+    fail "wt --help: missing expected core help output"
 }
 
 # ── wt add ───────────────────────────────────────────────────────────

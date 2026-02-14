@@ -8,6 +8,17 @@ wt() {
     case "$cmd" in
         add)
             shift
+
+            # Preserve native help/version output.
+            for arg in "$@"; do
+                case "$arg" in
+                    -h|--help|-V|--version)
+                        wt-core add "$@"
+                        return $?
+                        ;;
+                esac
+            done
+
             local target
             target=$(wt-core add "$@" --print-cd-path 2>/dev/null)
             if [ $? -eq 0 ] && [ -n "$target" ]; then
@@ -20,6 +31,17 @@ wt() {
             ;;
         go)
             shift
+
+            # Preserve native help/version output.
+            for arg in "$@"; do
+                case "$arg" in
+                    -h|--help|-V|--version)
+                        wt-core go "$@"
+                        return $?
+                        ;;
+                esac
+            done
+
             # Detect if the caller explicitly asked for --json
             local want_json=false
             for arg in "$@"; do
@@ -44,6 +66,17 @@ wt() {
             ;;
         remove)
             shift
+
+            # Preserve native help/version output.
+            for arg in "$@"; do
+                case "$arg" in
+                    -h|--help|-V|--version)
+                        wt-core remove "$@"
+                        return $?
+                        ;;
+                esac
+            done
+
             # Detect if the caller explicitly asked for --json
             local want_json=false
             for arg in "$@"; do

@@ -7,7 +7,7 @@
 # Intentionally non-exported: Nushell disallows exporting a command with the
 # same name as the module (`wt`). This still works when sourced, which is the
 # intended integration path (`wt-core init nu`).
-def wt [
+def --wrapped wt [
     ...args: string  # Optional passthrough args for wt-core
 ] {
     if ($args | is-empty) {

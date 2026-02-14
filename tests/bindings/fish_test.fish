@@ -59,6 +59,48 @@ else
     fail "wt go: expected $WT_PATH, got "(realpath "$PWD")
 end
 
+# ── help passthrough safety ─────────────────────────────────────────
+set add_help (wt add --help 2>&1)
+if string match -q "*Usage: wt-core add*" "$add_help"
+    pass "wt add --help: passthrough to core help"
+else
+    fail "wt add --help: expected core help output"
+end
+if test (realpath "$PWD") = "$WT_PATH"
+    pass "wt add --help: cwd unchanged"
+else
+    fail "wt add --help: cwd changed unexpectedly"
+end
+
+set go_help (wt go --help 2>&1)
+if string match -q "*Usage: wt-core go*" "$go_help"
+    pass "wt go --help: passthrough to core help"
+else
+    fail "wt go --help: expected core help output"
+end
+if test (realpath "$PWD") = "$WT_PATH"
+    pass "wt go --help: cwd unchanged"
+else
+    fail "wt go --help: cwd changed unexpectedly"
+end
+
+set rm_help (wt remove --help 2>&1)
+if string match -q "*Usage: wt-core remove*" "$rm_help"
+    pass "wt remove --help: passthrough to core help"
+else
+    fail "wt remove --help: expected core help output"
+end
+if test -d "$WT_PATH"
+    pass "wt remove --help: worktree not removed"
+else
+    fail "wt remove --help: worktree was removed unexpectedly"
+end
+if test (realpath "$PWD") = "$WT_PATH"
+    pass "wt remove --help: cwd unchanged"
+else
+    fail "wt remove --help: cwd changed unexpectedly"
+end
+
 # ── wt remove (from inside worktree) ────────────────────────────────
 wt remove feat-one 2>&1
 if test (realpath "$PWD") = "$REPO_PATH"

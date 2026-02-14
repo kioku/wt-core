@@ -45,6 +45,34 @@ wt go feat-one >/dev/null 2>&1
     && pass "wt go: cd into existing worktree" \
     || fail "wt go: expected $WT_PATH, got $(pwd -P)"
 
+# ── help passthrough safety ─────────────────────────────────────────
+add_help=$(wt add --help 2>&1)
+echo "$add_help" | grep -q "Usage: wt-core add" \
+    && pass "wt add --help: passthrough to core help" \
+    || fail "wt add --help: expected core help output"
+[[ "$(pwd -P)" == "$WT_PATH" ]] \
+    && pass "wt add --help: cwd unchanged" \
+    || fail "wt add --help: cwd changed unexpectedly"
+
+go_help=$(wt go --help 2>&1)
+echo "$go_help" | grep -q "Usage: wt-core go" \
+    && pass "wt go --help: passthrough to core help" \
+    || fail "wt go --help: expected core help output"
+[[ "$(pwd -P)" == "$WT_PATH" ]] \
+    && pass "wt go --help: cwd unchanged" \
+    || fail "wt go --help: cwd changed unexpectedly"
+
+rm_help=$(wt remove --help 2>&1)
+echo "$rm_help" | grep -q "Usage: wt-core remove" \
+    && pass "wt remove --help: passthrough to core help" \
+    || fail "wt remove --help: expected core help output"
+[[ -d "$WT_PATH" ]] \
+    && pass "wt remove --help: worktree not removed" \
+    || fail "wt remove --help: worktree was removed unexpectedly"
+[[ "$(pwd -P)" == "$WT_PATH" ]] \
+    && pass "wt remove --help: cwd unchanged" \
+    || fail "wt remove --help: cwd changed unexpectedly"
+
 # ── wt remove (from inside worktree) ────────────────────────────────
 wt remove feat-one 2>&1
 [[ "$(pwd -P)" == "$REPO_PATH" ]] \

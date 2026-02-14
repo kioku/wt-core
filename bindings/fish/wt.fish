@@ -7,6 +7,15 @@ function wt --description "Git worktree manager"
     switch "$cmd"
         case add
             set -e argv[1]
+
+            # Preserve native help/version output.
+            for arg in $argv
+                if test "$arg" = "-h" -o "$arg" = "--help" -o "$arg" = "-V" -o "$arg" = "--version"
+                    wt-core add $argv
+                    return $status
+                end
+            end
+
             set -l target (wt-core add $argv --print-cd-path 2>/dev/null)
             if test $status -eq 0 -a -n "$target"
                 cd "$target"
@@ -17,6 +26,15 @@ function wt --description "Git worktree manager"
 
         case go
             set -e argv[1]
+
+            # Preserve native help/version output.
+            for arg in $argv
+                if test "$arg" = "-h" -o "$arg" = "--help" -o "$arg" = "-V" -o "$arg" = "--version"
+                    wt-core go $argv
+                    return $status
+                end
+            end
+
             # Detect if the caller explicitly asked for --json
             set -l want_json false
             for arg in $argv
@@ -42,6 +60,15 @@ function wt --description "Git worktree manager"
 
         case remove
             set -e argv[1]
+
+            # Preserve native help/version output.
+            for arg in $argv
+                if test "$arg" = "-h" -o "$arg" = "--help" -o "$arg" = "-V" -o "$arg" = "--version"
+                    wt-core remove $argv
+                    return $status
+                end
+            end
+
             # Detect if the caller explicitly asked for --json
             set -l want_json false
             for arg in $argv
