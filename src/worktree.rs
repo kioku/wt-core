@@ -433,9 +433,11 @@ pub struct MergeResult {
     pub mainline: String,
     pub repo_root: PathBuf,
     pub cleaned_up: bool,
+    /// Path of the removed worktree (only set when `cleaned_up` is true).
+    pub removed_path: Option<PathBuf>,
     pub pushed: bool,
-    /// Non-fatal warning (e.g. push failure after successful merge).
-    pub warning: Option<String>,
+    /// Non-fatal warnings (e.g. cleanup or push failure after merge).
+    pub warnings: Vec<String>,
 }
 
 /// Merge a worktree's branch into the mainline.
@@ -493,27 +495,44 @@ pub fn merge(
         // Abort to restore the main worktree to a clean state.
         git::merge_abort(repo);
         return Err(AppError::conflict(format!(
-            "merge conflicts with '{}' — merge aborted, resolve manually\n{e}",
+            "merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{e}",
             target_branch
         )));
     }
 
+    let mut warnings = Vec::new();
+
     // Cleanup: remove worktree and branch (default behaviour).
-    let cleaned_up = if no_cleanup {
-        false
+    // Downgraded to a warning because the merge has already been committed;
+    // a hard error would hide the successful merge from the caller.
+    let (cleaned_up, removed_path) = if no_cleanup {
+        (false, None)
     } else {
-        remove(repo, Some(&target_branch), false)?;
-        true
+        match remove(repo, Some(&target_branch), false) {
+            Ok(result) => {
+                if let Some(w) = result.warning {
+                    warnings.push(w);
+                }
+                (true, Some(result.removed_path))
+            }
+            Err(e) => {
+                warnings.push(format!("merge succeeded but cleanup failed: {e}"));
+                (false, None)
+            }
+        }
     };
 
     // Push mainline to origin if requested.
-    let (pushed, warning) = if push {
+    let pushed = if push {
         match git::push(repo, &mainline) {
-            Ok(()) => (true, None),
-            Err(e) => (false, Some(format!("merge succeeded but push failed: {e}"))),
+            Ok(()) => true,
+            Err(e) => {
+                warnings.push(format!("merge succeeded but push failed: {e}"));
+                false
+            }
         }
     } else {
-        (false, None)
+        false
     };
 
     Ok(MergeResult {
@@ -521,7 +540,8 @@ pub fn merge(
         mainline,
         repo_root: repo.to_path_buf(),
         cleaned_up,
+        removed_path,
         pushed,
-        warning,
+        warnings,
     })
 }

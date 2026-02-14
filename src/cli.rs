@@ -92,29 +92,6 @@ pub enum Command {
         print_paths: bool,
     },
 
-    /// Remove worktrees whose branches are fully integrated into mainline
-    Prune {
-        /// Actually remove integrated worktrees (default is dry-run)
-        #[arg(long)]
-        execute: bool,
-
-        /// Force removal of dirty worktrees and use -D for branch deletion
-        #[arg(long, requires = "execute")]
-        force: bool,
-
-        /// Override mainline branch (default: auto-detect)
-        #[arg(long)]
-        mainline: Option<String>,
-
-        /// Repository path (defaults to current directory)
-        #[arg(long)]
-        repo: Option<PathBuf>,
-
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
     /// Merge a worktree's branch into mainline and clean up
     Merge {
         /// Branch name (defaults to current worktree's branch)
@@ -136,9 +113,32 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print merge info (one per line) for shell wrappers
+        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line) for shell wrappers
         #[arg(long, conflicts_with = "json")]
         print_paths: bool,
+    },
+
+    /// Remove worktrees whose branches are fully integrated into mainline
+    Prune {
+        /// Actually remove integrated worktrees (default is dry-run)
+        #[arg(long)]
+        execute: bool,
+
+        /// Force removal of dirty worktrees and use -D for branch deletion
+        #[arg(long, requires = "execute")]
+        force: bool,
+
+        /// Override mainline branch (default: auto-detect)
+        #[arg(long)]
+        mainline: Option<String>,
+
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print shell bindings to stdout

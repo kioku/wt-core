@@ -203,7 +203,7 @@ pub struct JsonSkippedEntry {
 pub enum MergeFormat {
     Human,
     Json,
-    /// `--print-paths`: prints repo_root, branch, mainline, cleaned_up, pushed (one per line).
+    /// `--print-paths`: prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
     PrintPaths,
 }
 
@@ -216,6 +216,8 @@ pub struct JsonMergeResponse {
     pub mainline: String,
     pub repo_root: String,
     pub cleaned_up: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_path: Option<String>,
     pub pushed: bool,
 }
 

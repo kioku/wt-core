@@ -117,7 +117,7 @@ fn merge_conflict_aborts_and_leaves_everything_untouched() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("merge conflicts"))
-        .stderr(predicate::str::contains("merge aborted, resolve manually"));
+        .stderr(predicate::str::contains("merge aborted"));
 
     // Worktree should still exist
     let wt_dir = find_worktree_dir(&repo.path(), "feature-conflict");
@@ -134,6 +134,78 @@ fn merge_conflict_aborts_and_leaves_everything_untouched() {
     assert!(
         status.is_empty(),
         "main worktree should be clean after abort: {status}"
+    );
+}
+
+// ── Dirty worktree tests ────────────────────────────────────────────
+
+#[test]
+fn merge_dirty_main_worktree_errors() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/dirty-main", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-dirty-main");
+    // Modify the same file on the feature branch so the merge would touch it.
+    commit_file(&wt_dir, "README.md", "feature changes", "feature change");
+
+    // Modify the same tracked file on main without committing.
+    // Git refuses to merge when tracked files with local changes would
+    // be overwritten by the merge.
+    std::fs::write(repo.path().join("README.md"), "dirty local changes").expect("write failed");
+
+    wt_core()
+        .args(["merge", "feature/dirty-main", "--repo", &repo_str])
+        .assert()
+        .failure();
+
+    // Restore tracked file so TestRepo::drop doesn't fail.
+    run_git(&["checkout", "--", "README.md"], &repo.path());
+}
+
+#[test]
+fn merge_cleanup_failure_is_warning_not_error() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/dirty-wt", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-dirty-wt");
+    commit_file(&wt_dir, "clean.txt", "clean commit", "add clean");
+
+    // Create an uncommitted file in the feature worktree so removal fails.
+    std::fs::write(wt_dir.join("dirty.txt"), "dirty").expect("write failed");
+
+    // Merge should succeed (merge itself is on main), but cleanup fails.
+    // Cleanup failure is a warning, not a hard error.
+    wt_core()
+        .args(["merge", "feature/dirty-wt", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merged 'feature/dirty-wt' into main",
+        ))
+        .stderr(predicate::str::contains("warning:"))
+        .stderr(predicate::str::contains("cleanup failed"));
+
+    // Verify merge commit exists on main despite cleanup failure.
+    let log = git_log_oneline(&repo.path(), "main");
+    assert!(
+        log.contains("Merge branch 'feature/dirty-wt'"),
+        "merge commit should exist on main: {log}"
+    );
+
+    // Worktree should still exist (cleanup failed).
+    assert!(
+        wt_dir.exists(),
+        "worktree should still exist after cleanup failure"
     );
 }
 
@@ -265,6 +337,10 @@ fn merge_json_output_structure() {
     assert_eq!(json["mainline"], "main");
     assert!(json["repo_root"].as_str().is_some());
     assert_eq!(json["cleaned_up"], true);
+    assert!(
+        json["removed_path"].as_str().is_some(),
+        "removed_path should be present when cleaned_up is true"
+    );
     assert_eq!(json["pushed"], false);
 }
 
@@ -299,12 +375,16 @@ fn merge_json_no_cleanup_shows_false() {
     let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
     assert_eq!(json["ok"], true);
     assert_eq!(json["cleaned_up"], false);
+    assert!(
+        json["removed_path"].is_null(),
+        "removed_path should be absent when cleaned_up is false"
+    );
 }
 
 // ── Print-paths output tests ────────────────────────────────────────
 
 #[test]
-fn merge_print_paths_returns_five_lines() {
+fn merge_print_paths_returns_six_lines() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
@@ -332,7 +412,7 @@ fn merge_print_paths_returns_five_lines() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 5, "expected 5 lines: {stdout}");
+    assert_eq!(lines.len(), 6, "expected 6 lines: {stdout}");
 
     // Line 1: repo root
     assert!(
@@ -350,8 +430,15 @@ fn merge_print_paths_returns_five_lines() {
     // Line 4: cleaned_up
     assert_eq!(lines[3], "true");
 
-    // Line 5: pushed
-    assert_eq!(lines[4], "false");
+    // Line 5: removed_path (non-empty when cleaned_up)
+    assert!(
+        lines[4].contains(".worktrees/"),
+        "line 5 should be the removed worktree path: {}",
+        lines[4]
+    );
+
+    // Line 6: pushed
+    assert_eq!(lines[5], "false");
 }
 
 #[test]

@@ -155,12 +155,13 @@ wt() {
                 output=$(wt-core merge "$@")
                 local rc=$?
                 if [ $rc -eq 0 ]; then
-                    local repo_root cleaned_up
-                    repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                    cleaned_up=$(printf '%s\n' "$output" | sed -n 's/.*"cleaned_up": *\(true\|false\).*/\1/p')
-                    if [ "$cleaned_up" = "true" ] && [ -n "$repo_root" ]; then
+                    local removed_path
+                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    if [ -n "$removed_path" ]; then
                         case "$cwd_before" in
-                            "${repo_root}"/.worktrees/*)
+                            "${removed_path}"*)
+                                local repo_root
+                                repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
                                 cd "$repo_root" || true
                                 ;;
                         esac
@@ -172,20 +173,21 @@ wt() {
 
             local cwd_before
             cwd_before=$(pwd)
-            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, pushed
+            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
             local result
             result=$(wt-core merge "$@" --print-paths)
             local rc=$?
             if [ $rc -eq 0 ]; then
-                local repo_root branch mainline cleaned_up pushed
+                local repo_root branch mainline cleaned_up removed_path pushed
                 repo_root=$(printf '%s\n' "$result" | sed -n '1p')
                 branch=$(printf '%s\n' "$result" | sed -n '2p')
                 mainline=$(printf '%s\n' "$result" | sed -n '3p')
                 cleaned_up=$(printf '%s\n' "$result" | sed -n '4p')
-                pushed=$(printf '%s\n' "$result" | sed -n '5p')
-                if [ "$cleaned_up" = "true" ]; then
+                removed_path=$(printf '%s\n' "$result" | sed -n '5p')
+                pushed=$(printf '%s\n' "$result" | sed -n '6p')
+                if [ "$cleaned_up" = "true" ] && [ -n "$removed_path" ]; then
                     case "$cwd_before" in
-                        "${repo_root}"/.worktrees/*)
+                        "${removed_path}"*)
                             cd "$repo_root" || true
                             ;;
                     esac

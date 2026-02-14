@@ -140,8 +140,8 @@ export def --env "wt merge" [
         let full_args = (build-args $args $repo true false)
         let result = (^wt-core ...$full_args | from json)
 
-        if ($result.ok) and ($result.cleaned_up? == true) and ($result.repo_root? != null) {
-            if ($cwd_before | str starts-with $"($result.repo_root)/.worktrees/") {
+        if ($result.ok) and ($result.removed_path? != null) {
+            if ($cwd_before | str starts-with ($result.removed_path)) {
                 cd $result.repo_root
             }
         }
@@ -155,10 +155,11 @@ export def --env "wt merge" [
         let branch_name = ($lines | get 1)
         let mainline = ($lines | get 2)
         let cleaned_up = ($lines | get 3)
-        let pushed = ($lines | get 4)
+        let removed_path = ($lines | get 4)
+        let pushed = ($lines | get 5)
 
-        if $cleaned_up == "true" {
-            if ($cwd_before | str starts-with $"($repo_root)/.worktrees/") {
+        if $cleaned_up == "true" and $removed_path != "" {
+            if ($cwd_before | str starts-with $removed_path) {
                 cd $repo_root
             }
         }

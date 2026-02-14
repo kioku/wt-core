@@ -138,10 +138,10 @@ function wt --description "Git worktree manager"
                 set -l output (wt-core merge $argv)
                 set -l rc $status
                 if test $rc -eq 0
-                    set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                    set -l cleaned_up (printf '%s\n' $output | sed -n 's/.*"cleaned_up": *\(true\|false\).*/\1/p')
-                    if test "$cleaned_up" = "true" -a -n "$repo_root"
-                        if string match -q "$repo_root/.worktrees/*" "$cwd_before"
+                    set -l removed_path (printf '%s\n' $output | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    if test -n "$removed_path"
+                        if string match -q "$removed_path*" "$cwd_before"
+                            set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
                             cd "$repo_root"; or true
                         end
                     end
@@ -151,7 +151,7 @@ function wt --description "Git worktree manager"
             end
 
             set -l cwd_before (pwd)
-            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, pushed
+            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
             set -l lines (wt-core merge $argv --print-paths)
             set -l rc $status
             if test $rc -eq 0
@@ -159,9 +159,10 @@ function wt --description "Git worktree manager"
                 set -l branch $lines[2]
                 set -l mainline $lines[3]
                 set -l cleaned_up $lines[4]
-                set -l pushed $lines[5]
-                if test "$cleaned_up" = "true"
-                    if string match -q "$repo_root/.worktrees/*" "$cwd_before"
+                set -l removed_path $lines[5]
+                set -l pushed $lines[6]
+                if test "$cleaned_up" = "true" -a -n "$removed_path"
+                    if string match -q "$removed_path*" "$cwd_before"
                         cd "$repo_root"; or true
                     end
                 end

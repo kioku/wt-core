@@ -449,6 +449,11 @@ fn cmd_merge(
 
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;
+    let removed_str = result
+        .removed_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
 
     match fmt {
         MergeFormat::PrintPaths => {
@@ -456,6 +461,7 @@ fn cmd_merge(
             println!("{branch_name}");
             println!("{}", result.mainline);
             println!("{}", result.cleaned_up);
+            println!("{removed_str}");
             println!("{}", result.pushed);
         }
         MergeFormat::Json => {
@@ -466,6 +472,11 @@ fn cmd_merge(
                 mainline: result.mainline.clone(),
                 repo_root: root_str,
                 cleaned_up: result.cleaned_up,
+                removed_path: if result.cleaned_up {
+                    Some(removed_str)
+                } else {
+                    None
+                },
                 pushed: result.pushed,
             })?;
         }
@@ -479,7 +490,7 @@ fn cmd_merge(
             }
         }
     }
-    if let Some(w) = &result.warning {
+    for w in &result.warnings {
         eprintln!("warning: {w}");
     }
     Ok(())
