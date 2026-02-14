@@ -321,25 +321,25 @@ fn pick_worktree(_worktrees: &[domain::Worktree]) -> Result<BranchName> {
     ))
 }
 
-/// Resolve the branch for `remove` when none was explicitly provided.
+/// Resolve an optional branch for a destructive command (`remove`, `merge`)
+/// when none was explicitly provided.
 ///
-/// In TTY contexts (both human and `--print-paths` formats), opens an
-/// interactive picker excluding the main worktree and pre-selecting the
-/// current worktree if applicable. `--print-paths` is allowed because shell
-/// bindings need it to capture paths on stdout while the picker renders on
-/// stderr/tty (same pattern as `go` with `--print-cd-path`).
+/// In TTY contexts (human and `--print-paths` formats), opens an interactive
+/// picker excluding the main worktree and pre-selecting the current worktree
+/// if applicable. For JSON and non-TTY contexts, returns `None` so the
+/// caller falls back to cwd inference in the worktree layer.
 ///
-/// For `--json` and non-TTY contexts, returns `None` so `worktree::remove()`
-/// falls back to cwd inference.
-fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<Option<BranchName>> {
-    // JSON is for machine consumers that pass an explicit branch or rely on
-    // cwd inference.  --print-paths is used by shell bindings that *do* want
-    // the picker (the UI renders on stderr/tty, paths go to stdout).
-    if matches!(fmt, RemoveFormat::Json) {
+/// `is_json` — whether the output format is machine-only (JSON).
+/// `action`  — verb shown in picker prompt and error messages (e.g. "remove", "merge").
+fn resolve_action_branch(
+    repo: &domain::RepoRoot,
+    is_json: bool,
+    action: &str,
+) -> Result<Option<BranchName>> {
+    if is_json {
         return Ok(None);
     }
 
-    // Non-TTY cannot render a picker; fall back to cwd inference.
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -348,14 +348,12 @@ fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<O
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
-        return Err(AppError::usage(
-            "no worktrees to remove (create one with `wt add`)".to_string(),
-        ));
+        return Err(AppError::usage(format!(
+            "no worktrees to {action} (create one with `wt add`)"
+        )));
     }
 
-    // Determine pre-selection: find the candidate whose path is the longest
-    // prefix of cwd (most-specific match), consistent with the cwd inference
-    // logic in worktree::remove().
+    // Pre-select the candidate whose path is the longest prefix of cwd.
     let preselect = std::env::current_dir().ok().and_then(|cwd| {
         candidates
             .iter()
@@ -365,20 +363,24 @@ fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<O
             .map(|(idx, _)| idx)
     });
 
-    pick_removable_worktree(&candidates, preselect).map(Some)
+    pick_action_worktree(&candidates, preselect, action).map(Some)
 }
 
-/// Present an interactive fuzzy picker for worktree removal.
+/// Present an interactive fuzzy picker for a destructive worktree action.
 ///
 /// Only non-main worktrees are shown. `preselect` is the index into
 /// `candidates` to highlight by default (e.g. the current worktree).
+/// `action` is the verb displayed in the prompt (e.g. "Remove", "Merge").
 #[cfg(feature = "interactive")]
-fn pick_removable_worktree(
+fn pick_action_worktree(
     candidates: &[&domain::Worktree],
     preselect: Option<usize>,
+    action: &str,
 ) -> Result<BranchName> {
     use dialoguer::theme::ColorfulTheme;
     use dialoguer::FuzzySelect;
+
+    let prompt = format!("{} worktree", capitalize(action));
 
     let items: Vec<String> = candidates
         .iter()
@@ -389,7 +391,7 @@ fn pick_removable_worktree(
         .collect();
 
     let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Remove worktree")
+        .with_prompt(&prompt)
         .items(&items)
         .default(preselect.unwrap_or(0))
         .interact_opt()
@@ -410,94 +412,23 @@ fn pick_removable_worktree(
 }
 
 #[cfg(not(feature = "interactive"))]
-fn pick_removable_worktree(
+fn pick_action_worktree(
     _candidates: &[&domain::Worktree],
     _preselect: Option<usize>,
+    _action: &str,
 ) -> Result<BranchName> {
     Err(AppError::usage(
         "interactive mode not available (compiled without 'interactive' feature)".to_string(),
     ))
 }
 
-/// Resolve the branch for `merge` when none was explicitly provided.
-///
-/// Same strategy as `resolve_remove_branch`: in TTY contexts (human and
-/// `--print-paths`), opens an interactive picker. For `--json` and non-TTY
-/// contexts, returns `None` so `worktree::merge()` falls back to cwd
-/// inference.
-fn resolve_merge_branch(repo: &domain::RepoRoot, fmt: MergeFormat) -> Result<Option<BranchName>> {
-    if matches!(fmt, MergeFormat::Json) {
-        return Ok(None);
+/// Capitalize the first character of a string (ASCII only).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
     }
-
-    if !std::io::stdin().is_terminal() {
-        return Ok(None);
-    }
-
-    let worktrees = git::list_worktrees(repo)?;
-    let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
-
-    if candidates.is_empty() {
-        return Err(AppError::usage(
-            "no worktrees to merge (create one with `wt add`)".to_string(),
-        ));
-    }
-
-    let preselect = std::env::current_dir().ok().and_then(|cwd| {
-        candidates
-            .iter()
-            .enumerate()
-            .filter(|(_, wt)| cwd.starts_with(&wt.path))
-            .max_by_key(|(_, wt)| wt.path.as_os_str().len())
-            .map(|(idx, _)| idx)
-    });
-
-    pick_mergeable_worktree(&candidates, preselect).map(Some)
-}
-
-/// Present an interactive fuzzy picker for worktree merge.
-#[cfg(feature = "interactive")]
-fn pick_mergeable_worktree(
-    candidates: &[&domain::Worktree],
-    preselect: Option<usize>,
-) -> Result<BranchName> {
-    use dialoguer::theme::ColorfulTheme;
-    use dialoguer::FuzzySelect;
-
-    let items: Vec<String> = candidates
-        .iter()
-        .map(|wt| {
-            let branch = wt.branch.as_deref().unwrap_or("(detached)");
-            format!("{branch:<30} {:<50} {}", wt.path.display(), wt.commit)
-        })
-        .collect();
-
-    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Merge worktree")
-        .items(&items)
-        .default(preselect.unwrap_or(0))
-        .interact_opt()
-        .map_err(|e| AppError::usage(format!("picker failed: {e}")))?;
-
-    match selection {
-        Some(idx) => {
-            let branch = candidates[idx].branch.as_deref().ok_or_else(|| {
-                AppError::usage("selected worktree has no branch (detached HEAD)".to_string())
-            })?;
-            Ok(BranchName::new(branch))
-        }
-        None => std::process::exit(130),
-    }
-}
-
-#[cfg(not(feature = "interactive"))]
-fn pick_mergeable_worktree(
-    _candidates: &[&domain::Worktree],
-    _preselect: Option<usize>,
-) -> Result<BranchName> {
-    Err(AppError::usage(
-        "interactive mode not available (compiled without 'interactive' feature)".to_string(),
-    ))
 }
 
 fn cmd_merge(
@@ -511,7 +442,7 @@ fn cmd_merge(
 
     let resolved_branch = match branch {
         Some(b) => Some(b),
-        None => resolve_merge_branch(&repo, fmt)?,
+        None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge")?,
     };
 
     let result = worktree::merge(&repo, resolved_branch.as_ref(), push, no_cleanup)?;
@@ -564,7 +495,7 @@ fn cmd_remove(
 
     let resolved_branch = match branch {
         Some(b) => Some(b),
-        None => resolve_remove_branch(&repo, fmt)?,
+        None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove")?,
     };
 
     let result = worktree::remove(&repo, resolved_branch.as_ref(), force)?;

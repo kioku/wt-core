@@ -111,12 +111,13 @@ fn merge_conflict_aborts_and_leaves_everything_untouched() {
     commit_file(&wt_dir, "shared.txt", "feature version", "feature change");
     commit_file(&repo.path(), "shared.txt", "main version", "main change");
 
-    // Merge should fail
+    // Merge should fail with conflict details from git.
     wt_core()
         .args(["merge", "feature/conflict", "--repo", &repo_str])
         .assert()
         .failure()
-        .stderr(predicate::str::contains("merge conflicts"));
+        .stderr(predicate::str::contains("merge conflicts"))
+        .stderr(predicate::str::contains("merge aborted, resolve manually"));
 
     // Worktree should still exist
     let wt_dir = find_worktree_dir(&repo.path(), "feature-conflict");
@@ -151,6 +152,38 @@ fn merge_refuses_main_worktree() {
         .stderr(predicate::str::contains(
             "refusing to merge the main worktree",
         ));
+}
+
+#[test]
+fn merge_refuses_when_main_worktree_not_on_mainline() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Create a feature worktree and commit to it.
+    wt_core()
+        .args(["add", "feature/diverged", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-diverged");
+    commit_file(&wt_dir, "d.txt", "diverged work", "diverged commit");
+
+    // Switch the main worktree off mainline to simulate HEAD divergence.
+    run_git(&["checkout", "-b", "other-branch"], &repo.path());
+
+    // Merge should refuse because HEAD != mainline.
+    wt_core()
+        .args(["merge", "feature/diverged", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(4) // Invariant violation
+        .stderr(predicate::str::contains(
+            "main worktree is on 'other-branch'",
+        ))
+        .stderr(predicate::str::contains("checkout mainline first"));
+
+    // Switch back so cleanup doesn't fail.
+    run_git(&["checkout", "main"], &repo.path());
 }
 
 // ── Push tests ──────────────────────────────────────────────────────
