@@ -54,6 +54,8 @@ fn classify_git_error(msg: String) -> AppError {
         || lower.contains("already exists")
         || lower.contains("already checked out")
         || lower.contains("is not fully merged")
+        || lower.contains("merge conflict")
+        || lower.contains("automatic merge failed")
     {
         return AppError::conflict(msg);
     }
@@ -326,6 +328,38 @@ pub fn branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
 /// Resolve a revision to confirm it exists.
 pub fn rev_exists(repo: &RepoRoot, rev: &str) -> bool {
     git(&["rev-parse", "--verify", rev], repo.as_ref()).is_ok()
+}
+
+/// Merge a branch into the current branch using `--no-ff`.
+///
+/// Must be run from the main worktree (the `repo` root). Returns `Ok(())`
+/// on a clean merge or an error if conflicts arise (or any other git failure).
+pub fn merge_no_ff(repo: &RepoRoot, branch: &str) -> Result<()> {
+    git(
+        &[
+            "merge",
+            "--no-ff",
+            branch,
+            "-m",
+            &format!("Merge branch '{branch}'"),
+        ],
+        repo.as_ref(),
+    )?;
+    Ok(())
+}
+
+/// Abort an in-progress merge.
+///
+/// Best-effort: if there is no merge to abort, git returns an error that
+/// we silently ignore.
+pub fn merge_abort(repo: &RepoRoot) {
+    let _ = git(&["merge", "--abort"], repo.as_ref());
+}
+
+/// Push a branch to `origin`.
+pub fn push(repo: &RepoRoot, branch: &str) -> Result<()> {
+    git(&["push", "origin", branch], repo.as_ref())?;
+    Ok(())
 }
 
 #[cfg(test)]

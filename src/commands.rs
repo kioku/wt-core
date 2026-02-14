@@ -6,9 +6,9 @@ use crate::domain::{self, BranchName};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    print_json, JsonDoctorResponse, JsonListResponse, JsonPruneDryRunEntry,
+    print_json, JsonDoctorResponse, JsonListResponse, JsonMergeResponse, JsonPruneDryRunEntry,
     JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
-    JsonSkippedEntry, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
 };
 use crate::worktree;
 
@@ -51,6 +51,20 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             remove_fmt(json, print_paths),
         ),
+        Command::Merge {
+            branch,
+            push,
+            no_cleanup,
+            repo,
+            json,
+            print_paths,
+        } => cmd_merge(
+            branch.as_deref().map(BranchName::new),
+            push,
+            no_cleanup,
+            repo,
+            merge_fmt(json, print_paths),
+        ),
         Command::Prune {
             execute,
             force,
@@ -88,6 +102,16 @@ fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
         RemoveFormat::Json
     } else {
         RemoveFormat::Human
+    }
+}
+
+fn merge_fmt(json: bool, print_paths: bool) -> MergeFormat {
+    if print_paths {
+        MergeFormat::PrintPaths
+    } else if json {
+        MergeFormat::Json
+    } else {
+        MergeFormat::Human
     }
 }
 
@@ -393,6 +417,141 @@ fn pick_removable_worktree(
     Err(AppError::usage(
         "interactive mode not available (compiled without 'interactive' feature)".to_string(),
     ))
+}
+
+/// Resolve the branch for `merge` when none was explicitly provided.
+///
+/// Same strategy as `resolve_remove_branch`: in TTY contexts (human and
+/// `--print-paths`), opens an interactive picker. For `--json` and non-TTY
+/// contexts, returns `None` so `worktree::merge()` falls back to cwd
+/// inference.
+fn resolve_merge_branch(repo: &domain::RepoRoot, fmt: MergeFormat) -> Result<Option<BranchName>> {
+    if matches!(fmt, MergeFormat::Json) {
+        return Ok(None);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let worktrees = git::list_worktrees(repo)?;
+    let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
+
+    if candidates.is_empty() {
+        return Err(AppError::usage(
+            "no worktrees to merge (create one with `wt add`)".to_string(),
+        ));
+    }
+
+    let preselect = std::env::current_dir().ok().and_then(|cwd| {
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| cwd.starts_with(&wt.path))
+            .max_by_key(|(_, wt)| wt.path.as_os_str().len())
+            .map(|(idx, _)| idx)
+    });
+
+    pick_mergeable_worktree(&candidates, preselect).map(Some)
+}
+
+/// Present an interactive fuzzy picker for worktree merge.
+#[cfg(feature = "interactive")]
+fn pick_mergeable_worktree(
+    candidates: &[&domain::Worktree],
+    preselect: Option<usize>,
+) -> Result<BranchName> {
+    use dialoguer::theme::ColorfulTheme;
+    use dialoguer::FuzzySelect;
+
+    let items: Vec<String> = candidates
+        .iter()
+        .map(|wt| {
+            let branch = wt.branch.as_deref().unwrap_or("(detached)");
+            format!("{branch:<30} {:<50} {}", wt.path.display(), wt.commit)
+        })
+        .collect();
+
+    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Merge worktree")
+        .items(&items)
+        .default(preselect.unwrap_or(0))
+        .interact_opt()
+        .map_err(|e| AppError::usage(format!("picker failed: {e}")))?;
+
+    match selection {
+        Some(idx) => {
+            let branch = candidates[idx].branch.as_deref().ok_or_else(|| {
+                AppError::usage("selected worktree has no branch (detached HEAD)".to_string())
+            })?;
+            Ok(BranchName::new(branch))
+        }
+        None => std::process::exit(130),
+    }
+}
+
+#[cfg(not(feature = "interactive"))]
+fn pick_mergeable_worktree(
+    _candidates: &[&domain::Worktree],
+    _preselect: Option<usize>,
+) -> Result<BranchName> {
+    Err(AppError::usage(
+        "interactive mode not available (compiled without 'interactive' feature)".to_string(),
+    ))
+}
+
+fn cmd_merge(
+    branch: Option<BranchName>,
+    push: bool,
+    no_cleanup: bool,
+    repo: Option<PathBuf>,
+    fmt: MergeFormat,
+) -> Result<()> {
+    let repo = resolve_repo(repo)?;
+
+    let resolved_branch = match branch {
+        Some(b) => Some(b),
+        None => resolve_merge_branch(&repo, fmt)?,
+    };
+
+    let result = worktree::merge(&repo, resolved_branch.as_ref(), push, no_cleanup)?;
+
+    let root_str = result.repo_root.display().to_string();
+    let branch_name = &result.branch;
+
+    match fmt {
+        MergeFormat::PrintPaths => {
+            println!("{root_str}");
+            println!("{branch_name}");
+            println!("{}", result.mainline);
+            println!("{}", result.cleaned_up);
+            println!("{}", result.pushed);
+        }
+        MergeFormat::Json => {
+            print_json(&JsonMergeResponse {
+                ok: true,
+                message: format!("merged '{}' into {}", branch_name, result.mainline),
+                branch: branch_name.to_string(),
+                mainline: result.mainline.clone(),
+                repo_root: root_str,
+                cleaned_up: result.cleaned_up,
+                pushed: result.pushed,
+            })?;
+        }
+        MergeFormat::Human => {
+            println!("Merged '{}' into {}", branch_name, result.mainline);
+            if result.cleaned_up {
+                println!("Removed worktree and branch '{}'", branch_name);
+            }
+            if result.pushed {
+                println!("Pushed {} to origin", result.mainline);
+            }
+        }
+    }
+    if let Some(w) = &result.warning {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
 }
 
 fn cmd_remove(

@@ -115,6 +115,32 @@ pub enum Command {
         json: bool,
     },
 
+    /// Merge a worktree's branch into mainline and clean up
+    Merge {
+        /// Branch name (defaults to current worktree's branch)
+        branch: Option<String>,
+
+        /// Push mainline to origin after successful merge
+        #[arg(long)]
+        push: bool,
+
+        /// Keep worktree and branch after merge (skip cleanup)
+        #[arg(long)]
+        no_cleanup: bool,
+
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Print merge info (one per line) for shell wrappers
+        #[arg(long, conflicts_with = "json")]
+        print_paths: bool,
+    },
+
     /// Print shell bindings to stdout
     Init {
         /// Shell to generate bindings for
