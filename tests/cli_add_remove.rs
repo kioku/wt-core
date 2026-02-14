@@ -443,11 +443,11 @@ fn remove_no_branch_print_paths_uses_cwd_inference() {
 fn remove_no_branch_no_worktrees_non_tty_errors() {
     let repo = fixtures::TestRepo::new();
 
-    // No worktrees created, no branch specified, outside any worktree.
-    // In non-TTY, this falls through to cwd inference which finds the
-    // main worktree → invariant error.
+    // No worktrees created, no branch specified, cwd outside the test repo.
+    // Non-TTY → cwd inference fails (cwd is not inside any worktree) → usage error.
     wt_core()
         .args(["remove", "--repo", &repo.path().display().to_string()])
         .assert()
-        .failure();
+        .failure()
+        .code(1);
 }

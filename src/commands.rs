@@ -299,13 +299,19 @@ fn pick_worktree(_worktrees: &[domain::Worktree]) -> Result<BranchName> {
 
 /// Resolve the branch for `remove` when none was explicitly provided.
 ///
-/// In human-format TTY contexts, opens an interactive picker (excluding the
-/// main worktree and pre-selecting the current worktree if applicable).
-/// For machine formats (`--json`, `--print-paths`) and non-TTY contexts,
-/// returns `None` so `worktree::remove()` falls back to cwd inference.
+/// In TTY contexts (both human and `--print-paths` formats), opens an
+/// interactive picker excluding the main worktree and pre-selecting the
+/// current worktree if applicable. `--print-paths` is allowed because shell
+/// bindings need it to capture paths on stdout while the picker renders on
+/// stderr/tty (same pattern as `go` with `--print-cd-path`).
+///
+/// For `--json` and non-TTY contexts, returns `None` so `worktree::remove()`
+/// falls back to cwd inference.
 fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<Option<BranchName>> {
-    // Machine-readable formats rely on explicit branches or cwd inference.
-    if matches!(fmt, RemoveFormat::Json | RemoveFormat::PrintPaths) {
+    // JSON is for machine consumers that pass an explicit branch or rely on
+    // cwd inference.  --print-paths is used by shell bindings that *do* want
+    // the picker (the UI renders on stderr/tty, paths go to stdout).
+    if matches!(fmt, RemoveFormat::Json) {
         return Ok(None);
     }
 

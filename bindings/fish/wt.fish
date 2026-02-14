@@ -96,8 +96,10 @@ function wt --description "Git worktree manager"
             end
 
             set -l cwd_before (pwd)
-            # --print-paths outputs three lines: removed_path, repo_root, branch
-            set -l lines (wt-core remove $argv --print-paths 2>/dev/null)
+            # --print-paths outputs three lines: removed_path, repo_root, branch.
+            # stderr is left connected to the terminal so the interactive picker
+            # (if triggered) renders correctly and errors are visible.
+            set -l lines (wt-core remove $argv --print-paths)
             set -l rc $status
             if test $rc -eq 0
                 set -l removed_path $lines[1]
@@ -109,8 +111,7 @@ function wt --description "Git worktree manager"
                 end
                 echo "Removed worktree and branch '$branch'"
             else
-                wt-core remove $argv
-                return $status
+                return $rc
             end
 
         case ''
