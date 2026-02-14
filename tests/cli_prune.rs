@@ -160,6 +160,76 @@ fn prune_dry_run_shows_rebase_integrated() {
         .stdout(predicate::str::contains("integrated (rebase)"));
 }
 
+/// Rebase-integrated branches use `-D` for deletion automatically, so
+/// `--execute` without `--force` must fully remove worktree AND branch.
+#[test]
+fn prune_execute_rebase_deletes_branch_without_force() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Create a worktree with a branch
+    wt_core()
+        .args(["add", "feature/rebased-exec", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    // Commit on the feature branch
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-rebased-exec");
+    commit_file(
+        &wt_dir,
+        "rebased.txt",
+        "rebased work",
+        "add rebased feature",
+    );
+
+    // Diverge main so cherry-pick produces a new (non-ff) commit
+    commit_file(
+        &repo.path(),
+        "mainline.txt",
+        "mainline work",
+        "mainline commit",
+    );
+
+    // Cherry-pick the feature commit into main (simulates rebase merge)
+    let mut log_cmd = StdCommand::new("git");
+    log_cmd
+        .args(["log", "feature/rebased-exec", "--format=%H", "-1"])
+        .current_dir(&repo.path());
+    for var in GIT_ENV_OVERRIDES {
+        log_cmd.env_remove(var);
+    }
+    let log_output = log_cmd.output().expect("git log failed");
+    let commit_hash = String::from_utf8_lossy(&log_output.stdout)
+        .trim()
+        .to_string();
+    run_git(&["cherry-pick", &commit_hash], &repo.path());
+
+    // Execute prune WITHOUT --force
+    wt_core()
+        .args(["prune", "--execute", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Removed feature/rebased-exec"))
+        .stdout(predicate::str::contains("Pruned 1 worktree."));
+
+    // Branch must be deleted (auto-escalated to -D for rebase integration)
+    let mut branch_cmd = StdCommand::new("git");
+    branch_cmd
+        .args(["branch", "--list", "feature/rebased-exec"])
+        .current_dir(&repo.path());
+    for var in GIT_ENV_OVERRIDES {
+        branch_cmd.env_remove(var);
+    }
+    let branch_output = branch_cmd.output().expect("git branch failed");
+    let branches = String::from_utf8_lossy(&branch_output.stdout)
+        .trim()
+        .to_string();
+    assert!(
+        branches.is_empty(),
+        "branch should be deleted but found: {branches}"
+    );
+}
+
 // ── Execute tests ───────────────────────────────────────────────────
 
 #[test]

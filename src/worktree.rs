@@ -265,6 +265,11 @@ struct PruneAccumulator {
 }
 
 /// Try to remove an integrated worktree and its branch.
+///
+/// When the branch was integrated via rebase (patch-id match), Git's own
+/// ancestry check (`git branch -d`) would refuse deletion because the
+/// original commits are not ancestors of mainline.  We auto-escalate to
+/// `-D` in that case since the cherry check already confirmed integration.
 fn prune_integrated_entry(
     repo: &RepoRoot,
     entry: WorktreePruneEntry,
@@ -272,6 +277,12 @@ fn prune_integrated_entry(
     acc: &mut PruneAccumulator,
 ) {
     let branch_name = entry.branch.clone().expect("integrated implies branch");
+
+    let force_branch = force
+        || matches!(
+            entry.status,
+            IntegrationStatus::Integrated(IntegrationMethod::Rebase)
+        );
 
     if let Err(e) = git::remove_worktree(repo, &entry.path, force) {
         acc.warnings.push(format!(
@@ -286,7 +297,7 @@ fn prune_integrated_entry(
     }
 
     let bn = BranchName::new(&branch_name);
-    if let Err(e) = git::delete_branch(repo, &bn, force) {
+    if let Err(e) = git::delete_branch(repo, &bn, force_branch) {
         acc.warnings.push(format!(
             "worktree removed but branch deletion failed for '{branch_name}': {e}"
         ));
