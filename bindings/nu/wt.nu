@@ -102,10 +102,13 @@ export def --env "wt remove" [
         # stderr/tty while paths go to stdout (same pattern as `go`
         # with --print-cd-path).
         let full_args = (build-args $args $repo false false | append "--print-paths")
-        # On failure wt-core prints to stderr (visible in the terminal)
-        # and exits non-zero.  Catch it here to avoid an
-        # index-out-of-bounds panic when the line list is empty.
-        let lines = try { ^wt-core ...$full_args | lines } catch { return }
+        # Capture stdout separately from the pipeline so that a
+        # non-zero exit code raises an error (piping through `| lines`
+        # directly would silently swallow the failure).  Stderr is
+        # inherited, keeping the interactive picker and error messages
+        # visible in the terminal.
+        let output = try { ^wt-core ...$full_args } catch { return }
+        let lines = ($output | lines)
         let removed_path = ($lines | get 0)
         let repo_root = ($lines | get 1)
         let branch_name = ($lines | get 2)
