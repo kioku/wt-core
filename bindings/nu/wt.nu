@@ -121,6 +121,58 @@ export def --env "wt remove" [
     }
 }
 
+# Merge a worktree's branch into mainline and clean up
+export def --env "wt merge" [
+    branch?: string  # Branch name (defaults to current worktree)
+    --push           # Push mainline to origin after merge
+    --no-cleanup     # Keep worktree and branch after merge
+    --repo: path     # Repository path (defaults to cwd)
+    --json           # Output as JSON
+] {
+    let cwd_before = (pwd)
+
+    mut args = ["merge"]
+    if $branch != null { $args = ($args | append $branch) }
+    if $push { $args = ($args | append "--push") }
+    if $no_cleanup { $args = ($args | append "--no-cleanup") }
+
+    if $json {
+        let full_args = (build-args $args $repo true false)
+        let result = (^wt-core ...$full_args | from json)
+
+        if ($result.ok) and ($result.cleaned_up? == true) and ($result.repo_root? != null) {
+            if ($cwd_before | str starts-with $"($result.repo_root)/.worktrees/") {
+                cd $result.repo_root
+            }
+        }
+
+        $result
+    } else {
+        let full_args = (build-args $args $repo false false | append "--print-paths")
+        let output = try { ^wt-core ...$full_args } catch { return }
+        let lines = ($output | lines)
+        let repo_root = ($lines | get 0)
+        let branch_name = ($lines | get 1)
+        let mainline = ($lines | get 2)
+        let cleaned_up = ($lines | get 3)
+        let pushed = ($lines | get 4)
+
+        if $cleaned_up == "true" {
+            if ($cwd_before | str starts-with $"($repo_root)/.worktrees/") {
+                cd $repo_root
+            }
+        }
+
+        print $"Merged '($branch_name)' into ($mainline)"
+        if $cleaned_up == "true" {
+            print $"Removed worktree and branch '($branch_name)'"
+        }
+        if $pushed == "true" {
+            print $"Pushed ($mainline) to origin"
+        }
+    }
+}
+
 # Diagnose worktree health
 export def "wt doctor" [
     --repo: path  # Repository path (defaults to cwd)

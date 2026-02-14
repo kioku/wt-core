@@ -114,6 +114,68 @@ function wt --description "Git worktree manager"
                 return $rc
             end
 
+        case merge
+            set -e argv[1]
+
+            # Preserve native help/version output.
+            for arg in $argv
+                if test "$arg" = "-h" -o "$arg" = "--help" -o "$arg" = "-V" -o "$arg" = "--version"
+                    wt-core merge $argv
+                    return $status
+                end
+            end
+
+            # Detect if the caller explicitly asked for --json
+            set -l want_json false
+            for arg in $argv
+                if test "$arg" = "--json"
+                    set want_json true
+                end
+            end
+
+            if test "$want_json" = true
+                set -l cwd_before (pwd)
+                set -l output (wt-core merge $argv)
+                set -l rc $status
+                if test $rc -eq 0
+                    set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
+                    set -l cleaned_up (printf '%s\n' $output | sed -n 's/.*"cleaned_up": *\(true\|false\).*/\1/p')
+                    if test "$cleaned_up" = "true" -a -n "$repo_root"
+                        if string match -q "$repo_root/.worktrees/*" "$cwd_before"
+                            cd "$repo_root"; or true
+                        end
+                    end
+                end
+                printf '%s\n' $output
+                return $rc
+            end
+
+            set -l cwd_before (pwd)
+            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, pushed
+            set -l lines (wt-core merge $argv --print-paths)
+            set -l rc $status
+            if test $rc -eq 0
+                set -l repo_root $lines[1]
+                set -l branch $lines[2]
+                set -l mainline $lines[3]
+                set -l cleaned_up $lines[4]
+                set -l pushed $lines[5]
+                if test "$cleaned_up" = "true"
+                    if string match -q "$repo_root/.worktrees/*" "$cwd_before"
+                        cd "$repo_root"; or true
+                    end
+                end
+                echo "Merged '$branch' into $mainline"
+                if test "$cleaned_up" = "true"
+                    echo "Removed worktree and branch '$branch'"
+                end
+                if test "$pushed" = "true"
+                    echo "Pushed $mainline to origin"
+                end
+            else
+                return $rc
+            end
+
         case ''
             wt-core --help
 
