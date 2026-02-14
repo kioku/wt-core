@@ -297,6 +297,88 @@ fn pick_worktree(_worktrees: &[domain::Worktree]) -> Result<BranchName> {
     ))
 }
 
+/// Resolve the branch for `remove` when none was explicitly provided.
+///
+/// In human-format TTY contexts, opens an interactive picker (excluding the
+/// main worktree and pre-selecting the current worktree if applicable).
+/// For machine formats (`--json`, `--print-paths`) and non-TTY contexts,
+/// returns `None` so `worktree::remove()` falls back to cwd inference.
+fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<Option<BranchName>> {
+    // Machine-readable formats rely on explicit branches or cwd inference.
+    if matches!(fmt, RemoveFormat::Json | RemoveFormat::PrintPaths) {
+        return Ok(None);
+    }
+
+    // Non-TTY cannot render a picker; fall back to cwd inference.
+    if !std::io::stdin().is_terminal() {
+        return Ok(None);
+    }
+
+    let worktrees = git::list_worktrees(repo)?;
+    let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
+
+    if candidates.is_empty() {
+        return Err(AppError::usage(
+            "no worktrees to remove (create one with `wt add`)".to_string(),
+        ));
+    }
+
+    // Determine pre-selection: find the candidate matching cwd.
+    let preselect = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| candidates.iter().position(|wt| cwd.starts_with(&wt.path)));
+
+    pick_removable_worktree(&candidates, preselect).map(Some)
+}
+
+/// Present an interactive fuzzy picker for worktree removal.
+///
+/// Only non-main worktrees are shown. `preselect` is the index into
+/// `candidates` to highlight by default (e.g. the current worktree).
+#[cfg(feature = "interactive")]
+fn pick_removable_worktree(
+    candidates: &[&domain::Worktree],
+    preselect: Option<usize>,
+) -> Result<BranchName> {
+    use dialoguer::theme::ColorfulTheme;
+    use dialoguer::FuzzySelect;
+
+    let items: Vec<String> = candidates
+        .iter()
+        .map(|wt| {
+            let branch = wt.branch.as_deref().unwrap_or("(detached)");
+            format!("{branch:<30} {:<50} {}", wt.path.display(), wt.commit)
+        })
+        .collect();
+
+    let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
+        .with_prompt("Remove worktree")
+        .items(&items)
+        .default(preselect.unwrap_or(0))
+        .interact_opt()
+        .map_err(|e| AppError::usage(format!("picker failed: {e}")))?;
+
+    match selection {
+        Some(idx) => {
+            let branch = candidates[idx].branch.as_deref().ok_or_else(|| {
+                AppError::usage("selected worktree has no branch (detached HEAD)".to_string())
+            })?;
+            Ok(BranchName::new(branch))
+        }
+        None => std::process::exit(130),
+    }
+}
+
+#[cfg(not(feature = "interactive"))]
+fn pick_removable_worktree(
+    _candidates: &[&domain::Worktree],
+    _preselect: Option<usize>,
+) -> Result<BranchName> {
+    Err(AppError::usage(
+        "interactive mode not available (compiled without 'interactive' feature)".to_string(),
+    ))
+}
+
 fn cmd_remove(
     branch: Option<BranchName>,
     force: bool,
@@ -304,7 +386,13 @@ fn cmd_remove(
     fmt: RemoveFormat,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
-    let result = worktree::remove(&repo, branch.as_ref(), force)?;
+
+    let resolved_branch = match branch {
+        Some(b) => Some(b),
+        None => resolve_remove_branch(&repo, fmt)?,
+    };
+
+    let result = worktree::remove(&repo, resolved_branch.as_ref(), force)?;
 
     let removed_str = result.removed_path.display().to_string();
     let root_str = result.repo_root.display().to_string();
