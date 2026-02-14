@@ -254,6 +254,29 @@ pub fn cherry(repo: &RepoRoot, mainline: &str, branch: &str) -> bool {
     }
 }
 
+/// Try to resolve `refs/remotes/origin/HEAD` to a usable branch name.
+///
+/// Returns the local branch name if it exists, otherwise the full remote
+/// ref (e.g. `origin/main`) so git commands can still resolve it.
+fn resolve_origin_head(repo: &RepoRoot) -> Option<String> {
+    let symref = git(
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        repo.as_ref(),
+    )
+    .ok()?;
+
+    let local = symref
+        .strip_prefix("origin/")
+        .unwrap_or(&symref)
+        .to_string();
+    let local_bn = BranchName::new(&local);
+
+    if branch_exists(repo, &local_bn) {
+        return Some(local);
+    }
+    Some(symref)
+}
+
 /// Auto-detect the mainline branch.
 ///
 /// Resolution order:
@@ -262,17 +285,11 @@ pub fn cherry(repo: &RepoRoot, mainline: &str, branch: &str) -> bool {
 /// 3. Local branch named `master`
 /// 4. The main worktree's branch (first entry from `git worktree list`)
 pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
-    // 1. Try origin/HEAD
-    if let Ok(symref) = git(
-        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        repo.as_ref(),
-    ) {
-        // symref is like "origin/main" — strip the remote prefix
-        let branch = symref
-            .strip_prefix("origin/")
-            .unwrap_or(&symref)
-            .to_string();
-        return Ok(branch);
+    // 1. Try origin/HEAD — prefer the local branch name if it exists,
+    //    otherwise use the full remote ref so git commands can resolve it
+    //    even when there is no local tracking branch.
+    if let Some(name) = resolve_origin_head(repo) {
+        return Ok(name);
     }
 
     // 2. Check for local 'main'

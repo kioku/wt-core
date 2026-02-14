@@ -5,44 +5,10 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+use fixtures::{commit_file, find_worktree_dir, run_git};
+
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
-}
-
-/// Environment variables that can leak from parent git processes (e.g. hooks).
-const GIT_ENV_OVERRIDES: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_PREFIX",
-];
-
-/// Run a git command in the given directory (test helper).
-///
-/// Clears inherited GIT_* env vars so tests work correctly when invoked
-/// from git hooks (e.g. pre-commit).
-fn run_git(args: &[&str], cwd: &std::path::Path) {
-    let mut cmd = StdCommand::new("git");
-    cmd.args(args).current_dir(cwd);
-    for var in GIT_ENV_OVERRIDES {
-        cmd.env_remove(var);
-    }
-    let output = cmd.output().expect("failed to run git");
-    assert!(
-        output.status.success(),
-        "git {} failed: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-/// Create a file, add, and commit in the given directory.
-fn commit_file(cwd: &std::path::Path, filename: &str, content: &str, message: &str) {
-    std::fs::write(cwd.join(filename), content).expect("write failed");
-    run_git(&["add", "."], cwd);
-    run_git(&["commit", "-m", message], cwd);
 }
 
 // ── Dry-run tests ───────────────────────────────────────────────────
@@ -139,17 +105,7 @@ fn prune_dry_run_shows_rebase_integrated() {
     );
 
     // Cherry-pick the feature commit into main (simulates rebase merge)
-    let mut log_cmd = StdCommand::new("git");
-    log_cmd
-        .args(["log", "feature/rebased", "--format=%H", "-1"])
-        .current_dir(&repo.path());
-    for var in GIT_ENV_OVERRIDES {
-        log_cmd.env_remove(var);
-    }
-    let log_output = log_cmd.output().expect("git log failed");
-    let commit_hash = String::from_utf8_lossy(&log_output.stdout)
-        .trim()
-        .to_string();
+    let commit_hash = git_log_hash(&repo.path(), "feature/rebased");
     run_git(&["cherry-pick", &commit_hash], &repo.path());
 
     // Dry-run should show as integrated (rebase)
@@ -191,17 +147,7 @@ fn prune_execute_rebase_deletes_branch_without_force() {
     );
 
     // Cherry-pick the feature commit into main (simulates rebase merge)
-    let mut log_cmd = StdCommand::new("git");
-    log_cmd
-        .args(["log", "feature/rebased-exec", "--format=%H", "-1"])
-        .current_dir(&repo.path());
-    for var in GIT_ENV_OVERRIDES {
-        log_cmd.env_remove(var);
-    }
-    let log_output = log_cmd.output().expect("git log failed");
-    let commit_hash = String::from_utf8_lossy(&log_output.stdout)
-        .trim()
-        .to_string();
+    let commit_hash = git_log_hash(&repo.path(), "feature/rebased-exec");
     run_git(&["cherry-pick", &commit_hash], &repo.path());
 
     // Execute prune WITHOUT --force
@@ -213,21 +159,7 @@ fn prune_execute_rebase_deletes_branch_without_force() {
         .stdout(predicate::str::contains("Pruned 1 worktree."));
 
     // Branch must be deleted (auto-escalated to -D for rebase integration)
-    let mut branch_cmd = StdCommand::new("git");
-    branch_cmd
-        .args(["branch", "--list", "feature/rebased-exec"])
-        .current_dir(&repo.path());
-    for var in GIT_ENV_OVERRIDES {
-        branch_cmd.env_remove(var);
-    }
-    let branch_output = branch_cmd.output().expect("git branch failed");
-    let branches = String::from_utf8_lossy(&branch_output.stdout)
-        .trim()
-        .to_string();
-    assert!(
-        branches.is_empty(),
-        "branch should be deleted but found: {branches}"
-    );
+    assert_branch_deleted(&repo.path(), "feature/rebased-exec");
 }
 
 // ── Execute tests ───────────────────────────────────────────────────
@@ -324,6 +256,20 @@ fn prune_mainline_override() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Mainline: develop"));
+}
+
+#[test]
+fn prune_mainline_override_invalid_fails() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["prune", "--mainline", "nonexistent", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "mainline branch 'nonexistent' does not exist",
+        ));
 }
 
 #[test]
@@ -507,6 +453,18 @@ fn prune_force_removes_dirty_integrated_worktree() {
         .stdout(predicate::str::contains("Removed feature/dirty"));
 }
 
+#[test]
+fn prune_force_without_execute_rejected() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["prune", "--force", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--execute"));
+}
+
 // ── Detached HEAD ───────────────────────────────────────────────────
 
 #[test]
@@ -516,7 +474,7 @@ fn prune_detached_head_skipped() {
 
     // Create a detached HEAD worktree directly via git
     let detached_dir = repo.path().join(".worktrees").join("detached-test");
-    std::fs::create_dir_all(&detached_dir.parent().expect("parent")).ok();
+    std::fs::create_dir_all(detached_dir.parent().expect("parent")).ok();
     run_git(
         &[
             "worktree",
@@ -556,23 +514,41 @@ fn prune_empty_repo_no_worktrees() {
         .stdout(predicate::str::contains("No worktrees pruned."));
 }
 
-// ── Helper ──────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────
 
-/// Find the worktree directory by slug prefix under .worktrees/.
-fn find_worktree_dir(repo: &std::path::Path, slug_prefix: &str) -> std::path::PathBuf {
-    let worktrees_dir = repo.join(".worktrees");
-    for entry in std::fs::read_dir(&worktrees_dir)
-        .expect("no .worktrees dir")
-        .flatten()
-    {
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with(slug_prefix) {
-            return entry.path();
-        }
+/// Environment variables cleared for raw git commands in tests.
+const GIT_ENV_OVERRIDES: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+];
+
+/// Get the latest commit hash for a branch.
+fn git_log_hash(repo: &std::path::Path, branch: &str) -> String {
+    let mut cmd = StdCommand::new("git");
+    cmd.args(["log", branch, "--format=%H", "-1"])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
     }
-    panic!(
-        "worktree with slug prefix '{}' not found in {}",
-        slug_prefix,
-        worktrees_dir.display()
+    let output = cmd.output().expect("git log failed");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Assert that a branch does not exist in the repo.
+fn assert_branch_deleted(repo: &std::path::Path, branch: &str) {
+    let mut cmd = StdCommand::new("git");
+    cmd.args(["branch", "--list", branch]).current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("git branch failed");
+    let branches = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    assert!(
+        branches.is_empty(),
+        "branch should be deleted but found: {branches}"
     );
 }

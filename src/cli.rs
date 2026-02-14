@@ -99,7 +99,7 @@ pub enum Command {
         execute: bool,
 
         /// Force removal of dirty worktrees and use -D for branch deletion
-        #[arg(long)]
+        #[arg(long, requires = "execute")]
         force: bool,
 
         /// Override mainline branch (default: auto-detect)

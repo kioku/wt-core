@@ -230,7 +230,14 @@ fn classify_integration(repo: &RepoRoot, branch: &str, mainline: &str) -> Integr
 /// Dry-run: scan worktrees and report integration status without removing anything.
 pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result<PruneDryRun> {
     let mainline = match mainline_override {
-        Some(m) => m.to_string(),
+        Some(m) => {
+            if !git::rev_exists(repo, m) {
+                return Err(AppError::usage(format!(
+                    "mainline branch '{m}' does not exist"
+                )));
+            }
+            m.to_string()
+        }
         None => git::resolve_mainline(repo)?,
     };
 
