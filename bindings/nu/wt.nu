@@ -73,8 +73,6 @@ export def --env "wt go" [
 }
 
 # Remove a worktree and its local branch
-# Note: Nu uses --json internally with `from json` which is safe (no grep/sed).
-# Other shells use --print-paths to avoid fragile JSON parsing.
 export def --env "wt remove" [
     branch?: string  # Branch name (defaults to current worktree)
     --force          # Force removal even if dirty
@@ -87,22 +85,39 @@ export def --env "wt remove" [
     if $branch != null { $args = ($args | append $branch) }
     if $force { $args = ($args | append "--force") }
 
-    # Always use --json internally so we can inspect removed_path for cd
-    let full_args = (build-args $args $repo true false)
-
-    let result = (^wt-core ...$full_args | from json)
-
-    # If we were inside the removed worktree, cd to repo root
-    if ($result.ok) and ($result.removed_path? != null) {
-        if ($cwd_before | str starts-with $result.removed_path) {
-            cd $result.repo_root
-        }
-    }
-
     if $json {
+        # --json: machine output, no interactive picker.
+        let full_args = (build-args $args $repo true false)
+        let result = (^wt-core ...$full_args | from json)
+
+        if ($result.ok) and ($result.removed_path? != null) {
+            if ($cwd_before | str starts-with $result.removed_path) {
+                cd $result.repo_root
+            }
+        }
+
         $result
     } else {
-        print $"Removed worktree and branch '($result.branch)'"
+        # --print-paths: allows the interactive picker to render on
+        # stderr/tty while paths go to stdout (same pattern as `go`
+        # with --print-cd-path).
+        let full_args = (build-args $args $repo false false | append "--print-paths")
+        # Capture stdout separately from the pipeline so that a
+        # non-zero exit code raises an error (piping through `| lines`
+        # directly would silently swallow the failure).  Stderr is
+        # inherited, keeping the interactive picker and error messages
+        # visible in the terminal.
+        let output = try { ^wt-core ...$full_args } catch { return }
+        let lines = ($output | lines)
+        let removed_path = ($lines | get 0)
+        let repo_root = ($lines | get 1)
+        let branch_name = ($lines | get 2)
+
+        if ($cwd_before | str starts-with $removed_path) {
+            cd $repo_root
+        }
+
+        print $"Removed worktree and branch '($branch_name)'"
     }
 }
 

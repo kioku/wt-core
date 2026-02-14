@@ -108,9 +108,11 @@ wt() {
 
             local cwd_before
             cwd_before=$(pwd)
-            # --print-paths outputs three lines: removed_path, repo_root, branch
+            # --print-paths outputs three lines: removed_path, repo_root, branch.
+            # stderr is left connected to the terminal so the interactive picker
+            # (if triggered) renders correctly and errors are visible.
             local result
-            result=$(wt-core remove "$@" --print-paths 2>/dev/null)
+            result=$(wt-core remove "$@" --print-paths)
             local rc=$?
             if [ $rc -eq 0 ]; then
                 local removed_path repo_root branch
@@ -124,8 +126,7 @@ wt() {
                 esac
                 echo "Removed worktree and branch '${branch}'"
             else
-                wt-core remove "$@"
-                return $?
+                return $rc
             fi
             ;;
         "")
