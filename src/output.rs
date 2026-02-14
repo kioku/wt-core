@@ -148,6 +148,56 @@ impl JsonDoctorResponse {
     }
 }
 
+/// Output format for the prune command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneFormat {
+    Human,
+    Json,
+}
+
+// ── Prune JSON types ────────────────────────────────────────────────
+
+/// JSON response for prune dry-run.
+#[derive(Debug, Serialize)]
+pub struct JsonPruneDryRunResponse {
+    pub ok: bool,
+    pub mainline: String,
+    pub worktrees: Vec<JsonPruneDryRunEntry>,
+    pub prunable: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonPruneDryRunEntry {
+    pub branch: Option<String>,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    pub path: String,
+}
+
+/// JSON response for prune execute.
+#[derive(Debug, Serialize)]
+pub struct JsonPruneExecuteResponse {
+    pub ok: bool,
+    pub mainline: String,
+    pub pruned: Vec<JsonPrunedEntry>,
+    pub skipped: Vec<JsonSkippedEntry>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonPrunedEntry {
+    pub branch: String,
+    pub path: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonSkippedEntry {
+    pub branch: Option<String>,
+    pub reason: String,
+    pub path: String,
+}
+
 /// Serialize a value as pretty-printed JSON to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
