@@ -103,10 +103,17 @@ pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Resu
     let target_branch = match branch {
         Some(b) => b.clone(),
         None => {
-            // Infer from cwd: find worktree whose path matches cwd.
+            // Infer from cwd: find worktree whose path is the most specific
+            // prefix of cwd. We use `max_by_key(path len)` instead of `find`
+            // because linked worktrees live under the main repo root
+            // (e.g. `.worktrees/`), so the main worktree's path is also a
+            // prefix — we need the longest (most specific) match.
             let cwd = std::env::current_dir()
                 .map_err(|e| AppError::usage(format!("cannot determine cwd: {e}")))?;
-            let found = worktrees.iter().find(|wt| cwd.starts_with(&wt.path));
+            let found = worktrees
+                .iter()
+                .filter(|wt| cwd.starts_with(&wt.path))
+                .max_by_key(|wt| wt.path.as_os_str().len());
             match found {
                 Some(wt) => BranchName::new(wt.branch.clone().ok_or_else(|| {
                     AppError::usage("current worktree has no branch".to_string())
