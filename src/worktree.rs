@@ -152,6 +152,214 @@ pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Resu
     })
 }
 
+/// How a branch was detected as integrated into mainline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationMethod {
+    /// `git merge-base --is-ancestor` succeeded (merge or fast-forward).
+    Merged,
+    /// `git cherry` showed all patches are in mainline (rebase merge).
+    Rebase,
+}
+
+/// Integration status for a single worktree branch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntegrationStatus {
+    /// Branch is fully integrated into mainline.
+    Integrated(IntegrationMethod),
+    /// Branch has commits not yet in mainline.
+    NotIntegrated,
+    /// Worktree has no branch (detached HEAD).
+    NoBranch,
+}
+
+/// A worktree entry annotated with its integration status for prune.
+#[derive(Debug)]
+pub struct WorktreePruneEntry {
+    pub branch: Option<String>,
+    pub path: std::path::PathBuf,
+    pub status: IntegrationStatus,
+}
+
+/// Result of a prune dry-run.
+#[derive(Debug)]
+pub struct PruneDryRun {
+    pub mainline: String,
+    pub entries: Vec<WorktreePruneEntry>,
+}
+
+/// An entry that was pruned (removed).
+#[derive(Debug)]
+pub struct PrunedEntry {
+    pub branch: String,
+    pub path: std::path::PathBuf,
+}
+
+/// An entry that was skipped during pruning.
+#[derive(Debug)]
+pub struct SkippedEntry {
+    pub branch: Option<String>,
+    pub path: std::path::PathBuf,
+    pub reason: String,
+}
+
+/// Result of a prune execution.
+#[derive(Debug)]
+pub struct PruneExecuteResult {
+    pub mainline: String,
+    pub pruned: Vec<PrunedEntry>,
+    pub skipped: Vec<SkippedEntry>,
+    pub warnings: Vec<String>,
+}
+
+/// Classify the integration status of a branch against the mainline.
+fn classify_integration(repo: &RepoRoot, branch: &str, mainline: &str) -> IntegrationStatus {
+    // 1. Ancestry check (merge / fast-forward)
+    if git::is_ancestor(repo, branch, mainline) {
+        return IntegrationStatus::Integrated(IntegrationMethod::Merged);
+    }
+
+    // 2. Patch-id check (rebase merge)
+    if git::cherry(repo, mainline, branch) {
+        return IntegrationStatus::Integrated(IntegrationMethod::Rebase);
+    }
+
+    IntegrationStatus::NotIntegrated
+}
+
+/// Dry-run: scan worktrees and report integration status without removing anything.
+pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result<PruneDryRun> {
+    let mainline = match mainline_override {
+        Some(m) => {
+            if !git::rev_exists(repo, m) {
+                return Err(AppError::usage(format!(
+                    "mainline branch '{m}' does not exist"
+                )));
+            }
+            m.to_string()
+        }
+        None => git::resolve_mainline(repo)?,
+    };
+
+    let worktrees = git::list_worktrees(repo)?;
+    let mut entries = Vec::new();
+
+    for wt in &worktrees {
+        if wt.is_main {
+            continue;
+        }
+
+        let status = match &wt.branch {
+            Some(branch) => classify_integration(repo, branch, &mainline),
+            None => IntegrationStatus::NoBranch,
+        };
+
+        entries.push(WorktreePruneEntry {
+            branch: wt.branch.clone(),
+            path: wt.path.clone(),
+            status,
+        });
+    }
+
+    Ok(PruneDryRun { mainline, entries })
+}
+
+/// Accumulator for prune execution results.
+struct PruneAccumulator {
+    pruned: Vec<PrunedEntry>,
+    skipped: Vec<SkippedEntry>,
+    warnings: Vec<String>,
+}
+
+/// Try to remove an integrated worktree and its branch.
+///
+/// When the branch was integrated via rebase (patch-id match), Git's own
+/// ancestry check (`git branch -d`) would refuse deletion because the
+/// original commits are not ancestors of mainline.  We auto-escalate to
+/// `-D` in that case since the cherry check already confirmed integration.
+fn prune_integrated_entry(
+    repo: &RepoRoot,
+    entry: WorktreePruneEntry,
+    force: bool,
+    acc: &mut PruneAccumulator,
+) {
+    let branch_name = entry.branch.clone().expect("integrated implies branch");
+
+    let force_branch = force
+        || matches!(
+            entry.status,
+            IntegrationStatus::Integrated(IntegrationMethod::Rebase)
+        );
+
+    if let Err(e) = git::remove_worktree(repo, &entry.path, force) {
+        acc.warnings.push(format!(
+            "failed to remove worktree for '{branch_name}': {e}"
+        ));
+        acc.skipped.push(SkippedEntry {
+            branch: Some(branch_name),
+            path: entry.path,
+            reason: "removal_failed".to_string(),
+        });
+        return;
+    }
+
+    let bn = BranchName::new(&branch_name);
+    if let Err(e) = git::delete_branch(repo, &bn, force_branch) {
+        acc.warnings.push(format!(
+            "worktree removed but branch deletion failed for '{branch_name}': {e}"
+        ));
+    }
+    acc.pruned.push(PrunedEntry {
+        branch: branch_name,
+        path: entry.path,
+    });
+}
+
+/// Execute prune: remove integrated worktrees and their branches.
+pub fn prune_execute(
+    repo: &RepoRoot,
+    mainline_override: Option<&str>,
+    force: bool,
+) -> Result<PruneExecuteResult> {
+    let dry_run = prune_dry_run(repo, mainline_override)?;
+    let mainline = dry_run.mainline;
+
+    let mut acc = PruneAccumulator {
+        pruned: Vec::new(),
+        skipped: Vec::new(),
+        warnings: Vec::new(),
+    };
+
+    for entry in dry_run.entries {
+        match entry.status {
+            IntegrationStatus::Integrated(_) => {
+                prune_integrated_entry(repo, entry, force, &mut acc);
+            }
+            IntegrationStatus::NotIntegrated => {
+                acc.skipped.push(SkippedEntry {
+                    branch: entry.branch,
+                    path: entry.path,
+                    reason: "not_integrated".to_string(),
+                });
+            }
+            IntegrationStatus::NoBranch => {
+                acc.skipped.push(SkippedEntry {
+                    branch: None,
+                    path: entry.path,
+                    reason: "no_branch".to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(PruneExecuteResult {
+        mainline,
+        pruned: acc.pruned,
+        skipped: acc.skipped,
+        warnings: acc.warnings,
+    })
+}
+
 /// Run health diagnostics on the repository's worktree state.
 pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
     let mut diags = Vec::new();

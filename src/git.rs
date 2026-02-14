@@ -213,6 +213,110 @@ pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Resul
     Ok(())
 }
 
+/// Run a git command and return true if it exits successfully.
+///
+/// Used for commands like `merge-base --is-ancestor` that communicate
+/// their result via exit code rather than stdout.
+fn git_success(args: &[&str], cwd: &Path) -> bool {
+    let mut cmd = Cmd::new("git");
+    cmd.args(args).current_dir(cwd);
+
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+
+    cmd.output().map(|o| o.status.success()).unwrap_or(false)
+}
+
+/// Check whether `branch` is an ancestor of `mainline`.
+///
+/// Uses `git merge-base --is-ancestor <branch> <mainline>`.
+/// Returns `true` if all commits on `branch` are reachable from `mainline`.
+pub fn is_ancestor(repo: &RepoRoot, branch: &str, mainline: &str) -> bool {
+    git_success(
+        &["merge-base", "--is-ancestor", branch, mainline],
+        repo.as_ref(),
+    )
+}
+
+/// Run `git cherry <mainline> <branch>` and return true if every commit
+/// is prefixed with `-`, meaning every patch has an equivalent in mainline
+/// (covers rebase/cherry-pick merges).
+///
+/// Returns `false` if cherry produces no output or any line starts with `+`.
+pub fn cherry(repo: &RepoRoot, mainline: &str, branch: &str) -> bool {
+    match git(&["cherry", mainline, branch], repo.as_ref()) {
+        Ok(output) => {
+            let lines: Vec<&str> = output.lines().collect();
+            !lines.is_empty() && lines.iter().all(|l| l.starts_with('-'))
+        }
+        Err(_) => false,
+    }
+}
+
+/// Try to resolve `refs/remotes/origin/HEAD` to a usable branch name.
+///
+/// Returns the local branch name if it exists, otherwise the full remote
+/// ref (e.g. `origin/main`) so git commands can still resolve it.
+fn resolve_origin_head(repo: &RepoRoot) -> Option<String> {
+    let symref = git(
+        &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        repo.as_ref(),
+    )
+    .ok()?;
+
+    let local = symref
+        .strip_prefix("origin/")
+        .unwrap_or(&symref)
+        .to_string();
+    let local_bn = BranchName::new(&local);
+
+    if branch_exists(repo, &local_bn) {
+        return Some(local);
+    }
+    Some(symref)
+}
+
+/// Auto-detect the mainline branch.
+///
+/// Resolution order:
+/// 1. `refs/remotes/origin/HEAD` → resolve symbolic ref
+/// 2. Local branch named `main`
+/// 3. Local branch named `master`
+/// 4. The main worktree's branch (first entry from `git worktree list`)
+pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
+    // 1. Try origin/HEAD — prefer the local branch name if it exists,
+    //    otherwise use the full remote ref so git commands can resolve it
+    //    even when there is no local tracking branch.
+    if let Some(name) = resolve_origin_head(repo) {
+        return Ok(name);
+    }
+
+    // 2. Check for local 'main'
+    let main_name = BranchName::new("main");
+    if branch_exists(repo, &main_name) {
+        return Ok("main".to_string());
+    }
+
+    // 3. Check for local 'master'
+    let master_name = BranchName::new("master");
+    if branch_exists(repo, &master_name) {
+        return Ok("master".to_string());
+    }
+
+    // 4. Fall back to main worktree's branch
+    let worktrees = list_worktrees(repo)?;
+    worktrees
+        .iter()
+        .find(|wt| wt.is_main)
+        .and_then(|wt| wt.branch.clone())
+        .ok_or_else(|| {
+            AppError::git(
+                "could not determine mainline branch; use --mainline to specify".to_string(),
+            )
+        })
+}
+
 /// Check if a local branch exists.
 pub fn branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
     let refspec = format!("refs/heads/{}", branch.as_str());

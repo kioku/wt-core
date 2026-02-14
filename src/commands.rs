@@ -6,8 +6,9 @@ use crate::domain::{self, BranchName};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    print_json, JsonDoctorResponse, JsonListResponse, JsonResponse, NavigationFormat, RemoveFormat,
-    StatusFormat,
+    print_json, JsonDoctorResponse, JsonListResponse, JsonPruneDryRunEntry,
+    JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
+    JsonSkippedEntry, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
 };
 use crate::worktree;
 
@@ -50,6 +51,13 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             remove_fmt(json, print_paths),
         ),
+        Command::Prune {
+            execute,
+            force,
+            mainline,
+            repo,
+            json,
+        } => cmd_prune(execute, force, mainline.as_deref(), repo, prune_fmt(json)),
         Command::Init { shell } => cmd_init(shell),
         Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
     }
@@ -80,6 +88,14 @@ fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
         RemoveFormat::Json
     } else {
         RemoveFormat::Human
+    }
+}
+
+fn prune_fmt(json: bool) -> PruneFormat {
+    if json {
+        PruneFormat::Json
+    } else {
+        PruneFormat::Human
     }
 }
 
@@ -314,6 +330,181 @@ fn cmd_remove(
     }
     if let Some(w) = &result.warning {
         eprintln!("warning: {w}");
+    }
+    Ok(())
+}
+
+fn cmd_prune(
+    execute: bool,
+    force: bool,
+    mainline: Option<&str>,
+    repo: Option<PathBuf>,
+    fmt: PruneFormat,
+) -> Result<()> {
+    let repo = resolve_repo(repo)?;
+
+    if execute {
+        cmd_prune_execute(&repo, mainline, force, fmt)
+    } else {
+        cmd_prune_dry_run(&repo, mainline, fmt)
+    }
+}
+
+fn format_prune_entry(entry: &worktree::WorktreePruneEntry) -> (String, Option<String>) {
+    match &entry.status {
+        worktree::IntegrationStatus::Integrated(m) => {
+            let method_str = match m {
+                worktree::IntegrationMethod::Merged => "merged",
+                worktree::IntegrationMethod::Rebase => "rebase",
+            };
+            ("integrated".to_string(), Some(method_str.to_string()))
+        }
+        worktree::IntegrationStatus::NotIntegrated => ("not_integrated".to_string(), None),
+        worktree::IntegrationStatus::NoBranch => ("no_branch".to_string(), None),
+    }
+}
+
+fn print_prune_entry_human(entry: &worktree::WorktreePruneEntry) {
+    match &entry.status {
+        worktree::IntegrationStatus::Integrated(method) => {
+            let method_str = match method {
+                worktree::IntegrationMethod::Merged => "merged",
+                worktree::IntegrationMethod::Rebase => "rebase",
+            };
+            let branch = entry.branch.as_deref().unwrap_or("(unknown)");
+            println!("  ✓ {branch:<20} integrated ({method_str})");
+        }
+        worktree::IntegrationStatus::NotIntegrated => {
+            let branch = entry.branch.as_deref().unwrap_or("(unknown)");
+            println!("  ✗ {branch:<20} not integrated");
+        }
+        worktree::IntegrationStatus::NoBranch => {
+            println!("  ⚠ {:<20} no branch (detached HEAD)", "(detached)");
+        }
+    }
+}
+
+fn cmd_prune_dry_run(
+    repo: &domain::RepoRoot,
+    mainline: Option<&str>,
+    fmt: PruneFormat,
+) -> Result<()> {
+    let result = worktree::prune_dry_run(repo, mainline)?;
+
+    let prunable = result
+        .entries
+        .iter()
+        .filter(|e| matches!(e.status, worktree::IntegrationStatus::Integrated(_)))
+        .count();
+
+    match fmt {
+        PruneFormat::Json => {
+            let entries: Vec<JsonPruneDryRunEntry> = result
+                .entries
+                .iter()
+                .map(|e| {
+                    let (status, method) = format_prune_entry(e);
+                    JsonPruneDryRunEntry {
+                        branch: e.branch.clone(),
+                        status,
+                        method,
+                        path: e.path.display().to_string(),
+                    }
+                })
+                .collect();
+
+            print_json(&JsonPruneDryRunResponse {
+                ok: true,
+                mainline: result.mainline,
+                worktrees: entries,
+                prunable,
+            })?;
+        }
+        PruneFormat::Human => {
+            println!("Mainline: {}", result.mainline);
+            for entry in &result.entries {
+                print_prune_entry_human(entry);
+            }
+            if result.entries.is_empty() {
+                println!("\nNo worktrees to prune.");
+            } else if prunable == 0 {
+                println!("\nNo integrated worktrees found.");
+            } else {
+                println!(
+                    "\n{prunable} integrated worktree{} can be pruned. Run with --execute to remove.",
+                    if prunable == 1 { "" } else { "s" }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_prune_execute(
+    repo: &domain::RepoRoot,
+    mainline: Option<&str>,
+    force: bool,
+    fmt: PruneFormat,
+) -> Result<()> {
+    let result = worktree::prune_execute(repo, mainline, force)?;
+
+    match fmt {
+        PruneFormat::Json => {
+            let pruned: Vec<JsonPrunedEntry> = result
+                .pruned
+                .iter()
+                .map(|e| JsonPrunedEntry {
+                    branch: e.branch.clone(),
+                    path: e.path.display().to_string(),
+                })
+                .collect();
+
+            let skipped: Vec<JsonSkippedEntry> = result
+                .skipped
+                .iter()
+                .map(|e| JsonSkippedEntry {
+                    branch: e.branch.clone(),
+                    reason: e.reason.clone(),
+                    path: e.path.display().to_string(),
+                })
+                .collect();
+
+            print_json(&JsonPruneExecuteResponse {
+                ok: true,
+                mainline: result.mainline,
+                pruned,
+                skipped,
+                warnings: result.warnings,
+            })?;
+        }
+        PruneFormat::Human => {
+            println!("Mainline: {}", result.mainline);
+            for entry in &result.pruned {
+                println!("  Removed {}", entry.branch);
+            }
+            for entry in &result.skipped {
+                let label = entry.branch.as_deref().unwrap_or("(detached)");
+                let reason = match entry.reason.as_str() {
+                    "not_integrated" => "not integrated",
+                    "no_branch" => "no branch",
+                    "removal_failed" => "removal failed",
+                    other => other,
+                };
+                println!("  Skipped {label} ({reason})");
+            }
+            for w in &result.warnings {
+                eprintln!("warning: {w}");
+            }
+            let count = result.pruned.len();
+            if count == 0 {
+                println!("\nNo worktrees pruned.");
+            } else {
+                println!(
+                    "\nPruned {count} worktree{}.",
+                    if count == 1 { "" } else { "s" }
+                );
+            }
+        }
     }
     Ok(())
 }
