@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use serde::Serialize;
 
 use crate::domain::Worktree;
@@ -95,26 +97,43 @@ pub struct JsonWorktreeEntry {
     pub branch: Option<String>,
     pub commit: String,
     pub is_main: bool,
-}
-
-impl From<&Worktree> for JsonWorktreeEntry {
-    fn from(wt: &Worktree) -> Self {
-        Self {
-            path: wt.path.display().to_string(),
-            branch: wt.branch.clone(),
-            commit: wt.commit.clone(),
-            is_main: wt.is_main,
-        }
-    }
+    pub is_current: bool,
 }
 
 impl JsonListResponse {
-    pub fn from_worktrees(worktrees: &[Worktree]) -> Self {
+    /// Build a list response, marking the worktree whose path is the
+    /// longest prefix of `cwd` as `is_current`.
+    pub fn from_worktrees(worktrees: &[Worktree], cwd: Option<&Path>) -> Self {
+        let current_idx = cwd.and_then(|cwd| find_current_worktree(worktrees, cwd));
+
+        let entries = worktrees
+            .iter()
+            .enumerate()
+            .map(|(i, wt)| JsonWorktreeEntry {
+                path: wt.path.display().to_string(),
+                branch: wt.branch.clone(),
+                commit: wt.commit.clone(),
+                is_main: wt.is_main,
+                is_current: current_idx == Some(i),
+            })
+            .collect();
+
         Self {
             ok: true,
-            worktrees: worktrees.iter().map(JsonWorktreeEntry::from).collect(),
+            worktrees: entries,
         }
     }
+}
+
+/// Find the index of the worktree whose path is the longest prefix of `cwd`.
+/// Returns `None` if no worktree path is a prefix of `cwd`.
+pub fn find_current_worktree(worktrees: &[Worktree], cwd: &Path) -> Option<usize> {
+    worktrees
+        .iter()
+        .enumerate()
+        .filter(|(_, wt)| cwd.starts_with(&wt.path))
+        .max_by_key(|(_, wt)| wt.path.as_os_str().len())
+        .map(|(idx, _)| idx)
 }
 
 /// JSON envelope for doctor responses.

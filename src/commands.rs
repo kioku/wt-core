@@ -6,9 +6,10 @@ use crate::domain::{self, BranchName};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    print_json, JsonDoctorResponse, JsonListResponse, JsonMergeResponse, JsonPruneDryRunEntry,
-    JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
-    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse, JsonMergeResponse,
+    JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry,
+    JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat,
+    StatusFormat,
 };
 use crate::worktree;
 
@@ -137,25 +138,40 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<domain::RepoRoot> {
 fn cmd_list(repo: Option<PathBuf>, fmt: StatusFormat) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let worktrees = git::list_worktrees(&repo)?;
+    let cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.canonicalize().ok());
 
     match fmt {
         StatusFormat::Json => {
-            print_json(&JsonListResponse::from_worktrees(&worktrees))?;
+            print_json(&JsonListResponse::from_worktrees(
+                &worktrees,
+                cwd.as_deref(),
+            ))?;
         }
         StatusFormat::Human => {
             if worktrees.is_empty() {
                 println!("No worktrees found.");
                 return Ok(());
             }
-            for wt in &worktrees {
+            let current_idx = cwd
+                .as_deref()
+                .and_then(|cwd| find_current_worktree(&worktrees, cwd));
+            for (i, wt) in worktrees.iter().enumerate() {
                 let branch_str = wt.branch.as_deref().unwrap_or("(detached)");
                 let main_tag = if wt.is_main { " [main]" } else { "" };
+                let here_tag = if current_idx == Some(i) {
+                    " ← here"
+                } else {
+                    ""
+                };
                 println!(
-                    "{:<50} {:<20} {}{}",
+                    "{:<50} {:<20} {}{}{}",
                     wt.path.display(),
                     branch_str,
                     wt.commit,
-                    main_tag
+                    main_tag,
+                    here_tag
                 );
             }
         }
