@@ -92,6 +92,32 @@ pub enum Command {
         print_paths: bool,
     },
 
+    /// Merge a worktree's branch into mainline and clean up
+    Merge {
+        /// Branch name (defaults to current worktree's branch)
+        branch: Option<String>,
+
+        /// Push mainline to origin after successful merge
+        #[arg(long)]
+        push: bool,
+
+        /// Keep worktree and branch after merge (skip cleanup)
+        #[arg(long)]
+        no_cleanup: bool,
+
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line) for shell wrappers
+        #[arg(long, conflicts_with = "json")]
+        print_paths: bool,
+    },
+
     /// Remove worktrees whose branches are fully integrated into mainline
     Prune {
         /// Actually remove integrated worktrees (default is dry-run)

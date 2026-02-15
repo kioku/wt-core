@@ -198,6 +198,29 @@ pub struct JsonSkippedEntry {
     pub path: String,
 }
 
+/// Output format for the merge command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeFormat {
+    Human,
+    Json,
+    /// `--print-paths`: prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
+    PrintPaths,
+}
+
+/// JSON response for the merge command.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeResponse {
+    pub ok: bool,
+    pub message: String,
+    pub branch: String,
+    pub mainline: String,
+    pub repo_root: String,
+    pub cleaned_up: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_path: Option<String>,
+    pub pushed: bool,
+}
+
 /// Serialize a value as pretty-printed JSON to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(

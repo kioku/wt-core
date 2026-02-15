@@ -129,6 +129,80 @@ wt() {
                 return $rc
             fi
             ;;
+        merge)
+            shift
+
+            # Preserve native help/version output.
+            for arg in "$@"; do
+                case "$arg" in
+                    -h|--help|-V|--version)
+                        wt-core merge "$@"
+                        return $?
+                        ;;
+                esac
+            done
+
+            # Detect if the caller explicitly asked for --json
+            local want_json=false
+            for arg in "$@"; do
+                case "$arg" in --json) want_json=true ;; esac
+            done
+
+            if [ "$want_json" = true ]; then
+                local cwd_before
+                cwd_before=$(pwd)
+                local output
+                output=$(wt-core merge "$@")
+                local rc=$?
+                if [ $rc -eq 0 ]; then
+                    local removed_path
+                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
+                    if [ -n "$removed_path" ]; then
+                        case "$cwd_before" in
+                            "${removed_path}"*)
+                                local repo_root
+                                repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
+                                cd "$repo_root" || true
+                                ;;
+                        esac
+                    fi
+                fi
+                printf '%s\n' "$output"
+                return $rc
+            fi
+
+            local cwd_before
+            cwd_before=$(pwd)
+            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
+            local result
+            result=$(wt-core merge "$@" --print-paths)
+            local rc=$?
+            if [ $rc -eq 0 ]; then
+                local repo_root branch mainline cleaned_up removed_path pushed
+                repo_root=$(printf '%s\n' "$result" | sed -n '1p')
+                branch=$(printf '%s\n' "$result" | sed -n '2p')
+                mainline=$(printf '%s\n' "$result" | sed -n '3p')
+                cleaned_up=$(printf '%s\n' "$result" | sed -n '4p')
+                removed_path=$(printf '%s\n' "$result" | sed -n '5p')
+                pushed=$(printf '%s\n' "$result" | sed -n '6p')
+                if [ "$cleaned_up" = "true" ] && [ -n "$removed_path" ]; then
+                    case "$cwd_before" in
+                        "${removed_path}"*)
+                            cd "$repo_root" || true
+                            ;;
+                    esac
+                fi
+                echo "Merged '${branch}' into ${mainline}"
+                if [ "$cleaned_up" = "true" ]; then
+                    echo "Removed worktree and branch '${branch}'"
+                fi
+                if [ "$pushed" = "true" ]; then
+                    echo "Pushed ${mainline} to origin"
+                fi
+            else
+                return $rc
+            fi
+            ;;
         "")
             wt-core --help
             ;;

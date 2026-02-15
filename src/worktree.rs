@@ -1,8 +1,29 @@
 use std::path::PathBuf;
 
-use crate::domain::{BranchName, RepoRoot};
+use crate::domain::{BranchName, RepoRoot, Worktree};
 use crate::error::{AppError, Result};
 use crate::git;
+
+/// Infer the target branch from cwd by finding the worktree whose path is
+/// the most specific (longest) prefix of the current directory.
+///
+/// Shared by `remove` and `merge` for their cwd-inference fallback.
+fn resolve_branch_from_cwd(worktrees: &[Worktree]) -> Result<BranchName> {
+    let cwd = std::env::current_dir()
+        .map_err(|e| AppError::usage(format!("cannot determine cwd: {e}")))?;
+    let found = worktrees
+        .iter()
+        .filter(|wt| cwd.starts_with(&wt.path))
+        .max_by_key(|wt| wt.path.as_os_str().len());
+    match found {
+        Some(wt) => Ok(BranchName::new(wt.branch.clone().ok_or_else(|| {
+            AppError::usage("current worktree has no branch".to_string())
+        })?)),
+        None => Err(AppError::usage(
+            "no branch specified and cwd is not inside a worktree".to_string(),
+        )),
+    }
+}
 
 /// Result of a successful `add` operation.
 pub struct AddResult {
@@ -102,29 +123,7 @@ pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Resu
     // Resolve which branch to remove.
     let target_branch = match branch {
         Some(b) => b.clone(),
-        None => {
-            // Infer from cwd: find worktree whose path is the most specific
-            // prefix of cwd. We use `max_by_key(path len)` instead of `find`
-            // because linked worktrees live under the main repo root
-            // (e.g. `.worktrees/`), so the main worktree's path is also a
-            // prefix — we need the longest (most specific) match.
-            let cwd = std::env::current_dir()
-                .map_err(|e| AppError::usage(format!("cannot determine cwd: {e}")))?;
-            let found = worktrees
-                .iter()
-                .filter(|wt| cwd.starts_with(&wt.path))
-                .max_by_key(|wt| wt.path.as_os_str().len());
-            match found {
-                Some(wt) => BranchName::new(wt.branch.clone().ok_or_else(|| {
-                    AppError::usage("current worktree has no branch".to_string())
-                })?),
-                None => {
-                    return Err(AppError::usage(
-                        "no branch specified and cwd is not inside a worktree".to_string(),
-                    ))
-                }
-            }
-        }
+        None => resolve_branch_from_cwd(&worktrees)?,
     };
 
     // Find the worktree entry.
@@ -426,4 +425,123 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
     }
 
     Ok(diags)
+}
+
+/// Result of a successful `merge` operation.
+pub struct MergeResult {
+    pub branch: BranchName,
+    pub mainline: String,
+    pub repo_root: PathBuf,
+    pub cleaned_up: bool,
+    /// Path of the removed worktree (only set when `cleaned_up` is true).
+    pub removed_path: Option<PathBuf>,
+    pub pushed: bool,
+    /// Non-fatal warnings (e.g. cleanup or push failure after merge).
+    pub warnings: Vec<String>,
+}
+
+/// Merge a worktree's branch into the mainline.
+///
+/// 1. Resolve the target branch (argument, cwd inference, or picker)
+/// 2. Refuse if it is the main worktree
+/// 3. Resolve the mainline branch
+/// 4. Run `git merge --no-ff <branch>` from the main worktree
+/// 5. On conflict: abort the merge and return an error
+/// 6. On success: optionally remove the worktree+branch, optionally push
+pub fn merge(
+    repo: &RepoRoot,
+    branch: Option<&BranchName>,
+    push: bool,
+    no_cleanup: bool,
+) -> Result<MergeResult> {
+    let worktrees = git::list_worktrees(repo)?;
+
+    // Resolve which branch to merge (same cwd-inference as `remove`).
+    let target_branch = match branch {
+        Some(b) => b.clone(),
+        None => resolve_branch_from_cwd(&worktrees)?,
+    };
+
+    // Find the worktree entry.
+    let wt = worktrees
+        .iter()
+        .find(|wt| wt.branch.as_deref() == Some(target_branch.as_str()))
+        .ok_or_else(|| {
+            AppError::usage(format!("no worktree found for branch '{target_branch}'"))
+        })?;
+
+    // Never merge the main worktree into itself.
+    if wt.is_main {
+        return Err(AppError::invariant(
+            "refusing to merge the main worktree".to_string(),
+        ));
+    }
+
+    // Resolve mainline and verify the main worktree is checked out to it.
+    let mainline = git::resolve_mainline(repo)?;
+    let main_wt_branch = worktrees
+        .iter()
+        .find(|w| w.is_main)
+        .and_then(|w| w.branch.as_deref());
+    if main_wt_branch != Some(&mainline) {
+        return Err(AppError::invariant(format!(
+            "main worktree is on '{}', expected '{mainline}' — checkout mainline first",
+            main_wt_branch.unwrap_or("(detached)")
+        )));
+    }
+
+    // Attempt the merge from the main worktree's context.
+    if let Err(e) = git::merge_no_ff(repo, target_branch.as_str()) {
+        // Abort to restore the main worktree to a clean state.
+        git::merge_abort(repo);
+        return Err(AppError::conflict(format!(
+            "merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{e}",
+            target_branch
+        )));
+    }
+
+    let mut warnings = Vec::new();
+
+    // Cleanup: remove worktree and branch (default behaviour).
+    // Downgraded to a warning because the merge has already been committed;
+    // a hard error would hide the successful merge from the caller.
+    let (cleaned_up, removed_path) = if no_cleanup {
+        (false, None)
+    } else {
+        match remove(repo, Some(&target_branch), false) {
+            Ok(result) => {
+                if let Some(w) = result.warning {
+                    warnings.push(w);
+                }
+                (true, Some(result.removed_path))
+            }
+            Err(e) => {
+                warnings.push(format!("merge succeeded but cleanup failed: {e}"));
+                (false, None)
+            }
+        }
+    };
+
+    // Push mainline to origin if requested.
+    let pushed = if push {
+        match git::push(repo, &mainline) {
+            Ok(()) => true,
+            Err(e) => {
+                warnings.push(format!("merge succeeded but push failed: {e}"));
+                false
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok(MergeResult {
+        branch: target_branch,
+        mainline,
+        repo_root: repo.to_path_buf(),
+        cleaned_up,
+        removed_path,
+        pushed,
+        warnings,
+    })
 }

@@ -6,9 +6,9 @@ use crate::domain::{self, BranchName};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    print_json, JsonDoctorResponse, JsonListResponse, JsonPruneDryRunEntry,
+    print_json, JsonDoctorResponse, JsonListResponse, JsonMergeResponse, JsonPruneDryRunEntry,
     JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
-    JsonSkippedEntry, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
 };
 use crate::worktree;
 
@@ -51,6 +51,20 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             remove_fmt(json, print_paths),
         ),
+        Command::Merge {
+            branch,
+            push,
+            no_cleanup,
+            repo,
+            json,
+            print_paths,
+        } => cmd_merge(
+            branch.as_deref().map(BranchName::new),
+            push,
+            no_cleanup,
+            repo,
+            merge_fmt(json, print_paths),
+        ),
         Command::Prune {
             execute,
             force,
@@ -88,6 +102,16 @@ fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
         RemoveFormat::Json
     } else {
         RemoveFormat::Human
+    }
+}
+
+fn merge_fmt(json: bool, print_paths: bool) -> MergeFormat {
+    if print_paths {
+        MergeFormat::PrintPaths
+    } else if json {
+        MergeFormat::Json
+    } else {
+        MergeFormat::Human
     }
 }
 
@@ -297,25 +321,25 @@ fn pick_worktree(_worktrees: &[domain::Worktree]) -> Result<BranchName> {
     ))
 }
 
-/// Resolve the branch for `remove` when none was explicitly provided.
+/// Resolve an optional branch for a destructive command (`remove`, `merge`)
+/// when none was explicitly provided.
 ///
-/// In TTY contexts (both human and `--print-paths` formats), opens an
-/// interactive picker excluding the main worktree and pre-selecting the
-/// current worktree if applicable. `--print-paths` is allowed because shell
-/// bindings need it to capture paths on stdout while the picker renders on
-/// stderr/tty (same pattern as `go` with `--print-cd-path`).
+/// In TTY contexts (human and `--print-paths` formats), opens an interactive
+/// picker excluding the main worktree and pre-selecting the current worktree
+/// if applicable. For JSON and non-TTY contexts, returns `None` so the
+/// caller falls back to cwd inference in the worktree layer.
 ///
-/// For `--json` and non-TTY contexts, returns `None` so `worktree::remove()`
-/// falls back to cwd inference.
-fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<Option<BranchName>> {
-    // JSON is for machine consumers that pass an explicit branch or rely on
-    // cwd inference.  --print-paths is used by shell bindings that *do* want
-    // the picker (the UI renders on stderr/tty, paths go to stdout).
-    if matches!(fmt, RemoveFormat::Json) {
+/// `is_json` — whether the output format is machine-only (JSON).
+/// `action`  — verb shown in picker prompt and error messages (e.g. "remove", "merge").
+fn resolve_action_branch(
+    repo: &domain::RepoRoot,
+    is_json: bool,
+    action: &str,
+) -> Result<Option<BranchName>> {
+    if is_json {
         return Ok(None);
     }
 
-    // Non-TTY cannot render a picker; fall back to cwd inference.
     if !std::io::stdin().is_terminal() {
         return Ok(None);
     }
@@ -324,14 +348,12 @@ fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<O
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
-        return Err(AppError::usage(
-            "no worktrees to remove (create one with `wt add`)".to_string(),
-        ));
+        return Err(AppError::usage(format!(
+            "no worktrees to {action} (create one with `wt add`)"
+        )));
     }
 
-    // Determine pre-selection: find the candidate whose path is the longest
-    // prefix of cwd (most-specific match), consistent with the cwd inference
-    // logic in worktree::remove().
+    // Pre-select the candidate whose path is the longest prefix of cwd.
     let preselect = std::env::current_dir().ok().and_then(|cwd| {
         candidates
             .iter()
@@ -341,20 +363,24 @@ fn resolve_remove_branch(repo: &domain::RepoRoot, fmt: RemoveFormat) -> Result<O
             .map(|(idx, _)| idx)
     });
 
-    pick_removable_worktree(&candidates, preselect).map(Some)
+    pick_action_worktree(&candidates, preselect, action).map(Some)
 }
 
-/// Present an interactive fuzzy picker for worktree removal.
+/// Present an interactive fuzzy picker for a destructive worktree action.
 ///
 /// Only non-main worktrees are shown. `preselect` is the index into
 /// `candidates` to highlight by default (e.g. the current worktree).
+/// `action` is the verb displayed in the prompt (e.g. "Remove", "Merge").
 #[cfg(feature = "interactive")]
-fn pick_removable_worktree(
+fn pick_action_worktree(
     candidates: &[&domain::Worktree],
     preselect: Option<usize>,
+    action: &str,
 ) -> Result<BranchName> {
     use dialoguer::theme::ColorfulTheme;
     use dialoguer::FuzzySelect;
+
+    let prompt = format!("{} worktree", capitalize(action));
 
     let items: Vec<String> = candidates
         .iter()
@@ -365,7 +391,7 @@ fn pick_removable_worktree(
         .collect();
 
     let selection = FuzzySelect::with_theme(&ColorfulTheme::default())
-        .with_prompt("Remove worktree")
+        .with_prompt(&prompt)
         .items(&items)
         .default(preselect.unwrap_or(0))
         .interact_opt()
@@ -386,13 +412,88 @@ fn pick_removable_worktree(
 }
 
 #[cfg(not(feature = "interactive"))]
-fn pick_removable_worktree(
+fn pick_action_worktree(
     _candidates: &[&domain::Worktree],
     _preselect: Option<usize>,
+    _action: &str,
 ) -> Result<BranchName> {
     Err(AppError::usage(
         "interactive mode not available (compiled without 'interactive' feature)".to_string(),
     ))
+}
+
+/// Capitalize the first character of a string (ASCII only).
+fn capitalize(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
+fn cmd_merge(
+    branch: Option<BranchName>,
+    push: bool,
+    no_cleanup: bool,
+    repo: Option<PathBuf>,
+    fmt: MergeFormat,
+) -> Result<()> {
+    let repo = resolve_repo(repo)?;
+
+    let resolved_branch = match branch {
+        Some(b) => Some(b),
+        None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge")?,
+    };
+
+    let result = worktree::merge(&repo, resolved_branch.as_ref(), push, no_cleanup)?;
+
+    let root_str = result.repo_root.display().to_string();
+    let branch_name = &result.branch;
+    let removed_str = result
+        .removed_path
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+
+    match fmt {
+        MergeFormat::PrintPaths => {
+            println!("{root_str}");
+            println!("{branch_name}");
+            println!("{}", result.mainline);
+            println!("{}", result.cleaned_up);
+            println!("{removed_str}");
+            println!("{}", result.pushed);
+        }
+        MergeFormat::Json => {
+            print_json(&JsonMergeResponse {
+                ok: true,
+                message: format!("merged '{}' into {}", branch_name, result.mainline),
+                branch: branch_name.to_string(),
+                mainline: result.mainline.clone(),
+                repo_root: root_str,
+                cleaned_up: result.cleaned_up,
+                removed_path: if result.cleaned_up {
+                    Some(removed_str)
+                } else {
+                    None
+                },
+                pushed: result.pushed,
+            })?;
+        }
+        MergeFormat::Human => {
+            println!("Merged '{}' into {}", branch_name, result.mainline);
+            if result.cleaned_up {
+                println!("Removed worktree and branch '{}'", branch_name);
+            }
+            if result.pushed {
+                println!("Pushed {} to origin", result.mainline);
+            }
+        }
+    }
+    for w in &result.warnings {
+        eprintln!("warning: {w}");
+    }
+    Ok(())
 }
 
 fn cmd_remove(
@@ -405,7 +506,7 @@ fn cmd_remove(
 
     let resolved_branch = match branch {
         Some(b) => Some(b),
-        None => resolve_remove_branch(&repo, fmt)?,
+        None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove")?,
     };
 
     let result = worktree::remove(&repo, resolved_branch.as_ref(), force)?;
