@@ -1,8 +1,20 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::domain::{BranchName, RepoRoot, Worktree};
 use crate::error::{AppError, Result};
 use crate::git;
+
+/// Find the worktree that most specifically contains `cwd`.
+///
+/// Worktree directories are nested under the main repo path, so both the
+/// main worktree and linked worktree paths can be prefixes of `cwd`. We must
+/// choose the longest matching prefix to select the current linked worktree.
+fn worktree_for_cwd<'a>(worktrees: &'a [Worktree], cwd: &Path) -> Option<&'a Worktree> {
+    worktrees
+        .iter()
+        .filter(|wt| cwd.starts_with(&wt.path))
+        .max_by_key(|wt| wt.path.as_os_str().len())
+}
 
 /// Infer the target branch from cwd by finding the worktree whose path is
 /// the most specific (longest) prefix of the current directory.
@@ -11,11 +23,7 @@ use crate::git;
 fn resolve_branch_from_cwd(worktrees: &[Worktree]) -> Result<BranchName> {
     let cwd = std::env::current_dir()
         .map_err(|e| AppError::usage(format!("cannot determine cwd: {e}")))?;
-    let found = worktrees
-        .iter()
-        .filter(|wt| cwd.starts_with(&wt.path))
-        .max_by_key(|wt| wt.path.as_os_str().len());
-    match found {
+    match worktree_for_cwd(worktrees, &cwd) {
         Some(wt) => Ok(BranchName::new(wt.branch.clone().ok_or_else(|| {
             AppError::usage("current worktree has no branch".to_string())
         })?)),
@@ -570,4 +578,68 @@ pub fn merge(
         pushed,
         warnings,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+
+    fn wt(path: &str, branch: Option<&str>, is_main: bool) -> Worktree {
+        Worktree {
+            path: PathBuf::from(path),
+            branch: branch.map(str::to_string),
+            commit: "deadbee".to_string(),
+            is_main,
+        }
+    }
+
+    #[test]
+    fn worktree_for_cwd_prefers_longest_prefix() {
+        let worktrees = vec![
+            wt("/repo", Some("main"), true),
+            wt(
+                "/repo/.worktrees/feature-a--aaaa1111",
+                Some("feature/a"),
+                false,
+            ),
+        ];
+        let cwd = PathBuf::from("/repo/.worktrees/feature-a--aaaa1111");
+
+        let selected = worktree_for_cwd(&worktrees, &cwd).expect("expected matching worktree");
+        assert_eq!(selected.branch.as_deref(), Some("feature/a"));
+    }
+
+    #[test]
+    fn worktree_for_cwd_matches_nested_directories() {
+        let worktrees = vec![
+            wt("/repo", Some("main"), true),
+            wt(
+                "/repo/.worktrees/feature-b--bbbb2222",
+                Some("feature/b"),
+                false,
+            ),
+        ];
+        let cwd = PathBuf::from("/repo/.worktrees/feature-b--bbbb2222/src/module");
+
+        let selected = worktree_for_cwd(&worktrees, &cwd).expect("expected matching worktree");
+        assert_eq!(selected.branch.as_deref(), Some("feature/b"));
+    }
+
+    #[test]
+    fn worktree_for_cwd_returns_none_outside_repo() {
+        let worktrees = vec![
+            wt("/repo", Some("main"), true),
+            wt(
+                "/repo/.worktrees/feature-c--cccc3333",
+                Some("feature/c"),
+                false,
+            ),
+        ];
+        let cwd = PathBuf::from("/tmp");
+
+        let selected = worktree_for_cwd(&worktrees, &cwd);
+        assert!(selected.is_none());
+    }
 }
