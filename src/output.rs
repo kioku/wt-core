@@ -127,12 +127,18 @@ impl JsonListResponse {
 
 /// Find the index of the worktree whose path is the longest prefix of `cwd`.
 /// Returns `None` if no worktree path is a prefix of `cwd`.
+///
+/// Both `cwd` (canonicalized by the caller) and each `wt.path` are compared
+/// in canonical form so symlinks in the repository path do not break the match.
 pub fn find_current_worktree(worktrees: &[Worktree], cwd: &Path) -> Option<usize> {
     worktrees
         .iter()
         .enumerate()
-        .filter(|(_, wt)| cwd.starts_with(&wt.path))
-        .max_by_key(|(_, wt)| wt.path.as_os_str().len())
+        .filter_map(|(i, wt)| {
+            let canonical = wt.path.canonicalize().unwrap_or_else(|_| wt.path.clone());
+            cwd.starts_with(&canonical).then_some((i, canonical))
+        })
+        .max_by_key(|(_, p)| p.as_os_str().len())
         .map(|(idx, _)| idx)
 }
 
