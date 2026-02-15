@@ -1,6 +1,7 @@
 mod fixtures;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
@@ -212,4 +213,156 @@ fn list_from_subdirectory_of_linked_worktree() {
         .find(|w| w["branch"] == "feat-linked-sub")
         .expect("linked worktree not found");
     assert_eq!(linked_wt["is_main"], false, "linked should not be is_main");
+}
+
+// ── is_current tests ────────────────────────────────────────────────
+
+#[test]
+fn list_json_marks_linked_worktree_as_current_when_cwd_inside() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let wt_path = add_worktree(&repo_str, "feat-current");
+
+    let output = wt_core()
+        .args(["list", "--json"])
+        .current_dir(&wt_path)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let worktrees = json["worktrees"].as_array().expect("worktrees array");
+
+    let feat_wt = worktrees
+        .iter()
+        .find(|w| w["branch"] == "feat-current")
+        .expect("feat worktree not found");
+    assert_eq!(
+        feat_wt["is_current"], true,
+        "linked worktree should be is_current when cwd is inside it"
+    );
+
+    let main_wt = worktrees
+        .iter()
+        .find(|w| w["branch"] == "main")
+        .expect("main worktree not found");
+    assert_eq!(
+        main_wt["is_current"], false,
+        "main worktree should not be is_current"
+    );
+}
+
+#[test]
+fn list_json_marks_main_worktree_as_current_when_cwd_inside() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    add_worktree(&repo_str, "feat-other");
+
+    let output = wt_core()
+        .args(["list", "--json"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let worktrees = json["worktrees"].as_array().expect("worktrees array");
+
+    let main_wt = worktrees
+        .iter()
+        .find(|w| w["branch"] == "main")
+        .expect("main worktree not found");
+    assert_eq!(
+        main_wt["is_current"], true,
+        "main worktree should be is_current when cwd is inside it"
+    );
+
+    let feat_wt = worktrees
+        .iter()
+        .find(|w| w["branch"] == "feat-other")
+        .expect("feat worktree not found");
+    assert_eq!(
+        feat_wt["is_current"], false,
+        "linked worktree should not be is_current"
+    );
+}
+
+#[test]
+fn list_json_no_current_when_repo_flag_points_elsewhere() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    add_worktree(&repo_str, "feat-remote");
+
+    // Use a temp dir as cwd that is NOT inside the repo
+    let outside = tempfile::TempDir::new().expect("create temp dir");
+
+    let output = wt_core()
+        .args(["list", "--repo", &repo_str, "--json"])
+        .current_dir(outside.path())
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let worktrees = json["worktrees"].as_array().expect("worktrees array");
+
+    for wt in worktrees {
+        assert_eq!(
+            wt["is_current"], false,
+            "no worktree should be is_current when cwd is outside the repo"
+        );
+    }
+}
+
+#[test]
+fn list_json_current_from_subdirectory_of_linked_worktree() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let wt_path = add_worktree(&repo_str, "feat-sub-current");
+
+    let subdir = std::path::PathBuf::from(&wt_path)
+        .join("deep")
+        .join("nested");
+    std::fs::create_dir_all(&subdir).expect("create subdir");
+
+    let output = wt_core()
+        .args(["list", "--json"])
+        .current_dir(&subdir)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let worktrees = json["worktrees"].as_array().expect("worktrees array");
+
+    let feat_wt = worktrees
+        .iter()
+        .find(|w| w["branch"] == "feat-sub-current")
+        .expect("feat worktree not found");
+    assert_eq!(
+        feat_wt["is_current"], true,
+        "linked worktree should be is_current even from a subdirectory"
+    );
+}
+
+#[test]
+fn list_human_shows_here_marker_on_current_worktree() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let wt_path = add_worktree(&repo_str, "feat-marker");
+
+    wt_core()
+        .args(["list"])
+        .current_dir(&wt_path)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("← here"));
 }
