@@ -330,6 +330,24 @@ pub fn rev_exists(repo: &RepoRoot, rev: &str) -> bool {
     git(&["rev-parse", "--verify", rev], repo.as_ref()).is_ok()
 }
 
+/// Check if a remote-tracking branch exists for `origin/<branch>`.
+pub fn remote_branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
+    let refspec = format!("refs/remotes/origin/{}", branch.as_str());
+    git(&["rev-parse", "--verify", &refspec], repo.as_ref()).is_ok()
+}
+
+/// Set the upstream tracking reference for a local branch.
+///
+/// Equivalent to `git branch --set-upstream-to=origin/<branch> <branch>`.
+pub fn set_upstream(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
+    let upstream = format!("origin/{}", branch.as_str());
+    git(
+        &["branch", "--set-upstream-to", &upstream, branch.as_str()],
+        repo.as_ref(),
+    )?;
+    Ok(())
+}
+
 /// Merge a branch into the current branch using `--no-ff`.
 ///
 /// Must be run from the main worktree (the `repo` root). Returns `Ok(())`

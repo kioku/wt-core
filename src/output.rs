@@ -41,6 +41,9 @@ pub struct JsonResponse {
     pub removed_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Whether the branch tracks a remote branch (only set for `add`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tracking: Option<bool>,
 }
 
 impl JsonResponse {
@@ -53,6 +56,7 @@ impl JsonResponse {
             cd_path: None,
             removed_path: None,
             branch: None,
+            tracking: None,
         }
     }
 
@@ -78,6 +82,11 @@ impl JsonResponse {
 
     pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
         self.branch = Some(branch.into());
+        self
+    }
+
+    pub fn with_tracking(mut self, tracking: bool) -> Self {
+        self.tracking = Some(tracking);
         self
     }
 }
