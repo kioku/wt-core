@@ -449,3 +449,231 @@ fn remove_no_branch_no_worktrees_non_tty_errors() {
         .failure()
         .code(1);
 }
+
+// ── Remote tracking tests ───────────────────────────────────────────
+
+/// Helper: push a branch to the bare origin from a temporary working copy,
+/// then fetch in the clone so `origin/<branch>` exists.
+fn push_remote_branch(
+    origin_path: &std::path::Path,
+    clone_path: &std::path::Path,
+    branch: &str,
+    filename: &str,
+) {
+    // Create a throwaway clone to push from (avoids contaminating the test clone)
+    let pusher = tempfile::TempDir::new().expect("failed to create pusher dir");
+    fixtures::run_git(
+        &[
+            "clone",
+            &origin_path.display().to_string(),
+            &pusher.path().display().to_string(),
+        ],
+        origin_path,
+    );
+    fixtures::run_git(&["config", "user.email", "test@test.com"], pusher.path());
+    fixtures::run_git(&["config", "user.name", "Test"], pusher.path());
+    fixtures::run_git(&["checkout", "-b", branch], pusher.path());
+    fixtures::commit_file(
+        pusher.path(),
+        filename,
+        "content",
+        &format!("add {filename}"),
+    );
+    fixtures::run_git(&["push", "origin", branch], pusher.path());
+
+    // Fetch in the test clone so origin/<branch> is visible
+    fixtures::run_git(&["fetch", "origin"], clone_path);
+}
+
+#[test]
+fn add_tracks_remote_branch_when_exists() {
+    let repos = fixtures::ClonedTestRepo::new();
+    let clone_str = repos.path().display().to_string();
+
+    // Push a branch to origin from a separate clone
+    push_remote_branch(
+        &repos.origin_path(),
+        &repos.path(),
+        "feature/review",
+        "review.txt",
+    );
+
+    // Now `wt add feature/review` should auto-track origin/feature/review
+    wt_core()
+        .args(["add", "feature/review", "--repo", &clone_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("tracking 'origin/feature/review'"));
+}
+
+#[test]
+fn add_remote_tracking_json_includes_tracking_field() {
+    let repos = fixtures::ClonedTestRepo::new();
+    let clone_str = repos.path().display().to_string();
+
+    push_remote_branch(
+        &repos.origin_path(),
+        &repos.path(),
+        "feature/json-track",
+        "track.txt",
+    );
+
+    let output = wt_core()
+        .args(["add", "feature/json-track", "--repo", &clone_str, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["tracking"], true);
+    assert_eq!(json["branch"], "feature/json-track");
+}
+
+#[test]
+fn add_with_base_ignores_remote_tracking() {
+    let repos = fixtures::ClonedTestRepo::new();
+    let clone_str = repos.path().display().to_string();
+
+    push_remote_branch(
+        &repos.origin_path(),
+        &repos.path(),
+        "feature/base-override",
+        "base.txt",
+    );
+
+    // Even though origin/feature/base-override exists, --base forces a new branch
+    let output = wt_core()
+        .args([
+            "add",
+            "feature/base-override",
+            "--base",
+            "HEAD",
+            "--repo",
+            &clone_str,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(
+        json["tracking"], false,
+        "--base should skip remote tracking"
+    );
+}
+
+#[test]
+fn add_new_branch_when_no_remote() {
+    let repos = fixtures::ClonedTestRepo::new();
+    let clone_str = repos.path().display().to_string();
+
+    // No remote branch exists for "feature/brand-new"
+    let output = wt_core()
+        .args(["add", "feature/brand-new", "--repo", &clone_str, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["tracking"], false);
+}
+
+#[test]
+fn add_still_errors_when_local_branch_exists() {
+    let repos = fixtures::ClonedTestRepo::new();
+    let clone_str = repos.path().display().to_string();
+
+    push_remote_branch(
+        &repos.origin_path(),
+        &repos.path(),
+        "feature/local-conflict",
+        "conflict.txt",
+    );
+
+    // Create the local branch manually (simulating a previous checkout)
+    fixtures::run_git(
+        &[
+            "branch",
+            "feature/local-conflict",
+            "origin/feature/local-conflict",
+        ],
+        &repos.path(),
+    );
+
+    // Should fail with conflict error even though remote exists
+    wt_core()
+        .args(["add", "feature/local-conflict", "--repo", &clone_str])
+        .assert()
+        .failure()
+        .code(5) // Conflict
+        .stderr(predicate::str::contains("already exists"));
+}
+
+#[test]
+fn add_remote_tracking_sets_correct_upstream() {
+    let repos = fixtures::ClonedTestRepo::new();
+    let clone_str = repos.path().display().to_string();
+
+    push_remote_branch(
+        &repos.origin_path(),
+        &repos.path(),
+        "feature/upstream-check",
+        "upstream.txt",
+    );
+
+    let output = wt_core()
+        .args([
+            "add",
+            "feature/upstream-check",
+            "--repo",
+            &clone_str,
+            "--print-cd-path",
+        ])
+        .output()
+        .expect("add failed");
+    let wt_path = String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+
+    // Verify the upstream is set correctly by checking @{u}.
+    // We need to use the run_git-style env clearing so hooks don't interfere.
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["rev-parse", "--abbrev-ref", "feature/upstream-check@{u}"])
+        .current_dir(&wt_path);
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_PREFIX",
+    ] {
+        cmd.env_remove(var);
+    }
+    let upstream_output = cmd.output().expect("git rev-parse failed");
+    assert!(
+        upstream_output.status.success(),
+        "git rev-parse @{{u}} failed: {}",
+        String::from_utf8_lossy(&upstream_output.stderr)
+    );
+    let upstream = String::from_utf8(upstream_output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+    assert_eq!(upstream, "origin/feature/upstream-check");
+
+    // Also verify the worktree has the remote branch's content
+    assert!(
+        std::path::Path::new(&wt_path).join("upstream.txt").exists(),
+        "tracked worktree should contain the remote branch's files"
+    );
+}

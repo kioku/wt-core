@@ -30,6 +30,8 @@ pub struct AddResult {
     pub worktree_path: PathBuf,
     pub branch: BranchName,
     pub repo_root: PathBuf,
+    /// Whether the branch was created to track an existing remote branch.
+    pub tracking: bool,
 }
 
 /// Result of a successful `go` operation.
@@ -64,6 +66,13 @@ pub enum DiagLevel {
 }
 
 /// Create a new worktree for the given branch.
+///
+/// When `base` is `None` and the branch does not exist locally but does
+/// exist on `origin`, the worktree is created tracking the remote branch
+/// (`origin/<branch>`) and the upstream is set automatically.
+///
+/// When `base` is provided, a new branch is always created from that
+/// revision (remote tracking is skipped).
 pub fn add(repo: &RepoRoot, branch: &BranchName, base: Option<&str>) -> Result<AddResult> {
     // Refuse if branch already exists locally.
     if git::branch_exists(repo, branch) {
@@ -87,12 +96,29 @@ pub fn add(repo: &RepoRoot, branch: &BranchName, base: Option<&str>) -> Result<A
         )));
     }
 
-    git::add_worktree(repo, &wt_dir, branch, base)?;
+    // Determine whether to track a remote branch:
+    // - Only when no explicit --base is provided
+    // - Only when origin/<branch> exists
+    let tracking = base.is_none() && git::remote_branch_exists(repo, branch);
+
+    let effective_base = if tracking {
+        Some(format!("origin/{}", branch.as_str()))
+    } else {
+        None
+    };
+
+    git::add_worktree(repo, &wt_dir, branch, effective_base.as_deref().or(base))?;
+
+    // Set upstream so `git pull`/`git push` work without arguments.
+    if tracking {
+        git::set_upstream(repo, branch)?;
+    }
 
     Ok(AddResult {
         worktree_path: wt_dir,
         branch: branch.clone(),
         repo_root: repo.to_path_buf(),
+        tracking,
     })
 }
 

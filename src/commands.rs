@@ -175,22 +175,34 @@ fn cmd_add(
     let path_str = result.worktree_path.display().to_string();
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;
+    let tracking = result.tracking;
 
     match fmt {
         NavigationFormat::CdPath => {
             println!("{path_str}");
         }
         NavigationFormat::Json => {
-            let resp =
-                JsonResponse::success(format!("created worktree for branch '{branch_name}'"))
-                    .with_repo_root(&root_str)
-                    .with_worktree_path(&path_str)
-                    .with_cd_path(&path_str)
-                    .with_branch(branch_name.as_str());
+            let message = if tracking {
+                format!(
+                    "created worktree for branch '{branch_name}' tracking 'origin/{branch_name}'"
+                )
+            } else {
+                format!("created worktree for branch '{branch_name}'")
+            };
+            let resp = JsonResponse::success(message)
+                .with_repo_root(&root_str)
+                .with_worktree_path(&path_str)
+                .with_cd_path(&path_str)
+                .with_branch(branch_name.as_str())
+                .with_tracking(tracking);
             print_json(&resp)?;
         }
         NavigationFormat::Human => {
-            println!("Created worktree for branch '{branch_name}' at {path_str}");
+            if tracking {
+                println!("Created worktree for branch '{branch_name}' tracking 'origin/{branch_name}' at {path_str}");
+            } else {
+                println!("Created worktree for branch '{branch_name}' at {path_str}");
+            }
         }
     }
     Ok(())
