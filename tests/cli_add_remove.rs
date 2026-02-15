@@ -438,6 +438,48 @@ fn remove_no_branch_print_paths_uses_cwd_inference() {
 }
 
 #[test]
+fn remove_no_branch_print_paths_from_nested_dir_uses_cwd_inference() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    // Create a worktree.
+    let output = wt_core()
+        .args([
+            "add",
+            "paths-infer-nested",
+            "--repo",
+            &repo_str,
+            "--print-cd-path",
+        ])
+        .output()
+        .expect("add failed");
+    let wt_path = String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+
+    // Move into a nested subdirectory inside that worktree.
+    let nested = std::path::Path::new(&wt_path).join("src/nested");
+    std::fs::create_dir_all(&nested).expect("failed to create nested test dir");
+
+    // --print-paths without a branch should still infer the linked branch
+    // from nested cwd, not the main worktree.
+    let output = wt_core()
+        .args(["remove", "--print-paths"])
+        .current_dir(&nested)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3);
+    assert_eq!(lines[2], "paths-infer-nested");
+}
+
+#[test]
 fn remove_no_branch_no_worktrees_non_tty_errors() {
     let repo = fixtures::TestRepo::new();
 
