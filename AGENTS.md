@@ -2,7 +2,7 @@
 
 ## Project
 
-`wt-core` is a Rust CLI that manages Git worktree lifecycles. It provides `add`, `go`, `list`, `remove`, and `doctor` commands. Thin shell bindings (Nu, Bash, Zsh, Fish) wrap the binary to handle `cd` in the parent shell. All Git/worktree logic lives in Rust; wrappers stay trivial.
+`wt-core` is a Rust CLI that manages Git worktree lifecycles. It provides `add`, `go`, `list`, `remove`, `merge`, `prune`, `doctor`, and `init` commands. Thin shell bindings (Nu, Bash, Zsh, Fish) wrap the binary to handle `cd` in the parent shell. All Git/worktree logic lives in Rust; wrappers stay trivial.
 
 ## Repository layout
 
