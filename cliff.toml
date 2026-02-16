@@ -1,0 +1,56 @@
+# git-cliff configuration
+# https://git-cliff.org/docs/configuration
+
+[changelog]
+header = """# Changelog
+
+All notable changes to this project will be documented in this file.
+
+This changelog is generated automatically by [git-cliff](https://git-cliff.org/)
+during the release workflow and is append-only — existing entries are never modified.\n
+"""
+body = """
+{%- macro remote_url() -%}
+  https://github.com/kioku/wt-core
+{%- endmacro -%}
+
+{% if version -%}
+  ## [{{ version | trim_start_matches(pat="v") }}]({{ self::remote_url() }}/releases/tag/{{ version }}) — {{ timestamp | date(format="%Y-%m-%d") }}
+{% else -%}
+  ## Unreleased
+{% endif -%}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+  - {{ commit.message | upper_first | trim }}\
+{% endfor %}
+{% endfor %}\n
+"""
+trim = true
+footer = ""
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug Fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactor" },
+  { message = "^doc", group = "Documentation" },
+  { message = "^test", skip = true },
+  { message = "^chore: bump version", skip = true },
+  { message = "^chore", group = "Miscellaneous" },
+  { message = "^ci", skip = true },
+  { message = "^build", skip = true },
+]
+filter_commits = false
+tag_pattern = "v[0-9].*"
+skip_tags = ""
+sort_commits = "oldest"
+
+# Do not include merge commits in the changelog.
+commit_preprocessors = []
+protect_breaking_commits = false

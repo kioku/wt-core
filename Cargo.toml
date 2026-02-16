@@ -18,6 +18,7 @@ exclude = [
     "scripts/",
     "sgconfig.yml",
     "deny.toml",
+    "cliff.toml",
     "AGENTS.md",
 ]
 
