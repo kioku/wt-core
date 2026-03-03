@@ -88,7 +88,11 @@ fn expand_entry(repo_root: &Path, pattern: &str) -> Vec<PathBuf> {
 /// Only single `*` within the pattern is supported (e.g. `.env.*`, `*.txt`).
 fn glob_matches(pattern: &str, name: &str) -> bool {
     match pattern.split_once('*') {
-        Some((prefix, suffix)) => name.starts_with(prefix) && name.ends_with(suffix),
+        Some((prefix, suffix)) => {
+            name.len() >= prefix.len() + suffix.len()
+                && name.starts_with(prefix)
+                && name.ends_with(suffix)
+        }
         None => pattern == name,
     }
 }
@@ -494,6 +498,16 @@ mod tests {
     fn parse_config_missing_file_returns_empty() {
         let entries = parse_config_file(Path::new("/nonexistent/path"));
         assert!(entries.is_empty());
+    }
+
+    #[test]
+    fn glob_matches_rejects_overlapping_prefix_suffix() {
+        assert!(glob_matches(".env.*", ".env.local"));
+        assert!(glob_matches(".env.*", ".env."));
+        assert!(!glob_matches(".env.loc*.local", ".env.local"));
+        assert!(glob_matches("a*", "abc"));
+        assert!(glob_matches("*c", "abc"));
+        assert!(!glob_matches("abc*def", "abcde"));
     }
 
     #[test]
