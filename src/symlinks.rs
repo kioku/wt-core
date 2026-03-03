@@ -314,8 +314,32 @@ const ECOSYSTEM_MARKERS: &[(&str, &str, &[&str])] = &[
             ".nox",
         ],
     ),
-    ("python", "setup.py", &[]),
-    ("python", "setup.cfg", &[]),
+    (
+        "python",
+        "setup.py",
+        &[
+            ".venv",
+            "venv",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".nox",
+        ],
+    ),
+    (
+        "python",
+        "setup.cfg",
+        &[
+            ".venv",
+            "venv",
+            ".mypy_cache",
+            ".pytest_cache",
+            ".ruff_cache",
+            ".tox",
+            ".nox",
+        ],
+    ),
     ("go", "go.mod", &["vendor"]),
     ("php", "composer.json", &["vendor"]),
     ("ruby", "Gemfile", &[".bundle"]),
@@ -734,6 +758,20 @@ mod tests {
         let config = generate_config(&repo);
         let python_count = config.matches("# python").count();
         assert_eq!(python_count, 1);
+    }
+
+    #[test]
+    fn generate_config_python_setup_py_emits_entries() {
+        let dir = make_temp_dir();
+        let repo = RepoRoot(dir.path().to_path_buf());
+        fs::write(dir.path().join("setup.py"), "").expect("write");
+
+        let config = generate_config(&repo);
+        assert!(config.contains(".venv"), "setup.py should emit .venv");
+        assert!(
+            config.contains("# python (detected: setup.py)"),
+            "should credit setup.py as the marker"
+        );
     }
 
     #[test]
