@@ -301,6 +301,54 @@ fn setup_detects_multiple_ecosystems() {
     assert!(config.contains("target"));
 }
 
+#[test]
+fn setup_json_returns_structured_response() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::write(repo.path().join("package.json"), "{}").expect("write");
+    fs::write(repo.path().join("Cargo.toml"), "[package]").expect("write");
+
+    let output = wt_core()
+        .args(["setup", "--repo", &repo_str, "--json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert!(
+        json["config_path"]
+            .as_str()
+            .expect("config_path")
+            .ends_with(".wt/symlinks"),
+        "config_path should end with .wt/symlinks"
+    );
+    let ecosystems = json["ecosystems"]
+        .as_array()
+        .expect("ecosystems should be array");
+    assert!(ecosystems.contains(&serde_json::json!("node")));
+    assert!(ecosystems.contains(&serde_json::json!("rust")));
+    assert_eq!(json["gitignore_updated"], true);
+}
+
+#[test]
+fn setup_json_refuses_if_config_exists() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::create_dir(repo.path().join(".wt")).expect("mkdir .wt");
+    fs::write(repo.path().join(".wt/symlinks"), "existing\n").expect("write");
+
+    wt_core()
+        .args(["setup", "--repo", &repo_str, "--json"])
+        .assert()
+        .failure()
+        .code(5);
+}
+
 // ── wt remove with symlinks ─────────────────────────────────────────
 
 #[test]

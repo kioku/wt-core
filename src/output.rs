@@ -266,6 +266,15 @@ pub struct JsonMergeResponse {
     pub pushed: bool,
 }
 
+/// JSON response for the setup command.
+#[derive(Debug, Serialize)]
+pub struct JsonSetupResponse {
+    pub ok: bool,
+    pub config_path: String,
+    pub ecosystems: Vec<String>,
+    pub gitignore_updated: bool,
+}
+
 /// Serialize a value as pretty-printed JSON to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(

@@ -146,6 +146,10 @@ pub enum Command {
         /// Repository path (defaults to current directory)
         #[arg(long)]
         repo: Option<PathBuf>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Print shell bindings to stdout

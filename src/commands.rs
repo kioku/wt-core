@@ -73,7 +73,7 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
         } => cmd_prune(execute, force, mainline.as_deref(), repo, prune_fmt(json)),
-        Command::Setup { repo } => cmd_setup(repo),
+        Command::Setup { repo, json } => cmd_setup(repo, status_fmt(json)),
         Command::Init { shell } => cmd_init(shell),
         Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
     }
@@ -760,7 +760,8 @@ fn cmd_prune_execute(
     Ok(())
 }
 
-fn cmd_setup(repo: Option<PathBuf>) -> Result<()> {
+fn cmd_setup(repo: Option<PathBuf>, fmt: StatusFormat) -> Result<()> {
+    use crate::output::JsonSetupResponse;
     use crate::symlinks;
 
     let repo = resolve_repo(repo)?;
@@ -786,17 +787,29 @@ fn cmd_setup(repo: Option<PathBuf>) -> Result<()> {
     let gitignore_updated = symlinks::ensure_gitignore_entry(&repo)
         .map_err(|e| AppError::git(format!("failed to update .gitignore: {e}")))?;
 
-    if ecosystems.is_empty() {
-        eprintln!("Detected ecosystems: (none)");
-    } else {
-        eprintln!("Detected ecosystems: {}", ecosystems.join(", "));
+    match fmt {
+        StatusFormat::Json => {
+            print_json(&JsonSetupResponse {
+                ok: true,
+                config_path: config_path.display().to_string(),
+                ecosystems,
+                gitignore_updated,
+            })?;
+        }
+        StatusFormat::Human => {
+            if ecosystems.is_empty() {
+                eprintln!("Detected ecosystems: (none)");
+            } else {
+                eprintln!("Detected ecosystems: {}", ecosystems.join(", "));
+            }
+            eprintln!("Created {}", config_path.display());
+            if gitignore_updated {
+                eprintln!("Added .wt/symlinks.local to .gitignore");
+            }
+            eprintln!();
+            eprintln!("Review the generated config and remove entries that don't apply.");
+        }
     }
-    eprintln!("Created {}", config_path.display());
-    if gitignore_updated {
-        eprintln!("Added .wt/symlinks.local to .gitignore");
-    }
-    eprintln!();
-    eprintln!("Review the generated config and remove entries that don't apply.");
 
     Ok(())
 }
