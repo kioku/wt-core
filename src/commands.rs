@@ -217,7 +217,7 @@ fn cmd_add(
                 .with_cd_path(&path_str)
                 .with_branch(branch_name.as_str())
                 .with_tracking(tracking)
-                .with_symlinks(symlinked.clone());
+                .with_symlinks(symlinked);
             print_json(&resp)?;
         }
         NavigationFormat::Human => {
@@ -226,8 +226,10 @@ fn cmd_add(
             } else {
                 println!("Created worktree for branch '{branch_name}' at {path_str}");
             }
-            for name in &symlinked {
-                println!("  Symlinked {name}");
+            if let Some(report) = &result.symlinks {
+                for path in &report.created {
+                    println!("  Symlinked {}", path.display());
+                }
             }
         }
     }
