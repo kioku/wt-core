@@ -160,7 +160,7 @@ jobs:
           cd staging && 7z a ../wt-core-${{ needs.validate.outputs.version }}-${{ matrix.target }}.zip *
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: wt-core-${{ matrix.target }}
           path: |
