@@ -105,6 +105,43 @@ fn go_json_returns_structured_response() {
 }
 
 #[test]
+fn go_json_emits_single_line_for_machine_parsing() {
+    let repo = fixtures::TestRepo::new();
+
+    wt_core()
+        .args([
+            "add",
+            "go-json-line",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "go",
+            "go-json-line",
+            "--repo",
+            &repo.path().display().to_string(),
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<_> = stdout.lines().collect();
+    assert_eq!(lines.len(), 1, "expected single-line json output");
+
+    let json: serde_json::Value = serde_json::from_str(lines[0]).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "go-json-line");
+}
+
+#[test]
 fn go_fails_for_nonexistent_branch() {
     let repo = fixtures::TestRepo::new();
 
@@ -147,6 +184,30 @@ fn go_no_branch_non_tty_errors() {
 #[test]
 fn go_no_branch_json_errors() {
     let repo = fixtures::TestRepo::new();
+
+    wt_core()
+        .args(["go", "--json", "--repo", &repo.path().display().to_string()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "branch argument is required with --json",
+        ));
+}
+
+#[test]
+fn go_no_branch_json_requires_explicit_branch_even_with_one_worktree() {
+    let repo = fixtures::TestRepo::new();
+
+    wt_core()
+        .args([
+            "add",
+            "json-sole",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .success();
 
     wt_core()
         .args(["go", "--json", "--repo", &repo.path().display().to_string()])

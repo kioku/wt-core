@@ -151,9 +151,11 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | Flag              | Behavior                                     |
 |-------------------|----------------------------------------------|
 | *(default)*       | Human-readable text                          |
-| `--json`          | Structured JSON envelope on stdout           |
+| `--json`          | Single-line JSON envelope on stdout          |
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
 | `--print-paths`   | Multi-line key values on stdout (for wrappers) |
+
+`--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
 
 JSON envelope example (`add`, `go`, `remove`):
 

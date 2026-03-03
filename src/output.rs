@@ -289,11 +289,11 @@ pub struct JsonSetupResponse {
     pub gitignore_updated: bool,
 }
 
-/// Serialize a value as pretty-printed JSON to stdout.
+/// Serialize a value as a compact single-line JSON object to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
         "{}",
-        serde_json::to_string_pretty(value)
+        serde_json::to_string(value)
             .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
     );
     Ok(())
