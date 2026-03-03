@@ -4,6 +4,7 @@ mod domain;
 mod error;
 mod git;
 mod output;
+mod symlinks;
 mod worktree;
 
 use std::process;

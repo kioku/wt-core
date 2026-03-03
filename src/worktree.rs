@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use crate::domain::{BranchName, RepoRoot, Worktree};
 use crate::error::{AppError, Result};
 use crate::git;
+use crate::symlinks;
 
 /// Find the worktree that most specifically contains `cwd`.
 ///
@@ -40,6 +41,8 @@ pub struct AddResult {
     pub repo_root: PathBuf,
     /// Whether the branch was created to track an existing remote branch.
     pub tracking: bool,
+    /// Symlink outcomes, if a `.wt/symlinks` config was present.
+    pub symlinks: Option<symlinks::SymlinkReport>,
 }
 
 /// Result of a successful `go` operation.
@@ -122,11 +125,14 @@ pub fn add(repo: &RepoRoot, branch: &BranchName, base: Option<&str>) -> Result<A
         git::set_upstream(repo, branch)?;
     }
 
+    let symlink_report = symlinks::apply_symlinks(repo, &wt_dir);
+
     Ok(AddResult {
         worktree_path: wt_dir,
         branch: branch.clone(),
         repo_root: repo.to_path_buf(),
         tracking,
+        symlinks: symlink_report,
     })
 }
 

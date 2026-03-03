@@ -46,6 +46,9 @@ pub struct JsonResponse {
     /// Whether the branch tracks a remote branch (only set for `add`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracking: Option<bool>,
+    /// Symlinks created during `add` (only set when config exists).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symlinks: Option<Vec<String>>,
 }
 
 impl JsonResponse {
@@ -59,6 +62,7 @@ impl JsonResponse {
             removed_path: None,
             branch: None,
             tracking: None,
+            symlinks: None,
         }
     }
 
@@ -89,6 +93,13 @@ impl JsonResponse {
 
     pub fn with_tracking(mut self, tracking: bool) -> Self {
         self.tracking = Some(tracking);
+        self
+    }
+
+    pub fn with_symlinks(mut self, symlinks: Vec<String>) -> Self {
+        if !symlinks.is_empty() {
+            self.symlinks = Some(symlinks);
+        }
         self
     }
 }

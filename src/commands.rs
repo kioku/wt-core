@@ -73,6 +73,7 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
         } => cmd_prune(execute, force, mainline.as_deref(), repo, prune_fmt(json)),
+        Command::Setup { repo } => cmd_setup(repo),
         Command::Init { shell } => cmd_init(shell),
         Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
     }
@@ -193,6 +194,11 @@ fn cmd_add(
     let branch_name = &result.branch;
     let tracking = result.tracking;
 
+    let symlinked: Vec<String> = result
+        .symlinks
+        .as_ref()
+        .map(|r| r.created.iter().map(|p| p.display().to_string()).collect())
+        .unwrap_or_default();
     match fmt {
         NavigationFormat::CdPath => {
             println!("{path_str}");
@@ -210,7 +216,8 @@ fn cmd_add(
                 .with_worktree_path(&path_str)
                 .with_cd_path(&path_str)
                 .with_branch(branch_name.as_str())
-                .with_tracking(tracking);
+                .with_tracking(tracking)
+                .with_symlinks(symlinked.clone());
             print_json(&resp)?;
         }
         NavigationFormat::Human => {
@@ -219,8 +226,17 @@ fn cmd_add(
             } else {
                 println!("Created worktree for branch '{branch_name}' at {path_str}");
             }
+            for name in &symlinked {
+                println!("  Symlinked {name}");
+            }
         }
     }
+    if let Some(report) = &result.symlinks {
+        for (path, reason) in &report.skipped {
+            eprintln!("warning: symlink {}: {reason}", path.display());
+        }
+    }
+
     Ok(())
 }
 
@@ -739,6 +755,47 @@ fn cmd_prune_execute(
             }
         }
     }
+    Ok(())
+}
+
+fn cmd_setup(repo: Option<PathBuf>) -> Result<()> {
+    use crate::symlinks;
+
+    let repo = resolve_repo(repo)?;
+    let config_path = symlinks::config_path(&repo);
+
+    if config_path.exists() {
+        return Err(AppError::conflict(format!(
+            ".wt/symlinks already exists at {}; edit it directly",
+            config_path.display()
+        )));
+    }
+
+    let config_content = symlinks::generate_config(&repo);
+    let ecosystems = symlinks::detect_ecosystems(&repo);
+
+    let config_dir = symlinks::config_dir(&repo);
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| AppError::git(format!("failed to create .wt/ directory: {e}")))?;
+
+    std::fs::write(&config_path, &config_content)
+        .map_err(|e| AppError::git(format!("failed to write .wt/symlinks: {e}")))?;
+
+    let gitignore_updated = symlinks::ensure_gitignore_entry(&repo)
+        .map_err(|e| AppError::git(format!("failed to update .gitignore: {e}")))?;
+
+    if ecosystems.is_empty() {
+        eprintln!("Detected ecosystems: (none)");
+    } else {
+        eprintln!("Detected ecosystems: {}", ecosystems.join(", "));
+    }
+    eprintln!("Created {}", config_path.display());
+    if gitignore_updated {
+        eprintln!("Added .wt/symlinks.local to .gitignore");
+    }
+    eprintln!();
+    eprintln!("Review the generated config and remove entries that don't apply.");
+
     Ok(())
 }
 
