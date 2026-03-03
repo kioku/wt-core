@@ -141,14 +141,14 @@ pub enum Command {
         json: bool,
     },
 
-    /// Print shell bindings to stdout
-
     /// Generate .wt/symlinks config from detected project ecosystems
     Setup {
         /// Repository path (defaults to current directory)
         #[arg(long)]
         repo: Option<PathBuf>,
     },
+
+    /// Print shell bindings to stdout
     Init {
         /// Shell to generate bindings for
         shell: Shell,
