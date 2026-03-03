@@ -141,6 +141,17 @@ pub enum Command {
         json: bool,
     },
 
+    /// Generate .wt/symlinks config from detected project ecosystems
+    Setup {
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Print shell bindings to stdout
     Init {
         /// Shell to generate bindings for
