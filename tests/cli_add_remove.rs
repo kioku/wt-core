@@ -56,6 +56,7 @@ fn add_json_returns_structured_response() {
 
     let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
     assert_eq!(json["ok"], true);
+    assert_eq!(json["event"], "switch");
     assert!(json["cd_path"].as_str().is_some());
     assert!(json["worktree_path"].as_str().is_some());
     assert!(json["repo_root"].as_str().is_some());
@@ -233,6 +234,7 @@ fn remove_json_includes_removed_path() {
 
     let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
     assert_eq!(json["ok"], true);
+    assert_eq!(json["event"], "reset");
     assert!(json["removed_path"].as_str().is_some());
     assert!(json["repo_root"].as_str().is_some());
 }

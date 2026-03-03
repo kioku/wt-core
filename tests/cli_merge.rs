@@ -333,6 +333,7 @@ fn merge_json_output_structure() {
 
     let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
     assert_eq!(json["ok"], true);
+    assert_eq!(json["event"], "reset");
     assert_eq!(json["branch"], "feature/json-merge");
     assert_eq!(json["mainline"], "main");
     assert!(json["repo_root"].as_str().is_some());
@@ -374,6 +375,10 @@ fn merge_json_no_cleanup_shows_false() {
 
     let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
     assert_eq!(json["ok"], true);
+    assert!(
+        json["event"].is_null(),
+        "event should be absent when cleanup is skipped"
+    );
     assert_eq!(json["cleaned_up"], false);
     assert!(
         json["removed_path"].is_null(),
