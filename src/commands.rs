@@ -212,6 +212,7 @@ fn cmd_add(
                 format!("created worktree for branch '{branch_name}'")
             };
             let resp = JsonResponse::success(message)
+                .with_event("switch")
                 .with_repo_root(&root_str)
                 .with_worktree_path(&path_str)
                 .with_cd_path(&path_str)
@@ -268,6 +269,7 @@ fn cmd_go(
         NavigationFormat::Json => {
             let resp =
                 JsonResponse::success(format!("resolved worktree for branch '{branch_name}'"))
+                    .with_event("switch")
                     .with_repo_root(&root_str)
                     .with_worktree_path(&path_str)
                     .with_cd_path(&path_str)
@@ -511,8 +513,14 @@ fn cmd_merge(
             println!("{}", result.pushed);
         }
         MergeFormat::Json => {
+            let event = if result.cleaned_up {
+                Some("reset".to_string())
+            } else {
+                None
+            };
             print_json(&JsonMergeResponse {
                 ok: true,
+                event,
                 message: format!("merged '{}' into {}", branch_name, result.mainline),
                 branch: branch_name.to_string(),
                 mainline: result.mainline.clone(),
@@ -570,6 +578,7 @@ fn cmd_remove(
         RemoveFormat::Json => {
             let resp =
                 JsonResponse::success(format!("removed worktree for branch '{branch_name}'"))
+                    .with_event("reset")
                     .with_repo_root(&root_str)
                     .with_removed_path(&removed_str)
                     .with_branch(branch_name.as_str());

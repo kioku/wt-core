@@ -32,6 +32,11 @@ pub enum RemoveFormat {
 #[derive(Debug, Serialize)]
 pub struct JsonResponse {
     pub ok: bool,
+    /// Lifecycle event emitted by mutating commands.
+    /// `"switch"` — consumer should cd to `cd_path`.
+    /// `"reset"` — worktree removed; consumer should cd to `repo_root`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
     pub message: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_root: Option<String>,
@@ -55,6 +60,7 @@ impl JsonResponse {
     pub fn success(message: impl Into<String>) -> Self {
         Self {
             ok: true,
+            event: None,
             message: message.into(),
             repo_root: None,
             worktree_path: None,
@@ -100,6 +106,11 @@ impl JsonResponse {
         if !symlinks.is_empty() {
             self.symlinks = Some(symlinks);
         }
+        self
+    }
+
+    pub fn with_event(mut self, event: impl Into<String>) -> Self {
+        self.event = Some(event.into());
         self
     }
 }
@@ -256,6 +267,9 @@ pub enum MergeFormat {
 #[derive(Debug, Serialize)]
 pub struct JsonMergeResponse {
     pub ok: bool,
+    /// `"reset"` when the worktree was cleaned up; absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<String>,
     pub message: String,
     pub branch: String,
     pub mainline: String,
