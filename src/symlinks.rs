@@ -201,9 +201,34 @@ fn create_one_symlink(
     let source_in_main = repo_root.join(rel_path);
     let link_target = compute_relative_symlink(&target_in_wt, &source_in_main);
 
-    match std::os::unix::fs::symlink(&link_target, &target_in_wt) {
+    match create_symlink(&link_target, &target_in_wt, &source_in_main) {
         Ok(()) => SymlinkOutcome::Created(rel_path.clone()),
         Err(e) => SymlinkOutcome::Skipped(rel_path.clone(), format!("symlink failed: {e}")),
+    }
+}
+
+#[cfg(unix)]
+fn create_symlink(
+    link_target: &Path,
+    target_in_wt: &Path,
+    _source_in_main: &Path,
+) -> io::Result<()> {
+    std::os::unix::fs::symlink(link_target, target_in_wt)
+}
+
+#[cfg(windows)]
+fn create_symlink(
+    link_target: &Path,
+    target_in_wt: &Path,
+    source_in_main: &Path,
+) -> io::Result<()> {
+    use std::os::windows::fs::{symlink_dir, symlink_file};
+
+    let metadata = fs::metadata(source_in_main)?;
+    if metadata.is_dir() {
+        symlink_dir(link_target, target_in_wt)
+    } else {
+        symlink_file(link_target, target_in_wt)
     }
 }
 
@@ -474,6 +499,7 @@ pub fn config_dir(repo: &RepoRoot) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::symlink;
 
     fn make_temp_dir() -> tempfile::TempDir {
@@ -615,6 +641,31 @@ mod tests {
     }
 
     #[test]
+    fn create_symlinks_creates_file_link() {
+        let dir = make_temp_dir();
+        let repo_root = dir.path().join("repo");
+        let wt_path = repo_root.join(".worktrees/feat--file1111");
+
+        fs::create_dir_all(&wt_path).expect("mkdir");
+        fs::write(repo_root.join(".env"), "SECRET=1").expect("write");
+
+        let repo = RepoRoot(repo_root);
+        let entries = vec![PathBuf::from(".env")];
+        let outcomes = create_symlinks(&repo, &wt_path, &entries);
+
+        assert_eq!(outcomes.len(), 1);
+        assert!(matches!(outcomes[0], SymlinkOutcome::Created(_)));
+
+        let link = wt_path.join(".env");
+        assert!(link
+            .symlink_metadata()
+            .expect("stat")
+            .file_type()
+            .is_symlink());
+        assert!(link.exists(), "symlink should resolve to existing target");
+    }
+
+    #[test]
     fn create_symlinks_skips_existing() {
         let dir = make_temp_dir();
         let repo_root = dir.path().join("repo");
@@ -649,6 +700,7 @@ mod tests {
         assert!(wt_path.join("apps/api/.env").exists());
     }
 
+    #[cfg(unix)]
     #[test]
     fn create_symlinks_skips_dangling_symlink() {
         let dir = make_temp_dir();
