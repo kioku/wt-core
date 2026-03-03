@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 This changelog is generated automatically by [git-cliff](https://git-cliff.org/)
 during the release workflow and is append-only — existing entries are never modified.
 
+## [0.3.0](https://github.com/kioku/wt-core/releases/tag/v0.3.0) — 2026-03-03
+
+### Bug Fixes
+
+- Restore init doc comment displaced by setup variant insertion
+- Populate python entries for setup.py and setup.cfg markers
+- Reject glob false positives when prefix+suffix exceeds name length
+- Remove unnecessary clone of symlinked vec in cmd_add
+
+### Documentation
+
+- Update readme for v0.2.0 features and add conventions section
+- Clarify json output is line-oriented
+
+### Features
+
+- Add git-cliff changelog generation to release workflow
+- Symlink gitignored resources into new worktrees
+- Add --json flag to setup command
+- Emit event field in JSON output from mutating commands
+- Emit single-line json output for machine parsing
+
+### Miscellaneous
+
+- Bump clap from 4.5.58 to 4.5.60
+- Bump tempfile from 3.25.0 to 3.26.0
+- Bump dialoguer from 0.11.0 to 0.12.0
+- Bump actions/upload-artifact from 6 to 7
+- Bump actions/download-artifact from 7 to 8
+
 ## [0.2.0](https://github.com/kioku/wt-core/releases/tag/v0.2.0) — 2026-02-15
 
 ### Features
