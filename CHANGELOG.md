@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 This changelog is generated automatically by [git-cliff](https://git-cliff.org/)
 during the release workflow and is append-only — existing entries are never modified.
 
+## [0.3.1](https://github.com/kioku/wt-core/releases/tag/v0.3.1) — 2026-03-03
+
+### Bug Fixes
+
+- Support windows symlink creation for worktree links
+
+### Documentation
+
+- Update changelog for v0.3.0
+
 ## [0.3.0](https://github.com/kioku/wt-core/releases/tag/v0.3.0) — 2026-03-03
 
 ### Bug Fixes
