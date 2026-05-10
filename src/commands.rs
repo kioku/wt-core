@@ -15,7 +15,12 @@ use crate::worktree;
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::List { repo, json } => cmd_list(repo, status_fmt(json)),
+        Command::List {
+            repo,
+            json,
+            stats,
+            against,
+        } => cmd_list(repo, status_fmt(json), stats, against.as_deref()),
         Command::Add {
             branch,
             base,
@@ -136,12 +141,18 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<domain::RepoRoot> {
 
 // ── Commands ────────────────────────────────────────────────────────
 
-fn cmd_list(repo: Option<PathBuf>, fmt: StatusFormat) -> Result<()> {
+fn cmd_list(
+    repo: Option<PathBuf>,
+    fmt: StatusFormat,
+    stats: bool,
+    against: Option<&str>,
+) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let worktrees = git::list_worktrees(&repo)?;
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.canonicalize().ok());
+    let _stats_options = (stats, against);
 
     match fmt {
         StatusFormat::Json => {
