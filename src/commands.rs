@@ -733,6 +733,10 @@ fn cmd_diff(
     dry_run: bool,
     repo: Option<PathBuf>,
 ) -> Result<()> {
+    if matches!(tool, Some(name) if name.trim().is_empty()) {
+        return Err(AppError::usage("--tool must not be empty".to_string()));
+    }
+
     let repo = resolve_repo(repo)?;
     let resolved_branch = match branch {
         Some(branch) => branch,

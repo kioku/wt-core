@@ -93,3 +93,28 @@ fn diff_without_branch_errors_when_no_non_main_worktrees() {
         .failure()
         .stderr(predicate::str::contains("no worktrees to diff"));
 }
+
+#[test]
+fn diff_rejects_empty_tool_name() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/empty-tool", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    wt_core()
+        .args([
+            "diff",
+            "feature/empty-tool",
+            "--repo",
+            &repo_str,
+            "--tool",
+            "   ",
+            "--dry-run",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--tool must not be empty"));
+}
