@@ -911,6 +911,61 @@ mod tests {
     }
 
     #[test]
+    fn detect_pnpm_workspace_rejects_malformed_package_manager_values() {
+        for package_json in [
+            "",
+            "not json",
+            r#"{}"#,
+            r#"{"packageManager":""}"#,
+            r#"{"packageManager":"none"}"#,
+            r#"{"packageManager":"npm@10.0.0"}"#,
+            r#"{"packageManager":" pnpm@9.0.0"}"#,
+            r#"{"packageManager":["pnpm@9.0.0"]}"#,
+        ] {
+            let dir = make_temp_dir();
+            let repo = RepoRoot(dir.path().to_path_buf());
+            fs::write(dir.path().join("package.json"), package_json).expect("write");
+
+            assert!(
+                !is_pnpm_workspace(&repo),
+                "package.json should not detect pnpm: {package_json}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_config_deduplicates_shared_and_local_entries() {
+        let dir = make_temp_dir();
+        let repo = RepoRoot(dir.path().to_path_buf());
+        fs::create_dir(dir.path().join(".wt")).expect("mkdir .wt");
+        fs::write(dir.path().join(".wt/symlinks"), "node_modules\n.env\n").expect("write");
+        fs::write(dir.path().join(".wt/symlinks.local"), ".env\ntarget\n").expect("write");
+
+        assert_eq!(load_config(&repo), vec!["node_modules", ".env", "target"]);
+    }
+
+    #[test]
+    fn pnpm_pattern_filter_skips_node_modules_globs_and_keeps_unknown_entries() {
+        let patterns = vec![
+            "node_modules".to_string(),
+            "apps/*/node_modules".to_string(),
+            "target".to_string(),
+            "unknown-extra".to_string(),
+        ];
+
+        let (safe, skipped) = filter_pnpm_unsafe_patterns(patterns);
+
+        assert_eq!(safe, vec!["target", "unknown-extra"]);
+        assert_eq!(
+            skipped.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![
+                &PathBuf::from("node_modules"),
+                &PathBuf::from("apps/*/node_modules"),
+            ]
+        );
+    }
+
+    #[test]
     fn generate_config_pnpm_omits_node_modules() {
         let dir = make_temp_dir();
         let repo = RepoRoot(dir.path().to_path_buf());
