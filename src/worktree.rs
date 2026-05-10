@@ -133,6 +133,7 @@ pub fn diff(
     let command = difftool_command(repo, tool, &range);
 
     if !dry_run {
+        git::ensure_difftool_available(repo.as_ref(), tool)?;
         git::difftool(repo, tool, &range)?;
     }
 
@@ -153,6 +154,7 @@ pub fn diff_dirty(
     let command = dirty_difftool_command(&worktree.path, mode, tool);
 
     if !dry_run {
+        git::ensure_difftool_available(&worktree.path, tool)?;
         git::difftool_dirty(&worktree.path, mode, tool)?;
     }
 

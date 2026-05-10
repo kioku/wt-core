@@ -434,6 +434,143 @@ pub fn merge_abort(repo: &RepoRoot) {
     let _ = git(&["merge", "--abort"], repo.as_ref());
 }
 
+/// Verify Git has a usable difftool before launching an interactive diff.
+pub fn ensure_difftool_available(path: &Path, tool: Option<&str>) -> Result<()> {
+    match tool {
+        Some(tool) => ensure_explicit_difftool_available(path, tool),
+        None => ensure_default_difftool_available(path),
+    }
+}
+
+fn ensure_explicit_difftool_available(path: &Path, tool: &str) -> Result<()> {
+    if is_difftool_available(path, tool)? {
+        return Ok(());
+    }
+
+    Err(AppError::usage(format!(
+        "git difftool '{tool}' is not configured or available\n\n\
+Configure it, for example:\n  git config --global diff.tool {tool}\n\n\
+Or choose an available tool explicitly:\n  wt diff --tool nvimdiff <branch>\n\n\
+Available tools can be inspected with:\n  git difftool --tool-help"
+    )))
+}
+
+fn ensure_default_difftool_available(path: &Path) -> Result<()> {
+    let Some(tool) = configured_difftool(path)? else {
+        if !available_difftools(path)?.is_empty() {
+            return Ok(());
+        }
+
+        return Err(AppError::usage(
+            "no git difftool is configured or available\n\n\
+Configure one, for example:\n  git config --global diff.tool nvimdiff\n\n\
+Or run explicitly:\n  wt diff --tool nvimdiff <branch>\n\n\
+Available tools can be inspected with:\n  git difftool --tool-help"
+                .to_string(),
+        ));
+    };
+
+    if is_difftool_available(path, &tool)? {
+        return Ok(());
+    }
+
+    Err(AppError::usage(format!(
+        "configured git difftool '{tool}' is not available\n\n\
+Configure one, for example:\n  git config --global diff.tool nvimdiff\n\n\
+Or run explicitly:\n  wt diff --tool nvimdiff <branch>\n\n\
+Available tools can be inspected with:\n  git difftool --tool-help"
+    )))
+}
+
+fn configured_difftool(path: &Path) -> Result<Option<String>> {
+    let Some(tool) = git_config_get(path, "diff.tool")? else {
+        return git_config_get(path, "merge.tool");
+    };
+
+    Ok(Some(tool))
+}
+
+fn is_difftool_available(path: &Path, tool: &str) -> Result<bool> {
+    if git_config_get(path, &format!("difftool.{tool}.cmd"))?.is_some() {
+        return Ok(true);
+    }
+
+    Ok(available_difftools(path)?.contains(tool))
+}
+
+fn available_difftools(path: &Path) -> Result<HashSet<String>> {
+    let output = git_tool_help(path)?;
+    Ok(parse_available_difftools(&output))
+}
+
+fn parse_available_difftools(output: &str) -> HashSet<String> {
+    let mut tools = HashSet::new();
+
+    for line in output.lines() {
+        if line.starts_with("The following tools are valid, but not currently available:") {
+            break;
+        }
+
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with("'git difftool")
+            || trimmed == "user-defined:"
+            || trimmed.starts_with("The following tools")
+        {
+            continue;
+        }
+
+        if let Some(name) = trimmed.split_whitespace().next() {
+            tools.insert(name.strip_suffix(".cmd").unwrap_or(name).to_string());
+        }
+    }
+
+    tools
+}
+
+fn git_config_get(path: &Path, key: &str) -> Result<Option<String>> {
+    let mut cmd = Cmd::new("git");
+    cmd.arg("-C").arg(path).arg("config").arg("--get").arg(key);
+
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| AppError::git(format!("failed to run git config: {e}")))?;
+
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!value.is_empty()).then_some(value))
+}
+
+fn git_tool_help(path: &Path) -> Result<String> {
+    let mut cmd = Cmd::new("git");
+    cmd.arg("-C").arg(path).arg("difftool").arg("--tool-help");
+
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+
+    let output = cmd
+        .output()
+        .map_err(|e| AppError::git(format!("failed to run git difftool --tool-help: {e}")))?;
+
+    if !output.status.success() {
+        return Err(classify_git_error(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+
+    let mut combined = String::from_utf8_lossy(&output.stdout).to_string();
+    combined.push_str(&String::from_utf8_lossy(&output.stderr));
+    Ok(combined)
+}
+
 /// Run Git's configured difftool for a branch comparison.
 pub fn difftool(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Result<()> {
     let mut cmd = base_difftool(repo.as_ref(), tool);
