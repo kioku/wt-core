@@ -54,6 +54,13 @@ pub struct GoResult {
     pub repo_root: PathBuf,
 }
 
+/// Result of a resolved `diff` operation.
+pub struct DiffResult {
+    pub branch: BranchName,
+    pub base: String,
+    pub command: Vec<String>,
+}
+
 /// Result of a successful `remove` operation.
 pub struct RemoveResult {
     pub removed_path: PathBuf,
@@ -76,6 +83,69 @@ pub enum DiagLevel {
     Ok,
     Warn,
     Error,
+}
+
+/// Resolve and optionally run a branch-vs-mainline difftool command.
+pub fn diff(
+    repo: &RepoRoot,
+    branch: &BranchName,
+    against: Option<&str>,
+    tool: Option<&str>,
+    dry_run: bool,
+) -> Result<DiffResult> {
+    let worktrees = git::list_worktrees(repo)?;
+    let has_worktree = worktrees
+        .iter()
+        .any(|wt| !wt.is_main && wt.branch.as_deref() == Some(branch.as_str()));
+
+    if !has_worktree {
+        return Err(AppError::usage(format!(
+            "branch '{}' has no associated worktree",
+            branch.as_str()
+        )));
+    }
+
+    let base = match against {
+        Some(rev) => {
+            if !git::rev_exists(repo, rev) {
+                return Err(AppError::usage(format!(
+                    "base revision '{rev}' does not exist"
+                )));
+            }
+            rev.to_string()
+        }
+        None => git::resolve_mainline(repo)?,
+    };
+    let range = format!("{}...{}", base, branch.as_str());
+    let command = difftool_command(repo, tool, &range);
+
+    if !dry_run {
+        git::difftool(repo, tool, &range)?;
+    }
+
+    Ok(DiffResult {
+        branch: branch.clone(),
+        base,
+        command,
+    })
+}
+
+fn difftool_command(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Vec<String> {
+    let mut command = vec![
+        "git".to_string(),
+        "-C".to_string(),
+        repo.display().to_string(),
+        "difftool".to_string(),
+    ];
+
+    if let Some(tool) = tool {
+        command.push("--tool".to_string());
+        command.push(tool.to_string());
+    }
+
+    command.push("--dir-diff".to_string());
+    command.push(range.to_string());
+    command
 }
 
 /// Create a new worktree for the given branch.

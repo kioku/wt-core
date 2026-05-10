@@ -130,6 +130,28 @@ pub enum Command {
         print_paths: bool,
     },
 
+    /// Open a difftool for a worktree branch against mainline
+    Diff {
+        /// Branch name of the worktree to diff
+        branch: Option<String>,
+
+        /// Compare against this revision (defaults to resolved mainline)
+        #[arg(long)]
+        against: Option<String>,
+
+        /// Git difftool name to use
+        #[arg(long)]
+        tool: Option<String>,
+
+        /// Print the resolved command without launching difftool
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+    },
+
     /// Remove worktrees whose branches are fully integrated into mainline
     Prune {
         /// Actually remove integrated worktrees (default is dry-run)
