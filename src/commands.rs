@@ -267,33 +267,95 @@ fn print_list_with_stats(
     stats: &[WorktreeStatsStatus],
     color: ColorPolicy,
 ) {
+    let rows = worktrees
+        .iter()
+        .zip(stats)
+        .map(|(wt, stat)| StatsRow {
+            branch: plain_cell(wt.branch.as_deref().unwrap_or("(detached)")),
+            columns: format_stats_columns(stat, color),
+            path: wt.path.display().to_string(),
+        })
+        .collect::<Vec<_>>();
+    let widths = StatsColumnWidths::from_rows(&rows);
+
     println!(
-        "{:<20} {:<12} {:<10} {:<7} {:<14} PATH",
-        "BRANCH", "BASE", "COMMITS", "FILES", "DIFF"
+        "{} {} {} {} {} PATH",
+        align_left(&plain_cell("BRANCH"), widths.branch),
+        align_left(&plain_cell("BASE"), widths.base),
+        align_right(&plain_cell("COMMITS"), widths.commits),
+        align_right(&plain_cell("FILES"), widths.files),
+        align_right(&plain_cell("DIFF"), widths.diff)
     );
-    for (wt, stat) in worktrees.iter().zip(stats) {
-        let branch = wt.branch.as_deref().unwrap_or("(detached)");
-        let columns = format_stats_columns(stat, color);
+
+    for row in rows {
         println!(
             "{} {} {} {} {} {}",
-            pad_cell(branch, branch.len(), 20),
-            pad_cell(&columns.base, columns.base.len(), 12),
-            pad_cell(&columns.commits.rendered, columns.commits.visible_len, 10),
-            pad_cell(&columns.files, columns.files.len(), 7),
-            pad_cell(&columns.diff.rendered, columns.diff.visible_len, 14),
-            wt.path.display()
+            align_left(&row.branch, widths.branch),
+            align_left(&row.columns.base, widths.base),
+            align_right(&row.columns.commits, widths.commits),
+            align_right(&row.columns.files, widths.files),
+            align_right(&row.columns.diff, widths.diff),
+            row.path
         );
     }
 }
 
-fn pad_cell(text: &str, visible_len: usize, width: usize) -> String {
-    format!("{}{}", text, " ".repeat(width.saturating_sub(visible_len)))
+fn align_left(cell: &RenderedCell, width: usize) -> String {
+    format!(
+        "{}{}",
+        cell.rendered,
+        " ".repeat(width.saturating_sub(cell.visible_len))
+    )
+}
+
+fn align_right(cell: &RenderedCell, width: usize) -> String {
+    format!(
+        "{}{}",
+        " ".repeat(width.saturating_sub(cell.visible_len)),
+        cell.rendered
+    )
+}
+
+struct StatsRow {
+    branch: RenderedCell,
+    columns: StatsColumns,
+    path: String,
+}
+
+struct StatsColumnWidths {
+    branch: usize,
+    base: usize,
+    commits: usize,
+    files: usize,
+    diff: usize,
+}
+
+impl StatsColumnWidths {
+    fn from_rows(rows: &[StatsRow]) -> Self {
+        let mut widths = Self {
+            branch: "BRANCH".len(),
+            base: "BASE".len(),
+            commits: "COMMITS".len(),
+            files: "FILES".len(),
+            diff: "DIFF".len(),
+        };
+
+        for row in rows {
+            widths.branch = widths.branch.max(row.branch.visible_len);
+            widths.base = widths.base.max(row.columns.base.visible_len);
+            widths.commits = widths.commits.max(row.columns.commits.visible_len);
+            widths.files = widths.files.max(row.columns.files.visible_len);
+            widths.diff = widths.diff.max(row.columns.diff.visible_len);
+        }
+
+        widths
+    }
 }
 
 struct StatsColumns {
-    base: String,
+    base: RenderedCell,
     commits: RenderedCell,
-    files: String,
+    files: RenderedCell,
     diff: RenderedCell,
 }
 
@@ -305,15 +367,15 @@ struct RenderedCell {
 fn format_stats_columns(stat: &WorktreeStatsStatus, color: ColorPolicy) -> StatsColumns {
     match stat {
         WorktreeStatsStatus::Available(stats) => StatsColumns {
-            base: stats.base.clone(),
+            base: plain_cell(&stats.base),
             commits: format_commit_counts(stats.commits_ahead, stats.commits_behind, color),
-            files: stats.files_changed.to_string(),
+            files: plain_cell(&stats.files_changed.to_string()),
             diff: format_diff_counts(stats.insertions, stats.deletions, color),
         },
         WorktreeStatsStatus::Unavailable { base, .. } => StatsColumns {
-            base: base.clone(),
+            base: plain_cell(base),
             commits: plain_cell("unavailable"),
-            files: "—".to_string(),
+            files: plain_cell("—"),
             diff: plain_cell("—"),
         },
     }
