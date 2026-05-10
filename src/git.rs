@@ -511,12 +511,12 @@ fn parse_available_difftools(output: &str) -> HashSet<String> {
             break;
         }
 
+        if !line.starts_with(char::is_whitespace) {
+            continue;
+        }
+
         let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with("'git difftool")
-            || trimmed == "user-defined:"
-            || trimmed.starts_with("The following tools")
-        {
+        if trimmed.is_empty() {
             continue;
         }
 
