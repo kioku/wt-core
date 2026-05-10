@@ -130,7 +130,7 @@ pub enum Command {
         print_paths: bool,
     },
 
-    /// Open a difftool for a worktree branch against mainline
+    /// Open a difftool for a worktree branch or dirty worktree changes
     Diff {
         /// Branch name of the worktree to diff
         branch: Option<String>,
@@ -139,6 +139,18 @@ pub enum Command {
         #[arg(long)]
         against: Option<String>,
 
+        /// Inspect all uncommitted changes in the selected worktree
+        #[arg(long)]
+        dirty: bool,
+
+        /// Inspect staged changes only in the selected worktree
+        #[arg(long)]
+        staged: bool,
+
+        /// Inspect unstaged changes only in the selected worktree
+        #[arg(long)]
+        unstaged: bool,
+
         /// Git difftool name to use
         #[arg(long)]
         tool: Option<String>,
@@ -146,6 +158,10 @@ pub enum Command {
         /// Print the resolved command without launching difftool
         #[arg(long)]
         dry_run: bool,
+
+        /// Print the resolved command without launching difftool
+        #[arg(long)]
+        print_command: bool,
 
         /// Repository path (defaults to current directory)
         #[arg(long)]

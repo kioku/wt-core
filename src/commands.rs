@@ -75,14 +75,19 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Diff {
             branch,
             against,
+            dirty,
+            staged,
+            unstaged,
             tool,
             dry_run,
+            print_command,
             repo,
         } => cmd_diff(
             branch.as_deref().map(BranchName::new),
             against.as_deref(),
+            DiffMode::from_flags(dirty, staged, unstaged)?,
             tool.as_deref(),
-            dry_run,
+            dry_run || print_command,
             repo,
         ),
         Command::Prune {
@@ -726,15 +731,52 @@ fn capitalize(s: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiffMode {
+    Branch,
+    Dirty,
+    Staged,
+    Unstaged,
+}
+
+impl DiffMode {
+    fn from_flags(dirty: bool, staged: bool, unstaged: bool) -> Result<Self> {
+        let selected = [dirty, staged, unstaged]
+            .into_iter()
+            .filter(|flag| *flag)
+            .count();
+
+        if selected > 1 {
+            return Err(AppError::usage(
+                "--dirty, --staged, and --unstaged are mutually exclusive".to_string(),
+            ));
+        }
+
+        Ok(match (dirty, staged, unstaged) {
+            (true, false, false) => Self::Dirty,
+            (false, true, false) => Self::Staged,
+            (false, false, true) => Self::Unstaged,
+            _ => Self::Branch,
+        })
+    }
+}
+
 fn cmd_diff(
     branch: Option<BranchName>,
     against: Option<&str>,
+    mode: DiffMode,
     tool: Option<&str>,
     dry_run: bool,
     repo: Option<PathBuf>,
 ) -> Result<()> {
     if matches!(tool, Some(name) if name.trim().is_empty()) {
         return Err(AppError::usage("--tool must not be empty".to_string()));
+    }
+
+    if mode != DiffMode::Branch && against.is_some() {
+        return Err(AppError::usage(
+            "--against can only be used with branch-vs-mainline diffs".to_string(),
+        ));
     }
 
     let repo = resolve_repo(repo)?;
