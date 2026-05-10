@@ -239,6 +239,9 @@ fn cmd_add(
             eprintln!("warning: symlink {}: {reason}", path.display());
         }
     }
+    if let Some(recommendation) = &result.setup_recommendation {
+        eprintln!("{recommendation}");
+    }
 
     Ok(())
 }

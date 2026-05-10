@@ -228,6 +228,83 @@ fn add_merges_shared_and_local_config() {
     assert!(wt.join(".env").exists(), "local entry symlinked");
 }
 
+#[test]
+fn add_pnpm_without_symlink_config_recommends_install() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::write(repo.path().join("pnpm-workspace.yaml"), "packages: []").expect("write");
+
+    wt_core()
+        .args(["add", "feat/pnpm-no-config", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "pnpm install --prefer-offline --frozen-lockfile",
+        ));
+}
+
+#[test]
+fn add_pnpm_warns_for_unsafe_config_even_when_source_missing() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").expect("write");
+    fs::create_dir(repo.path().join(".wt")).expect("mkdir .wt");
+    fs::write(repo.path().join(".wt/symlinks"), "node_modules\n").expect("write config");
+
+    wt_core()
+        .args(["add", "feat/pnpm-missing-modules", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "warning: symlink node_modules: pnpm workspace detected",
+        ));
+}
+
+#[test]
+fn add_pnpm_skips_unsafe_node_modules_and_recommends_install() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::write(repo.path().join("pnpm-workspace.yaml"), "packages: []").expect("write");
+    fs::create_dir(repo.path().join("node_modules")).expect("mkdir root modules");
+    fs::create_dir_all(repo.path().join("apps/web/node_modules")).expect("mkdir app modules");
+    fs::write(repo.path().join(".env"), "SECRET=x").expect("write env");
+
+    fs::create_dir(repo.path().join(".wt")).expect("mkdir .wt");
+    fs::write(
+        repo.path().join(".wt/symlinks"),
+        "node_modules\napps/web/node_modules\n.env\n",
+    )
+    .expect("write config");
+
+    let output = wt_core()
+        .args(["add", "feat/pnpm", "--repo", &repo_str, "--print-cd-path"])
+        .output()
+        .expect("add failed");
+    assert!(output.status.success());
+
+    let wt_path = String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string();
+    let wt = std::path::Path::new(&wt_path);
+    assert!(
+        !wt.join("node_modules").exists(),
+        "root node_modules skipped"
+    );
+    assert!(
+        !wt.join("apps/web/node_modules").exists(),
+        "package node_modules skipped"
+    );
+    assert!(wt.join(".env").exists(), ".env still symlinked");
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("workspace dependencies may resolve to the main worktree"));
+    assert!(stderr.contains("pnpm install --prefer-offline --frozen-lockfile"));
+}
+
 // ── wt setup ────────────────────────────────────────────────────────
 
 #[test]
@@ -299,6 +376,45 @@ fn setup_detects_multiple_ecosystems() {
     let config = fs::read_to_string(repo.path().join(".wt/symlinks")).expect("read config");
     assert!(config.contains("node_modules"));
     assert!(config.contains("target"));
+}
+
+#[test]
+fn setup_pnpm_omits_node_modules_but_keeps_safe_node_caches() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::write(
+        repo.path().join("package.json"),
+        r#"{"packageManager":"pnpm@9.0.0"}"#,
+    )
+    .expect("write");
+
+    wt_core()
+        .args(["setup", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("pnpm"));
+
+    let config = fs::read_to_string(repo.path().join(".wt/symlinks")).expect("read config");
+    assert!(!config.lines().any(|line| line == "node_modules"));
+    assert!(config.contains(".turbo"));
+}
+
+#[test]
+fn setup_pnpm_lockfile_detection_omits_node_modules() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    fs::write(repo.path().join("package.json"), "{}").expect("write");
+    fs::write(repo.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").expect("write");
+
+    wt_core()
+        .args(["setup", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let config = fs::read_to_string(repo.path().join(".wt/symlinks")).expect("read config");
+    assert!(!config.lines().any(|line| line == "node_modules"));
 }
 
 #[test]
