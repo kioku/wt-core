@@ -19,22 +19,14 @@ def --wrapped wt [
 
 # List all worktrees
 export def "wt list" [
-    --repo: path        # Repository path (defaults to cwd)
-    --json              # Output as JSON
-    --stats             # Include commit and diff stats for each worktree
-    --against: string   # Compare stats against this revision (requires --stats)
-    --color: string     # When to color stats output: auto, always, never
+    --repo: path  # Repository path (defaults to cwd)
+    --json        # Output as JSON
 ] {
-    mut args = ["list"]
-    if $stats { $args = ($args | append "--stats") }
-    if $against != null { $args = ($args | append ["--against" $against]) }
-    if $color != null { $args = ($args | append ["--color" $color]) }
-
-    let full_args = (build-args $args $repo $json false)
+    let args = (build-args ["list"] $repo $json false)
     if $json {
-        ^wt-core ...$full_args | from json
+        ^wt-core ...$args | from json
     } else {
-        ^wt-core ...$full_args
+        ^wt-core ...$args
     }
 }
 
