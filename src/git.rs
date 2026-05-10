@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 
@@ -160,11 +161,13 @@ fn apply_porcelain_line(
 /// canonicalization (e.g. symlinks).
 fn parse_worktree_porcelain(raw: &str, _repo: &RepoRoot) -> Result<Vec<Worktree>> {
     let blocks: Vec<&str> = raw.split("\n\n").collect();
+    let mut seen_paths = HashSet::new();
 
     let worktrees = blocks
         .iter()
         .filter_map(|block| parse_porcelain_block(block))
         .filter(|entry| !entry.is_bare)
+        .filter(|entry| seen_paths.insert(entry.path.clone()))
         .enumerate()
         .map(|(idx, entry)| Worktree {
             path: entry.path,
@@ -430,6 +433,45 @@ bare
         let result = parse_worktree_porcelain(raw, &repo).expect("should parse");
         assert_eq!(result.len(), 1);
         assert!(result[0].is_main);
+    }
+
+    #[test]
+    fn parse_porcelain_deduplicates_by_worktree_path() {
+        let repo = RepoRoot(PathBuf::from("/repo"));
+        let raw = "\
+worktree /repo
+HEAD abc1234567890
+branch refs/heads/main
+
+worktree /repo/.worktrees/feat
+HEAD def4567890abc
+branch refs/heads/feat
+
+worktree /repo/.worktrees/feat
+HEAD fedcba0987654
+branch refs/heads/feat-duplicate
+
+worktree /repo/.worktrees/other
+HEAD 9876543210fed
+branch refs/heads/other
+
+";
+        let result = parse_worktree_porcelain(raw, &repo).expect("should parse");
+
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].path, PathBuf::from("/repo"));
+        assert_eq!(result[0].branch.as_deref(), Some("main"));
+        assert_eq!(result[0].commit, "abc1234");
+        assert!(result[0].is_main);
+
+        assert_eq!(result[1].path, PathBuf::from("/repo/.worktrees/feat"));
+        assert_eq!(result[1].branch.as_deref(), Some("feat"));
+        assert_eq!(result[1].commit, "def4567");
+        assert!(!result[1].is_main);
+
+        assert_eq!(result[2].path, PathBuf::from("/repo/.worktrees/other"));
+        assert_eq!(result[2].branch.as_deref(), Some("other"));
+        assert!(!result[2].is_main);
     }
 
     #[test]
