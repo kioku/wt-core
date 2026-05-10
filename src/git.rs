@@ -520,9 +520,15 @@ fn parse_available_difftools(output: &str) -> HashSet<String> {
             continue;
         }
 
-        if let Some(name) = trimmed.split_whitespace().next() {
-            tools.insert(name.strip_suffix(".cmd").unwrap_or(name).to_string());
+        let Some(name) = trimmed.split_whitespace().next() else {
+            continue;
+        };
+
+        if name.ends_with(':') {
+            continue;
         }
+
+        tools.insert(name.strip_suffix(".cmd").unwrap_or(name).to_string());
     }
 
     tools
@@ -729,6 +735,29 @@ branch refs/heads/other
         assert_eq!(result[2].path, PathBuf::from("/repo/.worktrees/other"));
         assert_eq!(result[2].branch.as_deref(), Some("other"));
         assert!(!result[2].is_main);
+    }
+
+    #[test]
+    fn parse_available_difftools_skips_headings_and_unavailable_tools() {
+        let raw = "\
+'git difftool --tool=<tool>' may be set to one of the following:\n\
+\t\tnvimdiff         Use Neovim\n\
+\n\
+\tuser-defined:\n\
+\t\tdelta.cmd git diff --no-index -- $LOCAL $REMOTE | delta\n\
+\n\
+The following tools are valid, but not currently available:\n\
+\t\tvimdiff          Use Vim\n\
+\n\
+Some of the tools listed above only work in a windowed environment.\n";
+
+        let tools = parse_available_difftools(raw);
+
+        assert!(tools.contains("nvimdiff"));
+        assert!(tools.contains("delta"));
+        assert!(!tools.contains("user-defined:"));
+        assert!(!tools.contains("vimdiff"));
+        assert!(!tools.contains("Some"));
     }
 
     #[test]
