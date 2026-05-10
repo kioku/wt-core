@@ -54,10 +54,23 @@ pub struct GoResult {
     pub repo_root: PathBuf,
 }
 
-/// Result of a resolved `diff` operation.
+/// Result of a resolved branch-vs-mainline `diff` operation.
 pub struct DiffResult {
     pub branch: BranchName,
     pub base: String,
+    pub command: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirtyDiffMode {
+    Dirty,
+    Staged,
+    Unstaged,
+}
+
+/// Result of a resolved dirty-worktree `diff` operation.
+pub struct DirtyDiffResult {
+    pub label: String,
     pub command: Vec<String>,
 }
 
@@ -130,11 +143,55 @@ pub fn diff(
     })
 }
 
+/// Resolve and optionally run a dirty-worktree difftool command.
+pub fn diff_dirty(
+    worktree: &Worktree,
+    mode: DirtyDiffMode,
+    tool: Option<&str>,
+    dry_run: bool,
+) -> Result<DirtyDiffResult> {
+    let command = dirty_difftool_command(&worktree.path, mode, tool);
+
+    if !dry_run {
+        git::difftool_dirty(&worktree.path, mode, tool)?;
+    }
+
+    Ok(DirtyDiffResult {
+        label: worktree
+            .branch
+            .clone()
+            .unwrap_or_else(|| format!("detached at {}", worktree.commit)),
+        command,
+    })
+}
+
 fn difftool_command(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Vec<String> {
+    let mut command = base_difftool_command(repo.as_ref(), tool);
+    command.push(range.to_string());
+    command
+}
+
+fn dirty_difftool_command(
+    worktree_path: &std::path::Path,
+    mode: DirtyDiffMode,
+    tool: Option<&str>,
+) -> Vec<String> {
+    let mut command = base_difftool_command(worktree_path, tool);
+
+    match mode {
+        DirtyDiffMode::Dirty => command.push("HEAD".to_string()),
+        DirtyDiffMode::Staged => command.push("--staged".to_string()),
+        DirtyDiffMode::Unstaged => {}
+    }
+
+    command
+}
+
+fn base_difftool_command(path: &std::path::Path, tool: Option<&str>) -> Vec<String> {
     let mut command = vec![
         "git".to_string(),
         "-C".to_string(),
-        repo.display().to_string(),
+        path.display().to_string(),
         "difftool".to_string(),
     ];
 
@@ -144,7 +201,6 @@ fn difftool_command(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Vec<Str
     }
 
     command.push("--dir-diff".to_string());
-    command.push(range.to_string());
     command
 }
 

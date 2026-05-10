@@ -436,9 +436,36 @@ pub fn merge_abort(repo: &RepoRoot) {
 
 /// Run Git's configured difftool for a branch comparison.
 pub fn difftool(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Result<()> {
+    let mut cmd = base_difftool(repo.as_ref(), tool);
+    cmd.arg(range);
+    run_difftool(cmd)
+}
+
+/// Run Git's configured difftool for dirty changes in a linked worktree.
+pub fn difftool_dirty(
+    worktree_path: &Path,
+    mode: crate::worktree::DirtyDiffMode,
+    tool: Option<&str>,
+) -> Result<()> {
+    let mut cmd = base_difftool(worktree_path, tool);
+
+    match mode {
+        crate::worktree::DirtyDiffMode::Dirty => {
+            cmd.arg("HEAD");
+        }
+        crate::worktree::DirtyDiffMode::Staged => {
+            cmd.arg("--staged");
+        }
+        crate::worktree::DirtyDiffMode::Unstaged => {}
+    }
+
+    run_difftool(cmd)
+}
+
+fn base_difftool(path: &Path, tool: Option<&str>) -> Cmd {
     let mut cmd = Cmd::new("git");
     cmd.arg("-C")
-        .arg(repo.as_ref())
+        .arg(path)
         .arg("difftool")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -448,8 +475,11 @@ pub fn difftool(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Result<()> 
         cmd.arg("--tool").arg(tool);
     }
 
-    cmd.arg("--dir-diff").arg(range);
+    cmd.arg("--dir-diff");
+    cmd
+}
 
+fn run_difftool(mut cmd: Cmd) -> Result<()> {
     for var in GIT_ENV_OVERRIDES {
         cmd.env_remove(var);
     }

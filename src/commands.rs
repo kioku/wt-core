@@ -677,6 +677,19 @@ fn pick_action_worktree(
     preselect: Option<usize>,
     action: &str,
 ) -> Result<BranchName> {
+    let worktree = pick_action_worktree_entry(candidates, preselect, action)?;
+    let branch = worktree.branch.as_deref().ok_or_else(|| {
+        AppError::usage("selected worktree has no branch (detached HEAD)".to_string())
+    })?;
+    Ok(BranchName::new(branch))
+}
+
+#[cfg(feature = "interactive")]
+fn pick_action_worktree_entry(
+    candidates: &[&domain::Worktree],
+    preselect: Option<usize>,
+    action: &str,
+) -> Result<domain::Worktree> {
     use dialoguer::theme::ColorfulTheme;
     use dialoguer::FuzzySelect;
 
@@ -698,12 +711,7 @@ fn pick_action_worktree(
         .map_err(|e| AppError::usage(format!("picker failed: {e}")))?;
 
     match selection {
-        Some(idx) => {
-            let branch = candidates[idx].branch.as_deref().ok_or_else(|| {
-                AppError::usage("selected worktree has no branch (detached HEAD)".to_string())
-            })?;
-            Ok(BranchName::new(branch))
-        }
+        Some(idx) => Ok(candidates[idx].clone()),
         // Esc / Ctrl-C: dialoguer has already restored the terminal state
         // before returning None, so destructors are not a concern here.
         // Exit 130 (128 + SIGINT) is the Unix convention for user cancellation.
@@ -713,10 +721,23 @@ fn pick_action_worktree(
 
 #[cfg(not(feature = "interactive"))]
 fn pick_action_worktree(
+    candidates: &[&domain::Worktree],
+    preselect: Option<usize>,
+    action: &str,
+) -> Result<BranchName> {
+    let worktree = pick_action_worktree_entry(candidates, preselect, action)?;
+    let branch = worktree.branch.as_deref().ok_or_else(|| {
+        AppError::usage("selected worktree has no branch (detached HEAD)".to_string())
+    })?;
+    Ok(BranchName::new(branch))
+}
+
+#[cfg(not(feature = "interactive"))]
+fn pick_action_worktree_entry(
     _candidates: &[&domain::Worktree],
     _preselect: Option<usize>,
     _action: &str,
-) -> Result<BranchName> {
+) -> Result<domain::Worktree> {
     Err(AppError::usage(
         "interactive mode not available (compiled without 'interactive' feature)".to_string(),
     ))
@@ -780,23 +801,94 @@ fn cmd_diff(
     }
 
     let repo = resolve_repo(repo)?;
-    let resolved_branch = match branch {
-        Some(branch) => branch,
-        None => resolve_diff_branch(&repo)?,
-    };
 
-    let result = worktree::diff(&repo, &resolved_branch, against, tool, dry_run)?;
+    if mode == DiffMode::Branch {
+        let resolved_branch = match branch {
+            Some(branch) => branch,
+            None => resolve_diff_branch(&repo)?,
+        };
 
-    if dry_run {
-        println!("{}", result.command.join(" "));
-    } else {
-        println!(
-            "Opened diff for '{}' against {}",
-            result.branch, result.base
-        );
+        let result = worktree::diff(&repo, &resolved_branch, against, tool, dry_run)?;
+        print_branch_diff_result(&result, dry_run);
+        return Ok(());
     }
 
+    let selected_worktree = resolve_diff_worktree(&repo, branch)?;
+    let dirty_mode = match mode {
+        DiffMode::Dirty => worktree::DirtyDiffMode::Dirty,
+        DiffMode::Staged => worktree::DirtyDiffMode::Staged,
+        DiffMode::Unstaged => worktree::DirtyDiffMode::Unstaged,
+        DiffMode::Branch => unreachable!("branch diff handled above"),
+    };
+    let result = worktree::diff_dirty(&selected_worktree, dirty_mode, tool, dry_run)?;
+    print_dirty_diff_result(&result, dry_run);
+
     Ok(())
+}
+
+fn print_branch_diff_result(result: &worktree::DiffResult, dry_run: bool) {
+    if dry_run {
+        println!("{}", result.command.join(" "));
+        return;
+    }
+
+    println!(
+        "Opened diff for '{}' against {}",
+        result.branch, result.base
+    );
+}
+
+fn print_dirty_diff_result(result: &worktree::DirtyDiffResult, dry_run: bool) {
+    if dry_run {
+        println!("{}", result.command.join(" "));
+        return;
+    }
+
+    println!("Opened dirty diff for '{}'", result.label);
+}
+
+fn resolve_diff_worktree(
+    repo: &domain::RepoRoot,
+    branch: Option<BranchName>,
+) -> Result<domain::Worktree> {
+    let worktrees = git::list_worktrees(repo)?;
+
+    if let Some(branch) = branch {
+        return worktrees
+            .into_iter()
+            .find(|wt| !wt.is_main && wt.branch.as_deref() == Some(branch.as_str()))
+            .ok_or_else(|| {
+                AppError::usage(format!(
+                    "branch '{}' has no associated worktree",
+                    branch.as_str()
+                ))
+            });
+    }
+
+    let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
+
+    if candidates.is_empty() {
+        return Err(AppError::usage(
+            "no worktrees to diff (create one with `wt add`)".to_string(),
+        ));
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(AppError::usage(
+            "no branch specified; interactive mode requires a terminal".to_string(),
+        ));
+    }
+
+    let preselect = std::env::current_dir().ok().and_then(|cwd| {
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| cwd.starts_with(&wt.path))
+            .max_by_key(|(_, wt)| wt.path.as_os_str().len())
+            .map(|(idx, _)| idx)
+    });
+
+    pick_action_worktree_entry(&candidates, preselect, "diff")
 }
 
 fn resolve_diff_branch(repo: &domain::RepoRoot) -> Result<BranchName> {
