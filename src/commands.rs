@@ -12,6 +12,7 @@ use crate::output::{
     StatusFormat,
 };
 use crate::worktree;
+use unicode_width::UnicodeWidthStr;
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
@@ -437,7 +438,7 @@ fn joined_cell(cells: &[RenderedCell]) -> RenderedCell {
 fn plain_cell(text: &str) -> RenderedCell {
     RenderedCell {
         rendered: text.to_string(),
-        visible_len: text.chars().count(),
+        visible_len: UnicodeWidthStr::width(text),
     }
 }
 
@@ -468,7 +469,7 @@ impl ColorPolicy {
         if self.enabled {
             RenderedCell {
                 rendered: format!("{}{}\x1b[0m", sign.ansi_code(), text),
-                visible_len: text.chars().count(),
+                visible_len: UnicodeWidthStr::width(text),
             }
         } else {
             plain_cell(text)

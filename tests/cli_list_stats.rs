@@ -4,6 +4,7 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use unicode_width::UnicodeWidthStr;
 
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
@@ -197,6 +198,13 @@ fn char_start_of_text(line: &str, text: &str) -> usize {
     line[..byte_start].chars().count()
 }
 
+fn display_column_start(line: &str, text: &str) -> usize {
+    let byte_start = line
+        .find(text)
+        .unwrap_or_else(|| panic!("text '{text}' not found in '{line}'"));
+    UnicodeWidthStr::width(&line[..byte_start])
+}
+
 #[test]
 fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
     let repo = fixtures::TestRepo::new();
@@ -273,6 +281,40 @@ fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
             "{line}"
         );
     }
+}
+
+#[test]
+fn list_stats_human_output_aligns_visible_columns_for_wide_unicode_text() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    let unicode_branch = "feature/幅広統計";
+    let unicode_base = "基準ブランチ";
+    fixtures::run_git(&["branch", unicode_base], &repo_path);
+    let wt_path = add_worktree(&repo_path, unicode_branch);
+    fixtures::commit_file(
+        Path::new(&wt_path),
+        "unicode.txt",
+        "unicode branch\n",
+        "unicode branch commit",
+    );
+
+    let plain = list_human(
+        &repo_path,
+        &["--stats", "--against", unicode_base, "--color", "never"],
+    );
+    let header = plain.lines().next().expect("header line");
+    let path_display_start = display_column_start(header, "PATH");
+    let repo_prefix = repo_path.display().to_string();
+
+    let unicode_row = plain
+        .lines()
+        .find(|line| line.starts_with(unicode_branch))
+        .expect("unicode branch row");
+    assert_eq!(
+        display_column_start(unicode_row, &repo_prefix),
+        path_display_start,
+        "{unicode_row}"
+    );
 }
 
 #[test]
