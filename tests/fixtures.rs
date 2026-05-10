@@ -21,6 +21,12 @@ pub struct TestRepo {
     pub dir: TempDir,
 }
 
+impl Default for TestRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TestRepo {
     /// Create a new temporary git repo with an initial commit.
     pub fn new() -> Self {
@@ -82,6 +88,12 @@ pub struct ClonedTestRepo {
     pub _origin: TempDir,
     /// The cloned working copy.
     pub clone: TempDir,
+}
+
+impl Default for ClonedTestRepo {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClonedTestRepo {

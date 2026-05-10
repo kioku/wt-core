@@ -4,6 +4,7 @@ use std::path::Path;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use unicode_width::UnicodeWidthStr;
 
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
@@ -180,6 +181,142 @@ fn list_json_omits_stats_without_flag() {
     assert!(entry.get("stats").is_none());
 }
 
+fn column_start(line: &str, column: &str) -> usize {
+    line.find(column)
+        .unwrap_or_else(|| panic!("column '{column}' not found in '{line}'"))
+}
+
+fn char_column_start(line: &str, column: &str) -> usize {
+    let byte_start = column_start(line, column);
+    line[..byte_start].chars().count()
+}
+
+fn char_start_of_text(line: &str, text: &str) -> usize {
+    let byte_start = line
+        .find(text)
+        .unwrap_or_else(|| panic!("text '{text}' not found in '{line}'"));
+    line[..byte_start].chars().count()
+}
+
+fn display_column_start(line: &str, text: &str) -> usize {
+    let byte_start = line
+        .find(text)
+        .unwrap_or_else(|| panic!("text '{text}' not found in '{line}'"));
+    UnicodeWidthStr::width(&line[..byte_start])
+}
+
+#[test]
+fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+
+    let long_branch = "2385/line-native-startup-continuation-extra-long";
+    let long_wt_path = add_worktree(&repo_path, long_branch);
+    let large_insertions = (0..1200)
+        .map(|idx| format!("line {idx}\n"))
+        .collect::<String>();
+    fixtures::commit_file(
+        Path::new(&long_wt_path),
+        "large-feature.txt",
+        &large_insertions,
+        "large feature commit",
+    );
+
+    let diverged_branch = "diverged-large-counts";
+    let diverged_wt_path = add_worktree(&repo_path, diverged_branch);
+    fixtures::commit_file(
+        Path::new(&diverged_wt_path),
+        "feature.txt",
+        "feature\n",
+        "feature commit",
+    );
+    fixtures::commit_file(&repo_path, "main-1.txt", "main\n", "main commit 1");
+    fixtures::commit_file(&repo_path, "main-2.txt", "main\n", "main commit 2");
+    let base_branch = "base-with-a-long-name";
+    fixtures::run_git(&["branch", base_branch], &repo_path);
+
+    let detached_path = repo_path.join(".worktrees").join("detached-wide-stats");
+    fixtures::run_git(
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &detached_path.display().to_string(),
+            "HEAD",
+        ],
+        &repo_path,
+    );
+
+    let base_name = base_branch;
+    let plain = list_human(
+        &repo_path,
+        &["--stats", "--against", base_name, "--color", "never"],
+    );
+    let colored = list_human(
+        &repo_path,
+        &["--stats", "--against", base_name, "--color", "always"],
+    );
+    let colored_plain = strip_stats_ansi(&colored);
+
+    assert_eq!(colored_plain, plain);
+
+    let lines = plain.lines().collect::<Vec<_>>();
+    let header = lines.first().expect("header line");
+    let base_start = column_start(header, "BASE");
+    let path_start = column_start(header, "PATH");
+    let path_char_start = char_column_start(header, "PATH");
+    let repo_prefix = repo_path.display().to_string();
+
+    assert!(lines.iter().any(|line| line.contains("+1200 -0")));
+    assert!(lines.iter().any(|line| line.contains("+1 -2")));
+    assert!(lines.iter().any(|line| line.contains("unavailable")));
+
+    for line in lines.iter().skip(1) {
+        assert!(line[base_start..].starts_with(base_name), "{line}");
+        assert!(line[..path_start].contains(base_name), "{line}");
+        assert!(line.contains(&repo_prefix), "{line}");
+        assert_eq!(
+            char_start_of_text(line, &repo_prefix),
+            path_char_start,
+            "{line}"
+        );
+    }
+}
+
+#[test]
+fn list_stats_human_output_aligns_visible_columns_for_wide_unicode_text() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    let unicode_branch = "feature/幅広統計";
+    let unicode_base = "基準ブランチ";
+    fixtures::run_git(&["branch", unicode_base], &repo_path);
+    let wt_path = add_worktree(&repo_path, unicode_branch);
+    fixtures::commit_file(
+        Path::new(&wt_path),
+        "unicode.txt",
+        "unicode branch\n",
+        "unicode branch commit",
+    );
+
+    let plain = list_human(
+        &repo_path,
+        &["--stats", "--against", unicode_base, "--color", "never"],
+    );
+    let header = plain.lines().next().expect("header line");
+    let path_display_start = display_column_start(header, "PATH");
+    let repo_prefix = repo_path.display().to_string();
+
+    let unicode_row = plain
+        .lines()
+        .find(|line| line.starts_with(unicode_branch))
+        .expect("unicode branch row");
+    assert_eq!(
+        display_column_start(unicode_row, &repo_prefix),
+        path_display_start,
+        "{unicode_row}"
+    );
+}
+
 #[test]
 fn list_stats_color_always_colors_non_zero_signed_values() {
     let repo = fixtures::TestRepo::new();
@@ -198,8 +335,15 @@ fn list_stats_color_always_colors_non_zero_signed_values() {
     assert!(output.contains("\x1b[32m+1\x1b[0m"));
     assert!(output.contains("\x1b[31m-1\x1b[0m"));
     assert!(output.contains("\x1b[32m+1\x1b[0m \x1b[31m-1\x1b[0m"));
-    assert!(strip_stats_ansi(&output)
-        .contains("feat-color           main         +1 -1      1       +1 -1"));
+    let plain = strip_stats_ansi(&output);
+    let row = plain
+        .lines()
+        .find(|line| line.starts_with("feat-color"))
+        .expect("feat-color row");
+    assert_eq!(
+        row.split_whitespace().take(7).collect::<Vec<_>>(),
+        ["feat-color", "main", "+1", "-1", "1", "+1", "-1"]
+    );
 }
 
 #[test]
@@ -270,7 +414,13 @@ fn list_stats_does_not_color_zero_unavailable_or_json() {
     let json = list_json(&repo_path, &["--stats", "--color", "always"]);
     let json_text = serde_json::to_string(&json).expect("json text");
 
-    assert!(human.contains(" 0          0       +0 -0"));
+    let zero_row = strip_stats_ansi(&human)
+        .lines()
+        .find(|line| line.starts_with("main") || line.starts_with("feat-zero"))
+        .expect("zero stats row")
+        .to_string();
+    assert!(zero_row.contains(" 0"));
+    assert!(zero_row.contains("+0 -0"));
     assert!(human.contains("unavailable"));
     assert!(!human.contains("\x1b[32m+0"));
     assert!(!human.contains("\x1b[31m-0"));
