@@ -186,6 +186,45 @@ fn list_stats_human_output_contains_stats_columns() {
 }
 
 #[test]
+fn list_stats_counts_binary_numstat_rows_as_changed_files() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    let wt_path = add_worktree(&repo_path, "feat-binary");
+    std::fs::write(Path::new(&wt_path).join("image.bin"), [0, 159, 146, 150])
+        .expect("write binary file");
+    fixtures::run_git(&["add", "."], Path::new(&wt_path));
+    fixtures::run_git(&["commit", "-m", "binary commit"], Path::new(&wt_path));
+
+    let json = list_json(&repo_path, &["--stats"]);
+    let stats = stats_for(&json, "feat-binary");
+
+    assert_eq!(stats["files_changed"], 1);
+    assert_eq!(stats["insertions"], 0);
+    assert_eq!(stats["deletions"], 0);
+}
+
+#[test]
+fn list_stats_rejects_invalid_against_revision() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+
+    wt_core()
+        .args([
+            "list",
+            "--repo",
+            &repo_path.display().to_string(),
+            "--stats",
+            "--against",
+            "definitely-not-a-revision",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains(
+            "base revision 'definitely-not-a-revision' does not exist",
+        ));
+}
+
+#[test]
 fn list_stats_handles_detached_worktree_as_unavailable() {
     let repo = fixtures::TestRepo::new();
     let repo_path = repo.path();
