@@ -32,6 +32,10 @@ pub enum Command {
         /// Compare stats against this revision (defaults to resolved mainline)
         #[arg(long, requires = "stats")]
         against: Option<String>,
+
+        /// When to color stats output
+        #[arg(long, value_enum, default_value_t = ColorChoice::Auto)]
+        color: ColorChoice,
     },
 
     /// Create a new worktree and branch
@@ -184,4 +188,11 @@ pub enum Shell {
     Zsh,
     Fish,
     Nu,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColorChoice {
+    Auto,
+    Always,
+    Never,
 }

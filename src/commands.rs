@@ -1,7 +1,7 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::cli::{Cli, Command, Shell};
+use crate::cli::{Cli, ColorChoice, Command, Shell};
 use crate::domain::{self, BranchName, WorktreeStatsStatus};
 use crate::error::{AppError, Result};
 use crate::git;
@@ -20,7 +20,8 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
             stats,
             against,
-        } => cmd_list(repo, status_fmt(json), stats, against.as_deref()),
+            color,
+        } => cmd_list(repo, status_fmt(json), stats, against.as_deref(), color),
         Command::Add {
             branch,
             base,
@@ -146,6 +147,7 @@ fn cmd_list(
     fmt: StatusFormat,
     stats: bool,
     against: Option<&str>,
+    color: ColorChoice,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let worktrees = git::list_worktrees(&repo)?;
@@ -176,7 +178,8 @@ fn cmd_list(
                 return Ok(());
             }
             if let Some(stats) = &stats {
-                print_list_with_stats(&worktrees, stats);
+                let color = ColorPolicy::from_env(color);
+                print_list_with_stats(&worktrees, stats, color);
             } else {
                 print_list_default(&worktrees, cwd.as_deref());
             }
@@ -241,44 +244,170 @@ fn print_list_default(worktrees: &[domain::Worktree], cwd: Option<&std::path::Pa
     }
 }
 
-fn print_list_with_stats(worktrees: &[domain::Worktree], stats: &[WorktreeStatsStatus]) {
+fn print_list_with_stats(
+    worktrees: &[domain::Worktree],
+    stats: &[WorktreeStatsStatus],
+    color: ColorPolicy,
+) {
     println!(
         "{:<20} {:<12} {:<10} {:<7} {:<14} PATH",
         "BRANCH", "BASE", "COMMITS", "FILES", "DIFF"
     );
     for (wt, stat) in worktrees.iter().zip(stats) {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
-        let (base, commits, files, diff) = format_stats_columns(stat);
+        let columns = format_stats_columns(stat, color);
         println!(
-            "{branch:<20} {base:<12} {commits:<10} {files:<7} {diff:<14} {}",
+            "{} {} {} {} {} {}",
+            pad_cell(branch, branch.len(), 20),
+            pad_cell(&columns.base, columns.base.len(), 12),
+            pad_cell(&columns.commits.rendered, columns.commits.visible_len, 10),
+            pad_cell(&columns.files, columns.files.len(), 7),
+            pad_cell(&columns.diff.rendered, columns.diff.visible_len, 14),
             wt.path.display()
         );
     }
 }
 
-fn format_stats_columns(stat: &WorktreeStatsStatus) -> (String, String, String, String) {
+fn pad_cell(text: &str, visible_len: usize, width: usize) -> String {
+    format!("{}{}", text, " ".repeat(width.saturating_sub(visible_len)))
+}
+
+struct StatsColumns {
+    base: String,
+    commits: RenderedCell,
+    files: String,
+    diff: RenderedCell,
+}
+
+struct RenderedCell {
+    rendered: String,
+    visible_len: usize,
+}
+
+fn format_stats_columns(stat: &WorktreeStatsStatus, color: ColorPolicy) -> StatsColumns {
     match stat {
-        WorktreeStatsStatus::Available(stats) => (
-            stats.base.clone(),
-            format_commit_counts(stats.commits_ahead, stats.commits_behind),
-            stats.files_changed.to_string(),
-            format!("+{} -{}", stats.insertions, stats.deletions),
-        ),
-        WorktreeStatsStatus::Unavailable { base, .. } => (
-            base.clone(),
-            "unavailable".to_string(),
-            "—".to_string(),
-            "—".to_string(),
-        ),
+        WorktreeStatsStatus::Available(stats) => StatsColumns {
+            base: stats.base.clone(),
+            commits: format_commit_counts(stats.commits_ahead, stats.commits_behind, color),
+            files: stats.files_changed.to_string(),
+            diff: format_diff_counts(stats.insertions, stats.deletions, color),
+        },
+        WorktreeStatsStatus::Unavailable { base, .. } => StatsColumns {
+            base: base.clone(),
+            commits: plain_cell("unavailable"),
+            files: "—".to_string(),
+            diff: plain_cell("—"),
+        },
     }
 }
 
-fn format_commit_counts(ahead: u32, behind: u32) -> String {
+fn format_commit_counts(ahead: u32, behind: u32, color: ColorPolicy) -> RenderedCell {
     match (ahead, behind) {
-        (0, 0) => "0".to_string(),
-        (a, 0) => format!("+{a}"),
-        (0, b) => format!("-{b}"),
-        (a, b) => format!("+{a} -{b}"),
+        (0, 0) => plain_cell("0"),
+        (a, 0) => color.signed_cell(&format!("+{a}"), StatSign::Positive),
+        (0, b) => color.signed_cell(&format!("-{b}"), StatSign::Negative),
+        (a, b) => joined_cell(&[
+            color.signed_cell(&format!("+{a}"), StatSign::Positive),
+            color.signed_cell(&format!("-{b}"), StatSign::Negative),
+        ]),
+    }
+}
+
+fn format_diff_counts(insertions: u32, deletions: u32, color: ColorPolicy) -> RenderedCell {
+    joined_cell(&[
+        signed_or_zero_cell(
+            format!("+{insertions}"),
+            insertions,
+            StatSign::Positive,
+            color,
+        ),
+        signed_or_zero_cell(
+            format!("-{deletions}"),
+            deletions,
+            StatSign::Negative,
+            color,
+        ),
+    ])
+}
+
+fn signed_or_zero_cell(
+    text: String,
+    value: u32,
+    sign: StatSign,
+    color: ColorPolicy,
+) -> RenderedCell {
+    if value == 0 {
+        plain_cell(&text)
+    } else {
+        color.signed_cell(&text, sign)
+    }
+}
+
+fn joined_cell(cells: &[RenderedCell]) -> RenderedCell {
+    RenderedCell {
+        rendered: cells
+            .iter()
+            .map(|cell| cell.rendered.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        visible_len: cells.iter().map(|cell| cell.visible_len).sum::<usize>() + cells.len() - 1,
+    }
+}
+
+fn plain_cell(text: &str) -> RenderedCell {
+    RenderedCell {
+        rendered: text.to_string(),
+        visible_len: text.len(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ColorPolicy {
+    enabled: bool,
+}
+
+impl ColorPolicy {
+    fn from_env(choice: ColorChoice) -> Self {
+        Self::resolve(
+            choice,
+            std::io::stdout().is_terminal(),
+            std::env::var_os("NO_COLOR").is_some(),
+        )
+    }
+
+    fn resolve(choice: ColorChoice, stdout_is_tty: bool, no_color: bool) -> Self {
+        let enabled = match choice {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => stdout_is_tty && !no_color,
+        };
+        Self { enabled }
+    }
+
+    fn signed_cell(self, text: &str, sign: StatSign) -> RenderedCell {
+        if self.enabled {
+            RenderedCell {
+                rendered: format!("{}{}\x1b[0m", sign.ansi_code(), text),
+                visible_len: text.len(),
+            }
+        } else {
+            plain_cell(text)
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum StatSign {
+    Positive,
+    Negative,
+}
+
+impl StatSign {
+    fn ansi_code(self) -> &'static str {
+        match self {
+            StatSign::Positive => "\x1b[32m",
+            StatSign::Negative => "\x1b[31m",
+        }
     }
 }
 

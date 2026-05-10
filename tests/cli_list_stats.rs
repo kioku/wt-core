@@ -3,6 +3,7 @@ mod fixtures;
 use std::path::Path;
 
 use assert_cmd::Command;
+use predicates::prelude::*;
 
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
@@ -38,6 +39,26 @@ fn list_json(repo_path: &Path, extra_args: &[&str]) -> serde_json::Value {
         .stdout
         .clone();
     serde_json::from_slice(&output).expect("invalid json")
+}
+
+fn list_human(repo_path: &Path, extra_args: &[&str]) -> String {
+    let repo_arg = repo_path.display().to_string();
+    let mut args = vec!["list", "--repo", &repo_arg];
+    args.extend_from_slice(extra_args);
+    let output = wt_core()
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    String::from_utf8(output).expect("invalid utf8")
+}
+
+fn strip_stats_ansi(text: &str) -> String {
+    text.replace("\x1b[32m", "")
+        .replace("\x1b[31m", "")
+        .replace("\x1b[0m", "")
 }
 
 fn worktree_entry<'a>(json: &'a serde_json::Value, branch: &str) -> &'a serde_json::Value {
@@ -157,6 +178,103 @@ fn list_json_omits_stats_without_flag() {
     let entry = worktree_entry(&json, "feat-default");
 
     assert!(entry.get("stats").is_none());
+}
+
+#[test]
+fn list_stats_color_always_colors_non_zero_signed_values() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    let wt_path = add_worktree(&repo_path, "feat-color");
+    fixtures::commit_file(&repo_path, "main.txt", "main\n", "main commit");
+    fixtures::commit_file(
+        Path::new(&wt_path),
+        "README.md",
+        "changed\n",
+        "feature commit",
+    );
+
+    let output = list_human(&repo_path, &["--stats", "--color", "always"]);
+
+    assert!(output.contains("\x1b[32m+1\x1b[0m"));
+    assert!(output.contains("\x1b[31m-1\x1b[0m"));
+    assert!(output.contains("\x1b[32m+1\x1b[0m \x1b[31m-1\x1b[0m"));
+    assert!(strip_stats_ansi(&output)
+        .contains("feat-color           main         +1 -1      1       +1 -1"));
+}
+
+#[test]
+fn list_stats_color_never_and_auto_non_tty_do_not_emit_ansi() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    let wt_path = add_worktree(&repo_path, "feat-plain");
+    fixtures::commit_file(
+        Path::new(&wt_path),
+        "feature.txt",
+        "feature\n",
+        "feature commit",
+    );
+
+    let default_output = list_human(&repo_path, &["--stats"]);
+    let never_output = list_human(&repo_path, &["--stats", "--color", "never"]);
+
+    assert!(!default_output.contains("\x1b["));
+    assert!(!never_output.contains("\x1b["));
+}
+
+#[test]
+fn list_stats_no_color_disables_auto_but_not_always() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    let wt_path = add_worktree(&repo_path, "feat-no-color");
+    fixtures::commit_file(
+        Path::new(&wt_path),
+        "feature.txt",
+        "feature\n",
+        "feature commit",
+    );
+    let repo_arg = repo_path.display().to_string();
+
+    wt_core()
+        .args(["list", "--repo", &repo_arg, "--stats", "--color", "auto"])
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\x1b[").not());
+
+    wt_core()
+        .args(["list", "--repo", &repo_arg, "--stats", "--color", "always"])
+        .env("NO_COLOR", "1")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("\x1b[32m+1\x1b[0m"));
+}
+
+#[test]
+fn list_stats_does_not_color_zero_unavailable_or_json() {
+    let repo = fixtures::TestRepo::new();
+    let repo_path = repo.path();
+    add_worktree(&repo_path, "feat-zero");
+    let detached_path = repo_path.join(".worktrees").join("detached-color");
+    fixtures::run_git(
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            &detached_path.display().to_string(),
+            "HEAD",
+        ],
+        &repo_path,
+    );
+
+    let human = list_human(&repo_path, &["--stats", "--color", "always"]);
+    let json = list_json(&repo_path, &["--stats", "--color", "always"]);
+    let json_text = serde_json::to_string(&json).expect("json text");
+
+    assert!(human.contains(" 0          0       +0 -0"));
+    assert!(human.contains("unavailable"));
+    assert!(!human.contains("\x1b[32m+0"));
+    assert!(!human.contains("\x1b[31m-0"));
+    assert!(!json_text.contains("\x1b["));
 }
 
 #[test]
