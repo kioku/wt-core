@@ -733,6 +733,26 @@ mod tests {
     }
 
     #[test]
+    fn diff_dirty_dry_run_supports_detached_worktree() {
+        let worktree = wt("/repo/.worktrees/detached--abc12345", None, false);
+        let result = diff_dirty(&worktree, DirtyDiffMode::Dirty, None, true)
+            .expect("dry-run dirty diff should resolve");
+
+        assert_eq!(result.label, "detached at deadbee");
+        assert_eq!(
+            result.command,
+            [
+                "git",
+                "-C",
+                "/repo/.worktrees/detached--abc12345",
+                "difftool",
+                "--dir-diff",
+                "HEAD"
+            ]
+        );
+    }
+
+    #[test]
     fn worktree_for_cwd_prefers_longest_prefix() {
         let worktrees = vec![
             wt("/repo", Some("main"), true),
