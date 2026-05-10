@@ -50,6 +50,13 @@ if ($output | str contains "feat-one") {
     fail "wt list: 'feat-one' not found in output"
 }
 
+let stats_output = (wt list --stats --color never | str join "\n")
+if ($stats_output | str contains "COMMITS") and ($stats_output | str contains "feat-one") {
+    pass "wt list --stats: forwards stats options"
+} else {
+    fail "wt list --stats: missing expected stats output"
+}
+
 # ── wt go ────────────────────────────────────────────────────────────
 cd $"($work)/repo"
 wt go feat-one
