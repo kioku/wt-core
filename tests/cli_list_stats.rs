@@ -185,12 +185,22 @@ fn column_start(line: &str, column: &str) -> usize {
         .unwrap_or_else(|| panic!("column '{column}' not found in '{line}'"))
 }
 
+fn char_column_start(line: &str, column: &str) -> usize {
+    let byte_start = column_start(line, column);
+    line[..byte_start].chars().count()
+}
+
+fn char_start_of_text(line: &str, text: &str) -> usize {
+    let byte_start = line
+        .find(text)
+        .unwrap_or_else(|| panic!("text '{text}' not found in '{line}'"));
+    line[..byte_start].chars().count()
+}
+
 #[test]
 fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
     let repo = fixtures::TestRepo::new();
     let repo_path = repo.path();
-    let base_branch = "base-with-a-long-name";
-    fixtures::run_git(&["branch", base_branch], &repo_path);
 
     let long_branch = "2385/line-native-startup-continuation-extra-long";
     let long_wt_path = add_worktree(&repo_path, long_branch);
@@ -214,6 +224,8 @@ fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
     );
     fixtures::commit_file(&repo_path, "main-1.txt", "main\n", "main commit 1");
     fixtures::commit_file(&repo_path, "main-2.txt", "main\n", "main commit 2");
+    let base_branch = "base-with-a-long-name";
+    fixtures::run_git(&["branch", base_branch], &repo_path);
 
     let detached_path = repo_path.join(".worktrees").join("detached-wide-stats");
     fixtures::run_git(
@@ -227,7 +239,7 @@ fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
         &repo_path,
     );
 
-    let base_name = "main";
+    let base_name = base_branch;
     let plain = list_human(
         &repo_path,
         &["--stats", "--against", base_name, "--color", "never"],
@@ -244,6 +256,8 @@ fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
     let header = lines.first().expect("header line");
     let base_start = column_start(header, "BASE");
     let path_start = column_start(header, "PATH");
+    let path_char_start = char_column_start(header, "PATH");
+    let repo_prefix = repo_path.display().to_string();
 
     assert!(lines.iter().any(|line| line.contains("+1200 -0")));
     assert!(lines.iter().any(|line| line.contains("+1 -2")));
@@ -252,7 +266,12 @@ fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
     for line in lines.iter().skip(1) {
         assert!(line[base_start..].starts_with(base_name), "{line}");
         assert!(line[..path_start].contains(base_name), "{line}");
-        assert!(line[path_start..].trim_start().starts_with('/'), "{line}");
+        assert!(line.contains(&repo_prefix), "{line}");
+        assert_eq!(
+            char_start_of_text(line, &repo_prefix),
+            path_char_start,
+            "{line}"
+        );
     }
 }
 

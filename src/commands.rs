@@ -437,7 +437,7 @@ fn joined_cell(cells: &[RenderedCell]) -> RenderedCell {
 fn plain_cell(text: &str) -> RenderedCell {
     RenderedCell {
         rendered: text.to_string(),
-        visible_len: text.len(),
+        visible_len: text.chars().count(),
     }
 }
 
@@ -468,7 +468,7 @@ impl ColorPolicy {
         if self.enabled {
             RenderedCell {
                 rendered: format!("{}{}\x1b[0m", sign.ansi_code(), text),
-                visible_len: text.len(),
+                visible_len: text.chars().count(),
             }
         } else {
             plain_cell(text)
