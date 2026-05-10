@@ -2,7 +2,7 @@ use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use crate::cli::{Cli, Command, Shell};
-use crate::domain::{self, BranchName};
+use crate::domain::{self, BranchName, WorktreeStatsStatus};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
@@ -15,7 +15,12 @@ use crate::worktree;
 
 pub fn run(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::List { repo, json } => cmd_list(repo, status_fmt(json)),
+        Command::List {
+            repo,
+            json,
+            stats,
+            against,
+        } => cmd_list(repo, status_fmt(json), stats, against.as_deref()),
         Command::Add {
             branch,
             base,
@@ -136,48 +141,145 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<domain::RepoRoot> {
 
 // ── Commands ────────────────────────────────────────────────────────
 
-fn cmd_list(repo: Option<PathBuf>, fmt: StatusFormat) -> Result<()> {
+fn cmd_list(
+    repo: Option<PathBuf>,
+    fmt: StatusFormat,
+    stats: bool,
+    against: Option<&str>,
+) -> Result<()> {
     let repo = resolve_repo(repo)?;
     let worktrees = git::list_worktrees(&repo)?;
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.canonicalize().ok());
+    let stats = if stats {
+        Some(list_stats(&repo, &worktrees, against)?)
+    } else {
+        None
+    };
 
     match fmt {
-        StatusFormat::Json => {
-            print_json(&JsonListResponse::from_worktrees(
+        StatusFormat::Json => match &stats {
+            Some(stats) => print_json(&JsonListResponse::from_worktrees_with_stats(
                 &worktrees,
                 cwd.as_deref(),
-            ))?;
-        }
+                stats,
+            ))?,
+            None => print_json(&JsonListResponse::from_worktrees(
+                &worktrees,
+                cwd.as_deref(),
+            ))?,
+        },
         StatusFormat::Human => {
             if worktrees.is_empty() {
                 println!("No worktrees found.");
                 return Ok(());
             }
-            let current_idx = cwd
-                .as_deref()
-                .and_then(|cwd| find_current_worktree(&worktrees, cwd));
-            for (i, wt) in worktrees.iter().enumerate() {
-                let branch_str = wt.branch.as_deref().unwrap_or("(detached)");
-                let main_tag = if wt.is_main { " [main]" } else { "" };
-                let here_tag = if current_idx == Some(i) {
-                    " ← here"
-                } else {
-                    ""
-                };
-                println!(
-                    "{:<50} {:<20} {}{}{}",
-                    wt.path.display(),
-                    branch_str,
-                    wt.commit,
-                    main_tag,
-                    here_tag
-                );
+            if let Some(stats) = &stats {
+                print_list_with_stats(&worktrees, stats);
+            } else {
+                print_list_default(&worktrees, cwd.as_deref());
             }
         }
     }
     Ok(())
+}
+
+fn list_stats(
+    repo: &domain::RepoRoot,
+    worktrees: &[domain::Worktree],
+    against: Option<&str>,
+) -> Result<Vec<WorktreeStatsStatus>> {
+    let base = match against {
+        Some(rev) => {
+            if !git::rev_exists(repo, rev) {
+                return Err(AppError::usage(format!(
+                    "base revision '{rev}' does not exist"
+                )));
+            }
+            rev.to_string()
+        }
+        None => git::resolve_mainline(repo)?,
+    };
+
+    Ok(worktrees
+        .iter()
+        .map(|wt| match &wt.branch {
+            Some(branch) => git::worktree_stats(repo, &base, branch).map_or_else(
+                |_| WorktreeStatsStatus::Unavailable {
+                    base: base.clone(),
+                    reason: "git_error".to_string(),
+                },
+                WorktreeStatsStatus::Available,
+            ),
+            None => WorktreeStatsStatus::Unavailable {
+                base: base.clone(),
+                reason: "no_branch".to_string(),
+            },
+        })
+        .collect())
+}
+
+fn print_list_default(worktrees: &[domain::Worktree], cwd: Option<&std::path::Path>) {
+    let current_idx = cwd.and_then(|cwd| find_current_worktree(worktrees, cwd));
+    for (i, wt) in worktrees.iter().enumerate() {
+        let branch_str = wt.branch.as_deref().unwrap_or("(detached)");
+        let main_tag = if wt.is_main { " [main]" } else { "" };
+        let here_tag = if current_idx == Some(i) {
+            " ← here"
+        } else {
+            ""
+        };
+        println!(
+            "{:<50} {:<20} {}{}{}",
+            wt.path.display(),
+            branch_str,
+            wt.commit,
+            main_tag,
+            here_tag
+        );
+    }
+}
+
+fn print_list_with_stats(worktrees: &[domain::Worktree], stats: &[WorktreeStatsStatus]) {
+    println!(
+        "{:<20} {:<12} {:<10} {:<7} {:<14} PATH",
+        "BRANCH", "BASE", "COMMITS", "FILES", "DIFF"
+    );
+    for (wt, stat) in worktrees.iter().zip(stats) {
+        let branch = wt.branch.as_deref().unwrap_or("(detached)");
+        let (base, commits, files, diff) = format_stats_columns(stat);
+        println!(
+            "{branch:<20} {base:<12} {commits:<10} {files:<7} {diff:<14} {}",
+            wt.path.display()
+        );
+    }
+}
+
+fn format_stats_columns(stat: &WorktreeStatsStatus) -> (String, String, String, String) {
+    match stat {
+        WorktreeStatsStatus::Available(stats) => (
+            stats.base.clone(),
+            format_commit_counts(stats.commits_ahead, stats.commits_behind),
+            stats.files_changed.to_string(),
+            format!("+{} -{}", stats.insertions, stats.deletions),
+        ),
+        WorktreeStatsStatus::Unavailable { base, .. } => (
+            base.clone(),
+            "unavailable".to_string(),
+            "—".to_string(),
+            "—".to_string(),
+        ),
+    }
+}
+
+fn format_commit_counts(ahead: u32, behind: u32) -> String {
+    match (ahead, behind) {
+        (0, 0) => "0".to_string(),
+        (a, 0) => format!("+{a}"),
+        (0, b) => format!("-{b}"),
+        (a, b) => format!("+{a} -{b}"),
+    }
 }
 
 fn cmd_add(

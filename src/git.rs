@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 
-use crate::domain::{BranchName, RepoRoot, Worktree};
+use crate::domain::{BranchName, RepoRoot, Worktree, WorktreeStats};
 use crate::error::{AppError, Result};
 
 /// Environment variables that can leak from parent git processes (e.g. hooks)
@@ -320,6 +320,62 @@ pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
                 "could not determine mainline branch; use --mainline to specify".to_string(),
             )
         })
+}
+
+/// Compute commit and diff stats for `branch` against `base`.
+pub fn worktree_stats(repo: &RepoRoot, base: &str, branch: &str) -> Result<WorktreeStats> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let range = format!("{base}...{branch_ref}");
+    let (commits_behind, commits_ahead) = rev_list_counts(repo, &range)?;
+    let (files_changed, insertions, deletions) = diff_numstat(repo, &range)?;
+
+    Ok(WorktreeStats {
+        base: base.to_string(),
+        commits_ahead,
+        commits_behind,
+        files_changed,
+        insertions,
+        deletions,
+    })
+}
+
+fn rev_list_counts(repo: &RepoRoot, range: &str) -> Result<(u32, u32)> {
+    let output = git(
+        &["rev-list", "--left-right", "--count", range],
+        repo.as_ref(),
+    )?;
+    let mut fields = output.split_whitespace();
+    let behind = fields
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| AppError::git("failed to parse rev-list behind count".to_string()))?;
+    let ahead = fields
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+        .ok_or_else(|| AppError::git("failed to parse rev-list ahead count".to_string()))?;
+    Ok((behind, ahead))
+}
+
+fn diff_numstat(repo: &RepoRoot, range: &str) -> Result<(u32, u32, u32)> {
+    let output = git(&["diff", "--numstat", range], repo.as_ref())?;
+    let mut files_changed = 0;
+    let mut insertions = 0;
+    let mut deletions = 0;
+
+    for line in output.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let added = fields.next().unwrap_or_default();
+        let removed = fields.next().unwrap_or_default();
+        if fields.next().is_some() {
+            files_changed += 1;
+            // Git reports binary files as `-` insertions/deletions in --numstat.
+            // Count the file as changed and expose stable zero line counts.
+            insertions += added.parse::<u32>().unwrap_or(0);
+            deletions += removed.parse::<u32>().unwrap_or(0);
+        }
+    }
+
+    Ok((files_changed, insertions, deletions))
 }
 
 /// Check if a local branch exists.

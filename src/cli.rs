@@ -24,6 +24,14 @@ pub enum Command {
         /// Output as JSON
         #[arg(long)]
         json: bool,
+
+        /// Include commit and diff stats for each worktree
+        #[arg(long)]
+        stats: bool,
+
+        /// Compare stats against this revision (defaults to resolved mainline)
+        #[arg(long, requires = "stats")]
+        against: Option<String>,
     },
 
     /// Create a new worktree and branch
