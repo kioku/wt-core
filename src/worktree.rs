@@ -43,6 +43,8 @@ pub struct AddResult {
     pub tracking: bool,
     /// Symlink outcomes, if a `.wt/symlinks` config was present.
     pub symlinks: Option<symlinks::SymlinkReport>,
+    /// Safe per-worktree setup recommendation for pnpm workspaces.
+    pub setup_recommendation: Option<String>,
 }
 
 /// Result of a successful `go` operation.
@@ -126,6 +128,8 @@ pub fn add(repo: &RepoRoot, branch: &BranchName, base: Option<&str>) -> Result<A
     }
 
     let symlink_report = symlinks::apply_symlinks(repo, &wt_dir);
+    let setup_recommendation = symlinks::is_pnpm_workspace(repo)
+        .then(|| symlinks::pnpm_install_recommendation().to_string());
 
     Ok(AddResult {
         worktree_path: wt_dir,
@@ -133,6 +137,7 @@ pub fn add(repo: &RepoRoot, branch: &BranchName, base: Option<&str>) -> Result<A
         repo_root: repo.to_path_buf(),
         tracking,
         symlinks: symlink_report,
+        setup_recommendation,
     })
 }
 

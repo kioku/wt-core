@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::domain::RepoRoot;
 
@@ -164,6 +164,46 @@ pub fn resolve_entries(repo: &RepoRoot, patterns: &[String]) -> Vec<PathBuf> {
     resolved
 }
 
+fn is_node_modules_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, Component::Normal(name) if name == "node_modules"))
+}
+
+fn pnpm_unsafe_node_modules_warning() -> String {
+    "pnpm workspace detected; skipping node_modules symlink because workspace dependencies may resolve to the main worktree. Run `pnpm install --prefer-offline --frozen-lockfile` in the new worktree instead.".to_string()
+}
+
+fn filter_pnpm_unsafe_entries(entries: Vec<PathBuf>) -> (Vec<PathBuf>, Vec<(PathBuf, String)>) {
+    let mut safe = Vec::new();
+    let mut skipped = Vec::new();
+
+    for entry in entries {
+        if is_node_modules_path(&entry) {
+            skipped.push((entry, pnpm_unsafe_node_modules_warning()));
+        } else {
+            safe.push(entry);
+        }
+    }
+
+    (safe, skipped)
+}
+
+fn filter_pnpm_unsafe_patterns(patterns: Vec<String>) -> (Vec<String>, Vec<(PathBuf, String)>) {
+    let mut safe = Vec::new();
+    let mut skipped = Vec::new();
+
+    for pattern in patterns {
+        let path = PathBuf::from(&pattern);
+        if is_node_modules_path(&path) {
+            skipped.push((path, pnpm_unsafe_node_modules_warning()));
+        } else {
+            safe.push(pattern);
+        }
+    }
+
+    (safe, skipped)
+}
+
 /// Outcome of a single symlink attempt.
 #[derive(Debug)]
 pub enum SymlinkOutcome {
@@ -295,11 +335,22 @@ pub fn apply_symlinks(repo: &RepoRoot, worktree_path: &Path) -> Option<SymlinkRe
         return None;
     }
 
+    let pnpm_workspace = is_pnpm_workspace(repo);
+    let (patterns, mut skipped) = if pnpm_workspace {
+        filter_pnpm_unsafe_patterns(patterns)
+    } else {
+        (patterns, Vec::new())
+    };
     let entries = resolve_entries(repo, &patterns);
+    let (entries, expanded_skipped) = if pnpm_workspace {
+        filter_pnpm_unsafe_entries(entries)
+    } else {
+        (entries, Vec::new())
+    };
+    skipped.extend(expanded_skipped);
     let outcomes = create_symlinks(repo, worktree_path, &entries);
 
     let mut created = Vec::new();
-    let mut skipped = Vec::new();
 
     for outcome in outcomes {
         match outcome {
@@ -380,6 +431,40 @@ const ECOSYSTEM_MARKERS: &[(&str, &str, &[&str])] = &[
 
 const UNIVERSAL_ENTRIES: &[&str] = &[".env*"];
 
+const PNPM_SAFE_NODE_ENTRIES: &[&str] = &[
+    ".next",
+    ".nuxt",
+    ".turbo",
+    ".output",
+    ".parcel-cache",
+    ".svelte-kit",
+    ".angular",
+];
+
+pub fn pnpm_install_recommendation() -> &'static str {
+    "pnpm workspace detected; run `pnpm install --prefer-offline --frozen-lockfile` in the new worktree to create correct per-worktree links."
+}
+
+fn package_manager_is_pnpm(package_json: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(package_json) else {
+        return false;
+    };
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+
+    json.get("packageManager")
+        .and_then(|value| value.as_str())
+        .is_some_and(|package_manager| package_manager.starts_with("pnpm@"))
+}
+
+pub fn is_pnpm_workspace(repo: &RepoRoot) -> bool {
+    let root = repo.as_ref();
+    root.join("pnpm-workspace.yaml").exists()
+        || root.join("pnpm-lock.yaml").exists()
+        || package_manager_is_pnpm(&root.join("package.json"))
+}
+
 /// Detect ecosystems present at the repo root and generate `.wt/symlinks` content.
 pub fn generate_config(repo: &RepoRoot) -> String {
     let root = repo.as_ref();
@@ -399,6 +484,7 @@ pub fn generate_config(repo: &RepoRoot) -> String {
         output.push('\n');
     }
 
+    let pnpm_workspace = is_pnpm_workspace(repo);
     let mut seen_ecosystems = BTreeSet::new();
 
     for (name, marker, entries) in ECOSYSTEM_MARKERS {
@@ -410,13 +496,25 @@ pub fn generate_config(repo: &RepoRoot) -> String {
             continue;
         }
 
+        let entries = if *name == "node" && pnpm_workspace {
+            PNPM_SAFE_NODE_ENTRIES
+        } else {
+            entries
+        };
+
         if entries.is_empty() {
             continue;
         }
 
         output.push('\n');
-        output.push_str(&format!("# {name} (detected: {marker})\n"));
-        for entry in *entries {
+        if *name == "node" && pnpm_workspace {
+            output.push_str(&format!(
+                "# {name} (detected: {marker}; pnpm workspace: node_modules omitted)\n"
+            ));
+        } else {
+            output.push_str(&format!("# {name} (detected: {marker})\n"));
+        }
+        for entry in entries {
             output.push_str(entry);
             output.push('\n');
         }
@@ -453,6 +551,10 @@ pub fn detect_ecosystems(repo: &RepoRoot) -> Vec<String> {
         if root.join(marker).exists() {
             seen.insert(name.to_string());
         }
+    }
+
+    if is_pnpm_workspace(repo) {
+        seen.insert("pnpm".to_string());
     }
 
     if has_tf_files(root) {
@@ -779,6 +881,119 @@ mod tests {
         let config = generate_config(&repo);
         assert!(config.contains("node_modules"));
         assert!(config.contains("# node (detected: package.json)"));
+    }
+
+    #[test]
+    fn detect_pnpm_workspace_from_markers() {
+        let dir = make_temp_dir();
+        let repo = RepoRoot(dir.path().to_path_buf());
+        assert!(!is_pnpm_workspace(&repo));
+
+        fs::write(dir.path().join("pnpm-workspace.yaml"), "packages: []").expect("write");
+        assert!(is_pnpm_workspace(&repo));
+
+        fs::remove_file(dir.path().join("pnpm-workspace.yaml")).expect("remove");
+        fs::write(dir.path().join("pnpm-lock.yaml"), "lockfileVersion: '9.0'").expect("write");
+        assert!(is_pnpm_workspace(&repo));
+    }
+
+    #[test]
+    fn detect_pnpm_workspace_from_package_manager() {
+        let dir = make_temp_dir();
+        let repo = RepoRoot(dir.path().to_path_buf());
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"pnpm@9.0.0"}"#,
+        )
+        .expect("write");
+
+        assert!(is_pnpm_workspace(&repo));
+    }
+
+    #[test]
+    fn detect_pnpm_workspace_rejects_malformed_package_manager_values() {
+        for package_json in [
+            "",
+            "not json",
+            r#"{}"#,
+            r#"{"packageManager":""}"#,
+            r#"{"packageManager":"none"}"#,
+            r#"{"packageManager":"npm@10.0.0"}"#,
+            r#"{"packageManager":" pnpm@9.0.0"}"#,
+            r#"{"packageManager":["pnpm@9.0.0"]}"#,
+        ] {
+            let dir = make_temp_dir();
+            let repo = RepoRoot(dir.path().to_path_buf());
+            fs::write(dir.path().join("package.json"), package_json).expect("write");
+
+            assert!(
+                !is_pnpm_workspace(&repo),
+                "package.json should not detect pnpm: {package_json}"
+            );
+        }
+    }
+
+    #[test]
+    fn load_config_deduplicates_shared_and_local_entries() {
+        let dir = make_temp_dir();
+        let repo = RepoRoot(dir.path().to_path_buf());
+        fs::create_dir(dir.path().join(".wt")).expect("mkdir .wt");
+        fs::write(dir.path().join(".wt/symlinks"), "node_modules\n.env\n").expect("write");
+        fs::write(dir.path().join(".wt/symlinks.local"), ".env\ntarget\n").expect("write");
+
+        assert_eq!(load_config(&repo), vec!["node_modules", ".env", "target"]);
+    }
+
+    #[test]
+    fn pnpm_pattern_filter_skips_node_modules_globs_and_keeps_unknown_entries() {
+        let patterns = vec![
+            "node_modules".to_string(),
+            "apps/*/node_modules".to_string(),
+            "target".to_string(),
+            "unknown-extra".to_string(),
+        ];
+
+        let (safe, skipped) = filter_pnpm_unsafe_patterns(patterns);
+
+        assert_eq!(safe, vec!["target", "unknown-extra"]);
+        assert_eq!(
+            skipped.iter().map(|(path, _)| path).collect::<Vec<_>>(),
+            vec![
+                &PathBuf::from("node_modules"),
+                &PathBuf::from("apps/*/node_modules"),
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_config_pnpm_omits_node_modules() {
+        let dir = make_temp_dir();
+        let repo = RepoRoot(dir.path().to_path_buf());
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"packageManager":"pnpm@9.0.0"}"#,
+        )
+        .expect("write");
+
+        let config = generate_config(&repo);
+        assert!(!config.lines().any(|line| line == "node_modules"));
+        assert!(config.contains(".turbo"));
+        assert!(config.contains("pnpm workspace: node_modules omitted"));
+    }
+
+    #[test]
+    fn pnpm_filter_skips_nested_node_modules_entries() {
+        let entries = vec![
+            PathBuf::from("node_modules"),
+            PathBuf::from("apps/web/node_modules"),
+            PathBuf::from("target"),
+        ];
+
+        let (safe, skipped) = filter_pnpm_unsafe_entries(entries);
+
+        assert_eq!(safe, vec![PathBuf::from("target")]);
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped[0].1.contains("workspace dependencies may resolve"));
     }
 
     #[test]
