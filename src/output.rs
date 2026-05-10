@@ -2,7 +2,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
-use crate::domain::Worktree;
+use crate::domain::{Worktree, WorktreeStatsStatus};
 
 /// Output format for commands that produce a navigable path (add, go).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,6 +129,53 @@ pub struct JsonWorktreeEntry {
     pub commit: String,
     pub is_main: bool,
     pub is_current: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stats: Option<JsonWorktreeStats>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonWorktreeStats {
+    pub available: bool,
+    pub base: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commits_ahead: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub commits_behind: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_changed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub insertions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletions: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl JsonWorktreeStats {
+    fn from_status(status: &WorktreeStatsStatus) -> Self {
+        match status {
+            WorktreeStatsStatus::Available(stats) => Self {
+                available: true,
+                base: stats.base.clone(),
+                commits_ahead: Some(stats.commits_ahead),
+                commits_behind: Some(stats.commits_behind),
+                files_changed: Some(stats.files_changed),
+                insertions: Some(stats.insertions),
+                deletions: Some(stats.deletions),
+                reason: None,
+            },
+            WorktreeStatsStatus::Unavailable { base, reason } => Self {
+                available: false,
+                base: base.clone(),
+                commits_ahead: None,
+                commits_behind: None,
+                files_changed: None,
+                insertions: None,
+                deletions: None,
+                reason: Some(reason.clone()),
+            },
+        }
+    }
 }
 
 impl JsonListResponse {
@@ -146,6 +193,35 @@ impl JsonListResponse {
                 commit: wt.commit.clone(),
                 is_main: wt.is_main,
                 is_current: current_idx == Some(i),
+                stats: None,
+            })
+            .collect();
+
+        Self {
+            ok: true,
+            worktrees: entries,
+        }
+    }
+
+    /// Build a list response with per-worktree stats.
+    pub fn from_worktrees_with_stats(
+        worktrees: &[Worktree],
+        cwd: Option<&Path>,
+        stats: &[WorktreeStatsStatus],
+    ) -> Self {
+        let current_idx = cwd.and_then(|cwd| find_current_worktree(worktrees, cwd));
+
+        let entries = worktrees
+            .iter()
+            .zip(stats)
+            .enumerate()
+            .map(|(i, (wt, stat))| JsonWorktreeEntry {
+                path: wt.path.display().to_string(),
+                branch: wt.branch.clone(),
+                commit: wt.commit.clone(),
+                is_main: wt.is_main,
+                is_current: current_idx == Some(i),
+                stats: Some(JsonWorktreeStats::from_status(stat)),
             })
             .collect();
 

@@ -71,6 +71,24 @@ pub struct Worktree {
     pub is_main: bool,
 }
 
+/// Git comparison stats for a worktree branch against a base revision.
+#[derive(Debug, Clone)]
+pub struct WorktreeStats {
+    pub base: String,
+    pub commits_ahead: u32,
+    pub commits_behind: u32,
+    pub files_changed: u32,
+    pub insertions: u32,
+    pub deletions: u32,
+}
+
+/// Stats are unavailable for detached worktrees or refs Git cannot compare.
+#[derive(Debug, Clone)]
+pub enum WorktreeStatsStatus {
+    Available(WorktreeStats),
+    Unavailable { base: String, reason: String },
+}
+
 /// Slugify a branch name: replace non-alphanumeric chars with hyphens,
 /// collapse runs, and trim leading/trailing hyphens.
 fn slugify(input: &str) -> String {
