@@ -368,6 +368,8 @@ fn diff_numstat(repo: &RepoRoot, range: &str) -> Result<(u32, u32, u32)> {
         let removed = fields.next().unwrap_or_default();
         if fields.next().is_some() {
             files_changed += 1;
+            // Git reports binary files as `-` insertions/deletions in --numstat.
+            // Count the file as changed and expose stable zero line counts.
             insertions += added.parse::<u32>().unwrap_or(0);
             deletions += removed.parse::<u32>().unwrap_or(0);
         }
