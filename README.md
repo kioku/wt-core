@@ -51,6 +51,7 @@ wt go [<branch>] [-i]                  Switch to an existing worktree
 wt list                                List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
 wt merge [<branch>] [--push]           Merge a branch into mainline and clean up
+wt diff [<branch>] [--dry-run]         Open difftool for a branch vs mainline
 wt prune [--execute] [--force]         Remove worktrees integrated into mainline
 wt doctor                              Diagnose worktree/repo health
 ```
@@ -112,6 +113,19 @@ wt merge                    # merge current worktree's branch
 wt merge feature/auth       # explicit branch
 wt merge --push             # push mainline to origin after merge
 wt merge --no-cleanup       # keep worktree and branch after merge
+```
+
+### `wt diff`
+
+Opens Git's configured difftool in directory-diff mode for a worktree branch
+against the auto-detected mainline. When called without a branch in a TTY, a
+fuzzy picker containing non-main worktrees is shown.
+
+```
+wt diff feature/auth                 # git difftool --dir-diff main...feature/auth
+wt diff --against develop feature/auth
+wt diff --tool vimdiff feature/auth
+wt diff --dry-run feature/auth       # print the resolved git command
 ```
 
 ### `wt prune`

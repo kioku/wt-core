@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
+use std::process::Stdio;
 
 use crate::domain::{BranchName, RepoRoot, Worktree, WorktreeStats};
 use crate::error::{AppError, Result};
@@ -431,6 +432,39 @@ pub fn merge_no_ff(repo: &RepoRoot, branch: &str) -> Result<()> {
 /// we silently ignore.
 pub fn merge_abort(repo: &RepoRoot) {
     let _ = git(&["merge", "--abort"], repo.as_ref());
+}
+
+/// Run Git's configured difftool for a branch comparison.
+pub fn difftool(repo: &RepoRoot, tool: Option<&str>, range: &str) -> Result<()> {
+    let mut cmd = Cmd::new("git");
+    cmd.arg("-C")
+        .arg(repo.as_ref())
+        .arg("difftool")
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    if let Some(tool) = tool {
+        cmd.arg("--tool").arg(tool);
+    }
+
+    cmd.arg("--dir-diff").arg(range);
+
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+
+    let status = cmd
+        .status()
+        .map_err(|e| AppError::git(format!("failed to run git difftool: {e}")))?;
+
+    if !status.success() {
+        return Err(AppError::git(format!(
+            "git difftool failed with status {status}"
+        )));
+    }
+
+    Ok(())
 }
 
 /// Push a branch to `origin`.

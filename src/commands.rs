@@ -72,6 +72,19 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             merge_fmt(json, print_paths),
         ),
+        Command::Diff {
+            branch,
+            against,
+            tool,
+            dry_run,
+            repo,
+        } => cmd_diff(
+            branch.as_deref().map(BranchName::new),
+            against.as_deref(),
+            tool.as_deref(),
+            dry_run,
+            repo,
+        ),
         Command::Prune {
             execute,
             force,
@@ -711,6 +724,65 @@ fn capitalize(s: &str) -> String {
         Some(c) => c.to_uppercase().to_string() + chars.as_str(),
         None => String::new(),
     }
+}
+
+fn cmd_diff(
+    branch: Option<BranchName>,
+    against: Option<&str>,
+    tool: Option<&str>,
+    dry_run: bool,
+    repo: Option<PathBuf>,
+) -> Result<()> {
+    if matches!(tool, Some(name) if name.trim().is_empty()) {
+        return Err(AppError::usage("--tool must not be empty".to_string()));
+    }
+
+    let repo = resolve_repo(repo)?;
+    let resolved_branch = match branch {
+        Some(branch) => branch,
+        None => resolve_diff_branch(&repo)?,
+    };
+
+    let result = worktree::diff(&repo, &resolved_branch, against, tool, dry_run)?;
+
+    if dry_run {
+        println!("{}", result.command.join(" "));
+    } else {
+        println!(
+            "Opened diff for '{}' against {}",
+            result.branch, result.base
+        );
+    }
+
+    Ok(())
+}
+
+fn resolve_diff_branch(repo: &domain::RepoRoot) -> Result<BranchName> {
+    let worktrees = git::list_worktrees(repo)?;
+    let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
+
+    if candidates.is_empty() {
+        return Err(AppError::usage(
+            "no worktrees to diff (create one with `wt add`)".to_string(),
+        ));
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(AppError::usage(
+            "no branch specified; interactive mode requires a terminal".to_string(),
+        ));
+    }
+
+    let preselect = std::env::current_dir().ok().and_then(|cwd| {
+        candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, wt)| cwd.starts_with(&wt.path))
+            .max_by_key(|(_, wt)| wt.path.as_os_str().len())
+            .map(|(idx, _)| idx)
+    });
+
+    pick_action_worktree(&candidates, preselect, "diff")
 }
 
 fn cmd_merge(
