@@ -50,7 +50,7 @@ wt add <branch> [--base <rev>]         Create a worktree and branch
 wt go [<branch>] [-i]                  Switch to an existing worktree
 wt list                                List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
-wt merge [<branch>] [--push]           Merge a branch into mainline and clean up
+wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
 wt diff [<branch>] [--dry-run]         Open difftool for a branch vs mainline
 wt prune [--execute] [--force]         Remove worktrees integrated into mainline
 wt doctor                              Diagnose worktree/repo health
@@ -105,14 +105,17 @@ wt remove --force          # remove even if dirty, use -D for branch
 ### `wt merge`
 
 Merges a worktree's branch into the auto-detected mainline using
-`--no-ff`, then removes the worktree and branch by default. Conflicts
-cause an automatic `merge --abort` to keep the main worktree clean.
+`--no-ff`, then removes the worktree and branch by default. Use `--into`
+to merge into a different branch that is already checked out in the main
+worktree. Conflicts cause an automatic `merge --abort` to keep the main
+worktree clean.
 
 ```
-wt merge                    # merge current worktree's branch
-wt merge feature/auth       # explicit branch
-wt merge --push             # push mainline to origin after merge
-wt merge --no-cleanup       # keep worktree and branch after merge
+wt merge                         # merge current worktree's branch
+wt merge feature/auth            # explicit branch
+wt merge feature/auth --into rc  # merge into checked-out branch rc
+wt merge --push                  # push target branch to origin after merge
+wt merge --no-cleanup            # keep worktree and branch after merge
 ```
 
 ### `wt diff`

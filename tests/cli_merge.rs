@@ -308,6 +308,57 @@ fn merge_push_failure_reports_warning() {
         .stderr(predicate::str::contains("warning:"));
 }
 
+#[test]
+fn merge_into_with_push_pushes_destination_branch() {
+    let (repo, upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/1.0"], &repo.path());
+    run_git(&["push", "-u", "origin", "release/1.0"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/release-push", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-release-push");
+    commit_file(&wt_dir, "rp.txt", "release push", "add release push");
+
+    run_git(&["checkout", "release/1.0"], &repo.path());
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/release-push",
+            "--into",
+            "release/1.0",
+            "--push",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merged 'feature/release-push' into release/1.0",
+        ))
+        .stdout(predicate::str::contains("Pushed release/1.0 to origin"));
+
+    let upstream_log = git_log_oneline(upstream.path(), "release/1.0");
+    assert!(
+        upstream_log.contains("Merge branch 'feature/release-push'"),
+        "merge commit should be pushed to release branch: {upstream_log}"
+    );
+
+    let upstream_main_log = git_log_oneline(upstream.path(), "main");
+    assert!(
+        !upstream_main_log.contains("Merge branch 'feature/release-push'"),
+        "merge commit should not be pushed to main: {upstream_main_log}"
+    );
+
+    run_git(&["checkout", "main"], &repo.path());
+}
+
 // ── JSON output tests ───────────────────────────────────────────────
 
 #[test]
@@ -386,6 +437,52 @@ fn merge_json_no_cleanup_shows_false() {
     );
 }
 
+#[test]
+fn merge_json_into_reports_destination_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/json"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/json-release", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-json-release");
+    commit_file(&wt_dir, "json-release.txt", "json release", "json release");
+
+    run_git(&["checkout", "release/json"], &repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/json-release",
+            "--into",
+            "release/json",
+            "--repo",
+            &repo_str,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "feature/json-release");
+    assert_eq!(json["mainline"], "release/json");
+    assert_eq!(
+        json["message"],
+        "merged 'feature/json-release' into release/json"
+    );
+
+    run_git(&["checkout", "main"], &repo.path());
+}
+
 // ── Print-paths output tests ────────────────────────────────────────
 
 #[test]
@@ -447,6 +544,54 @@ fn merge_print_paths_returns_six_lines() {
 }
 
 #[test]
+fn merge_print_paths_into_reports_destination_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/paths"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/paths-release", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-paths-release");
+    commit_file(
+        &wt_dir,
+        "paths-release.txt",
+        "paths release",
+        "paths release",
+    );
+
+    run_git(&["checkout", "release/paths"], &repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/paths-release",
+            "--into",
+            "release/paths",
+            "--repo",
+            &repo_str,
+            "--print-paths",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 6, "expected 6 lines: {stdout}");
+    assert_eq!(lines[1], "feature/paths-release");
+    assert_eq!(lines[2], "release/paths");
+
+    run_git(&["checkout", "main"], &repo.path());
+}
+
+#[test]
 fn merge_print_paths_conflicts_with_json() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -485,6 +630,123 @@ fn merge_auto_detects_mainline() {
         .assert()
         .success()
         .stdout(predicate::str::contains("into main"));
+}
+
+#[test]
+fn merge_into_checked_out_non_mainline_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/1.0"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/release-fix", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-release-fix");
+    commit_file(&wt_dir, "fix.txt", "release fix", "add release fix");
+
+    run_git(&["checkout", "release/1.0"], &repo.path());
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/release-fix",
+            "--into",
+            "release/1.0",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merged 'feature/release-fix' into release/1.0",
+        ));
+
+    let release_log = git_log_oneline(&repo.path(), "release/1.0");
+    assert!(
+        release_log.contains("Merge branch 'feature/release-fix'"),
+        "merge commit should exist on release branch: {release_log}"
+    );
+
+    let main_log = git_log_oneline(&repo.path(), "main");
+    assert!(
+        !main_log.contains("Merge branch 'feature/release-fix'"),
+        "merge commit should not exist on main: {main_log}"
+    );
+
+    run_git(&["checkout", "main"], &repo.path());
+}
+
+#[test]
+fn merge_into_wrong_checked_out_destination_errors_before_merge() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/1.0"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/wrong-target", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-wrong-target");
+    commit_file(&wt_dir, "wrong.txt", "wrong target", "add wrong target");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/wrong-target",
+            "--into",
+            "release/1.0",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(4)
+        .stderr(predicate::str::contains("main worktree is on 'main'"))
+        .stderr(predicate::str::contains("expected 'release/1.0'"))
+        .stderr(predicate::str::contains("checkout target branch first"));
+
+    let release_log = git_log_oneline(&repo.path(), "release/1.0");
+    assert!(
+        !release_log.contains("Merge branch 'feature/wrong-target'"),
+        "merge commit should not exist on release branch: {release_log}"
+    );
+    assert_branch_exists(&repo.path(), "feature/wrong-target");
+}
+
+#[test]
+fn merge_into_refuses_source_equal_destination() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/self", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/self",
+            "--into",
+            "feature/self",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(4)
+        .stderr(predicate::str::contains(
+            "refusing to merge a branch into itself",
+        ));
+
+    assert_branch_exists(&repo.path(), "feature/self");
 }
 
 // ── Branch resolution ───────────────────────────────────────────────

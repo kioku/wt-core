@@ -104,12 +104,16 @@ pub enum Command {
         print_paths: bool,
     },
 
-    /// Merge a worktree's branch into mainline and clean up
+    /// Merge a worktree's branch into a checked-out target and clean up
     Merge {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,
 
-        /// Push mainline to origin after successful merge
+        /// Merge into this checked-out branch instead of the detected mainline
+        #[arg(long, value_name = "BRANCH")]
+        into: Option<String>,
+
+        /// Push the target branch to origin after successful merge
         #[arg(long)]
         push: bool,
 
