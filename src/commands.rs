@@ -61,6 +61,7 @@ pub fn run(cli: Cli) -> Result<()> {
         ),
         Command::Merge {
             branch,
+            into,
             push,
             no_cleanup,
             repo,
@@ -68,6 +69,7 @@ pub fn run(cli: Cli) -> Result<()> {
             print_paths,
         } => cmd_merge(
             branch.as_deref().map(BranchName::new),
+            into,
             push,
             no_cleanup,
             repo,
@@ -984,6 +986,7 @@ fn resolve_diff_branch(repo: &domain::RepoRoot) -> Result<BranchName> {
 
 fn cmd_merge(
     branch: Option<BranchName>,
+    into: Option<String>,
     push: bool,
     no_cleanup: bool,
     repo: Option<PathBuf>,
@@ -996,7 +999,13 @@ fn cmd_merge(
         None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge")?,
     };
 
-    let result = worktree::merge(&repo, resolved_branch.as_ref(), push, no_cleanup)?;
+    let result = worktree::merge(
+        &repo,
+        resolved_branch.as_ref(),
+        into.as_deref(),
+        push,
+        no_cleanup,
+    )?;
 
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;

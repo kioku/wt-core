@@ -617,13 +617,14 @@ pub struct MergeResult {
 ///
 /// 1. Resolve the target branch (argument, cwd inference, or picker)
 /// 2. Refuse if it is the main worktree
-/// 3. Resolve the mainline branch
+/// 3. Resolve the target branch (`--into` or detected mainline)
 /// 4. Run `git merge --no-ff <branch>` from the main worktree
 /// 5. On conflict: abort the merge and return an error
 /// 6. On success: optionally remove the worktree+branch, optionally push
 pub fn merge(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
+    into: Option<&str>,
     push: bool,
     no_cleanup: bool,
 ) -> Result<MergeResult> {
@@ -650,17 +651,30 @@ pub fn merge(
         ));
     }
 
-    // Resolve mainline and verify the main worktree is checked out to it.
-    let mainline = git::resolve_mainline(repo)?;
+    // Resolve target and verify the main worktree is checked out to it.
+    let mainline = into
+        .map(str::to_string)
+        .map(Ok)
+        .unwrap_or_else(|| git::resolve_mainline(repo))?;
     let main_wt_branch = worktrees
         .iter()
         .find(|w| w.is_main)
         .and_then(|w| w.branch.as_deref());
+    let checkout_hint = match into {
+        Some(_) => "checkout target branch first",
+        None => "checkout mainline first",
+    };
     if main_wt_branch != Some(&mainline) {
         return Err(AppError::invariant(format!(
-            "main worktree is on '{}', expected '{mainline}' — checkout mainline first",
+            "main worktree is on '{}', expected '{mainline}' — {checkout_hint}",
             main_wt_branch.unwrap_or("(detached)")
         )));
+    }
+
+    if target_branch.as_str() == mainline {
+        return Err(AppError::invariant(
+            "refusing to merge a branch into itself".to_string(),
+        ));
     }
 
     // Attempt the merge from the main worktree's context.

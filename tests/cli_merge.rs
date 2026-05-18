@@ -487,6 +487,54 @@ fn merge_auto_detects_mainline() {
         .stdout(predicate::str::contains("into main"));
 }
 
+#[test]
+fn merge_into_checked_out_non_mainline_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/1.0"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/release-fix", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-release-fix");
+    commit_file(&wt_dir, "fix.txt", "release fix", "add release fix");
+
+    run_git(&["checkout", "release/1.0"], &repo.path());
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/release-fix",
+            "--into",
+            "release/1.0",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merged 'feature/release-fix' into release/1.0",
+        ));
+
+    let release_log = git_log_oneline(&repo.path(), "release/1.0");
+    assert!(
+        release_log.contains("Merge branch 'feature/release-fix'"),
+        "merge commit should exist on release branch: {release_log}"
+    );
+
+    let main_log = git_log_oneline(&repo.path(), "main");
+    assert!(
+        !main_log.contains("Merge branch 'feature/release-fix'"),
+        "merge commit should not exist on main: {main_log}"
+    );
+
+    run_git(&["checkout", "main"], &repo.path());
+}
+
 // ── Branch resolution ───────────────────────────────────────────────
 
 #[test]
