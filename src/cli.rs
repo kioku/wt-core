@@ -104,7 +104,7 @@ pub enum Command {
         print_paths: bool,
     },
 
-    /// Merge a worktree's branch into mainline and clean up
+    /// Merge a worktree's branch into a checked-out target and clean up
     Merge {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,

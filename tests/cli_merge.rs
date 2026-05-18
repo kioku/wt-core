@@ -437,6 +437,52 @@ fn merge_json_no_cleanup_shows_false() {
     );
 }
 
+#[test]
+fn merge_json_into_reports_destination_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/json"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/json-release", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-json-release");
+    commit_file(&wt_dir, "json-release.txt", "json release", "json release");
+
+    run_git(&["checkout", "release/json"], &repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/json-release",
+            "--into",
+            "release/json",
+            "--repo",
+            &repo_str,
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "feature/json-release");
+    assert_eq!(json["mainline"], "release/json");
+    assert_eq!(
+        json["message"],
+        "merged 'feature/json-release' into release/json"
+    );
+
+    run_git(&["checkout", "main"], &repo.path());
+}
+
 // ── Print-paths output tests ────────────────────────────────────────
 
 #[test]
@@ -495,6 +541,54 @@ fn merge_print_paths_returns_six_lines() {
 
     // Line 6: pushed
     assert_eq!(lines[5], "false");
+}
+
+#[test]
+fn merge_print_paths_into_reports_destination_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    run_git(&["checkout", "-b", "release/paths"], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/paths-release", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-paths-release");
+    commit_file(
+        &wt_dir,
+        "paths-release.txt",
+        "paths release",
+        "paths release",
+    );
+
+    run_git(&["checkout", "release/paths"], &repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/paths-release",
+            "--into",
+            "release/paths",
+            "--repo",
+            &repo_str,
+            "--print-paths",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 6, "expected 6 lines: {stdout}");
+    assert_eq!(lines[1], "feature/paths-release");
+    assert_eq!(lines[2], "release/paths");
+
+    run_git(&["checkout", "main"], &repo.path());
 }
 
 #[test]
