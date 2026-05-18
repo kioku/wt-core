@@ -656,6 +656,12 @@ pub fn merge(
         .map(str::to_string)
         .map(Ok)
         .unwrap_or_else(|| git::resolve_mainline(repo))?;
+    if target_branch.as_str() == mainline {
+        return Err(AppError::invariant(
+            "refusing to merge a branch into itself".to_string(),
+        ));
+    }
+
     let main_wt_branch = worktrees
         .iter()
         .find(|w| w.is_main)
@@ -669,12 +675,6 @@ pub fn merge(
             "main worktree is on '{}', expected '{mainline}' — {checkout_hint}",
             main_wt_branch.unwrap_or("(detached)")
         )));
-    }
-
-    if target_branch.as_str() == mainline {
-        return Err(AppError::invariant(
-            "refusing to merge a branch into itself".to_string(),
-        ));
     }
 
     // Attempt the merge from the main worktree's context.
