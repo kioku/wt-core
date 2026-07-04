@@ -395,7 +395,13 @@ fn invalid_ref_char(ch: char) -> bool {
 }
 
 fn invalid_ref_segment(segment: &str) -> bool {
-    segment.is_empty() || segment == "." || segment == ".." || segment.ends_with(".lock")
+    segment.is_empty()
+        || segment == "."
+        || segment == ".."
+        || segment == "@"
+        || segment.starts_with('.')
+        || segment.ends_with('.')
+        || segment.ends_with(".lock")
 }
 
 fn validate_sha(sha: &str) -> Result<()> {

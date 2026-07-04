@@ -232,22 +232,34 @@ fn materialize_rejects_invalid_sha_and_unsafe_ref_before_git() {
         .code(1)
         .stderr(predicate::str::contains("40-character"));
 
-    wt_core()
-        .arg("materialize")
-        .arg("--repo-slug")
-        .arg("owner/repo")
-        .arg("--remote-url")
-        .arg(file_url(&repo.origin_path()))
-        .arg("--ref")
-        .arg("refs/heads/main..evil")
-        .arg("--sha")
-        .arg(sha)
-        .arg("--workspace-root")
-        .arg(root.path().join("bad-ref"))
-        .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("invalid --ref"));
+    for (ref_name, workspace_name) in [
+        ("refs/heads/main..evil", "bad-ref-dotdot"),
+        ("refs/heads/.hidden", "bad-ref-hidden"),
+        ("refs/heads/main.", "bad-ref-trailing-dot"),
+        ("@", "bad-ref-at"),
+    ] {
+        let workspace = root.path().join(workspace_name);
+        wt_core()
+            .arg("materialize")
+            .arg("--repo-slug")
+            .arg("owner/repo")
+            .arg("--remote-url")
+            .arg(file_url(&repo.origin_path()))
+            .arg("--ref")
+            .arg(ref_name)
+            .arg("--sha")
+            .arg(&sha)
+            .arg("--workspace-root")
+            .arg(&workspace)
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("invalid --ref"));
+        assert!(
+            !workspace.exists(),
+            "validation should happen before git setup"
+        );
+    }
 }
 
 #[test]
