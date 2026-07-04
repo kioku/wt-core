@@ -48,10 +48,11 @@ these conventions upfront makes everything else predictable.
 ```
 wt add <branch> [--base <rev>]         Create a worktree and branch
 wt go [<branch>] [-i]                  Switch to an existing worktree
-wt list                                List all worktrees
+wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
-wt diff [<branch>] [--dry-run]         Open difftool for a branch vs mainline
+wt diff [<branch>] [--dry-run]         Open difftool for branch or dirty changes
+wt materialize --sha <sha> ...         Create an explicit detached checkout
 wt prune [--execute] [--force]         Remove worktrees integrated into mainline
 wt doctor                              Diagnose worktree/repo health
 ```
@@ -84,11 +85,17 @@ wt go -i               # force picker even with one candidate
 ### `wt list`
 
 Lists all worktrees with branch, commit, and status information. The current
-worktree (based on `cwd`) is marked with `← here`.
+worktree (based on `cwd`) is marked with `← here`. Use `--stats` to include
+commit and diff statistics for each non-main worktree against the resolved
+mainline, or `--against <rev>` to compare against another revision.
 
 ```
 /home/user/repo                                    main                 a1b2c3d [main]
 /home/user/repo/.worktrees/feature-auth--d4e5f6a7   feature/auth         b2c3d4e ← here
+
+wt list --stats
+wt list --stats --against develop
+wt list --stats --color never
 ```
 
 ### `wt remove`
@@ -122,13 +129,36 @@ wt merge --no-cleanup            # keep worktree and branch after merge
 
 Opens Git's configured difftool in directory-diff mode for a worktree branch
 against the auto-detected mainline. When called without a branch in a TTY, a
-fuzzy picker containing non-main worktrees is shown.
+fuzzy picker containing non-main worktrees is shown. Use dirty modes to inspect
+uncommitted changes in the selected worktree instead of branch history.
 
 ```
 wt diff feature/auth                 # git difftool --dir-diff main...feature/auth
 wt diff --against develop feature/auth
 wt diff --tool vimdiff feature/auth
 wt diff --dry-run feature/auth       # print the resolved git command
+wt diff --dirty feature/auth         # all uncommitted changes
+wt diff --staged feature/auth        # staged changes only
+wt diff --unstaged feature/auth      # unstaged changes only
+```
+
+### `wt materialize`
+
+Creates a clean detached checkout for a full commit SHA at an explicit absolute
+workspace path. This is intended for automation that needs to materialize an
+exact repository state without creating or managing a local branch. `--cache-root`
+keeps a conservative bare mirror cache per repository slug; `--object-source`
+uses a read-only bare repository instead and takes precedence over cache use.
+
+```
+wt materialize \
+  --repo-slug owner/repo \
+  --remote-url https://github.com/owner/repo.git \
+  --ref main \
+  --sha 0123456789abcdef0123456789abcdef01234567 \
+  --cache-root /var/cache/wt-core \
+  --workspace-root /tmp/workspaces/owner-repo-01234567 \
+  --json
 ```
 
 ### `wt prune`
