@@ -5,6 +5,51 @@ All notable changes to this project will be documented in this file.
 This changelog is generated automatically by [git-cliff](https://git-cliff.org/)
 during the release workflow and is append-only — existing entries are never modified.
 
+## [0.4.0](https://github.com/kioku/wt-core/releases/tag/v0.4.0) — 2026-07-04
+
+### Bug Fixes
+
+- Avoid pnpm node_modules symlinks
+- Deduplicate parsed worktree paths
+- Reject empty diff tool names
+- Expose list stats in nushell binding
+- Align list stats table dynamically
+- Remove unrelated nushell binding changes
+- Measure visible stats columns by characters
+- Preserve nu list stats options
+- Measure stats columns by display width
+- Ignore difftool help section headings
+- Enforce merge --into invariants
+- Reject unsafe materialize repo slugs
+- Reject malformed materialize refs
+
+### Documentation
+
+- Update changelog for v0.3.1
+- Document binary numstat handling
+
+### Features
+
+- Add list stats flags
+- Compute list git stats
+- Colorize list stats output
+- Add worktree diff command
+- Add diff dirty mode flags
+- Run dirty worktree diffs
+- Add difftool preflight
+- Support merge into target branch
+- Add materialize cli surface
+- Implement detached materialization
+
+### Miscellaneous
+
+- Bump tempfile from 3.26.0 to 3.27.0
+- Bump assert_cmd from 2.1.2 to 2.2.1 (#41)
+- Bump clap from 4.5.60 to 4.6.1 (#42)
+- Bump codecov/codecov-action from 5 to 6
+- Bump softprops/action-gh-release from 2 to 3
+- Bump assert_cmd from 2.2.1 to 2.2.2 (#59)
+
 ## [0.3.1](https://github.com/kioku/wt-core/releases/tag/v0.3.1) — 2026-03-03
 
 ### Bug Fixes
