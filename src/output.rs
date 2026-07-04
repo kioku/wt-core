@@ -356,6 +356,32 @@ pub struct JsonMergeResponse {
     pub pushed: bool,
 }
 
+/// JSON response for the materialize command.
+#[derive(Debug, Serialize)]
+pub struct JsonMaterializeResponse {
+    pub ok: bool,
+    pub repository: String,
+    pub workspace_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub requested_ref: Option<String>,
+    pub requested_sha: String,
+    pub resolved_commit: String,
+    pub mode: String,
+    pub cache_status: String,
+    pub source: String,
+    pub timings_ms: JsonMaterializeTimings,
+}
+
+#[derive(Debug, Serialize)]
+pub struct JsonMaterializeTimings {
+    pub cache_lock: u64,
+    pub cache_refresh: u64,
+    pub workspace_checkout: u64,
+    pub total: u64,
+}
+
 /// JSON response for the setup command.
 #[derive(Debug, Serialize)]
 pub struct JsonSetupResponse {
