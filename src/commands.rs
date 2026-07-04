@@ -1,15 +1,15 @@
 use std::io::IsTerminal;
 use std::path::PathBuf;
 
-use crate::cli::{Cli, ColorChoice, Command, Shell};
+use crate::cli::{Cli, ColorChoice, Command, MaterializeMode, Shell};
 use crate::domain::{self, BranchName, WorktreeStatsStatus};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse, JsonMergeResponse,
-    JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry,
-    JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat,
-    StatusFormat,
+    find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse,
+    JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse, JsonPruneDryRunEntry,
+    JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
+    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
 };
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
@@ -74,6 +74,29 @@ pub fn run(cli: Cli) -> Result<()> {
             no_cleanup,
             repo,
             merge_fmt(json, print_paths),
+        ),
+        Command::Materialize {
+            repo_slug,
+            remote_url,
+            ref_,
+            sha,
+            cache_root,
+            workspace_root,
+            object_source,
+            mode,
+            json,
+        } => cmd_materialize(
+            crate::materialize::MaterializeOptions {
+                repo_slug,
+                remote_url,
+                ref_name: ref_,
+                sha,
+                cache_root,
+                workspace_root,
+                object_source,
+                mode,
+            },
+            json,
         ),
         Command::Diff {
             branch,
@@ -162,6 +185,44 @@ fn resolve_repo(repo: Option<PathBuf>) -> Result<domain::RepoRoot> {
 }
 
 // ── Commands ────────────────────────────────────────────────────────
+
+fn cmd_materialize(options: crate::materialize::MaterializeOptions, json: bool) -> Result<()> {
+    if options.mode != MaterializeMode::Detached {
+        return Err(AppError::usage(
+            "only detached materialize mode is supported".to_string(),
+        ));
+    }
+
+    let result = crate::materialize::materialize(options)?;
+    if json {
+        print_json(&JsonMaterializeResponse {
+            ok: true,
+            repository: result.repository,
+            workspace_path: result.workspace_path.display().to_string(),
+            cache_path: result.cache_path.map(|p| p.display().to_string()),
+            requested_ref: result.requested_ref,
+            requested_sha: result.requested_sha,
+            resolved_commit: result.resolved_commit,
+            mode: result.mode.to_string(),
+            cache_status: result.cache_status.to_string(),
+            source: result.source.to_string(),
+            timings_ms: JsonMaterializeTimings {
+                cache_lock: result.timings.cache_lock,
+                cache_refresh: result.timings.cache_refresh,
+                workspace_checkout: result.timings.workspace_checkout,
+                total: result.timings.total,
+            },
+        })?;
+    } else {
+        println!(
+            "Materialized {} at {} ({})",
+            result.resolved_commit,
+            result.workspace_path.display(),
+            result.mode
+        );
+    }
+    Ok(())
+}
 
 fn cmd_list(
     repo: Option<PathBuf>,

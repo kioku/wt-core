@@ -134,6 +134,54 @@ pub enum Command {
         print_paths: bool,
     },
 
+    /// Materialize an explicit detached checkout at a workspace path
+    ///
+    /// Creates a clean detached checkout for a full commit SHA at an explicit
+    /// absolute --workspace-root. When --cache-root is provided, wt-core keeps
+    /// a conservative bare mirror cache under <cache-root>/<safe-repo-key>.git
+    /// and serializes refreshes per repository. When --object-source is
+    /// provided, it is treated as a read-only bare repository and takes
+    /// precedence over cache use. JSON output includes repository,
+    /// workspace_path, cache_path, requested_ref, requested_sha,
+    /// resolved_commit, mode, cache_status, source, and timings_ms.
+    Materialize {
+        /// Relative owner/repository-style repository slug
+        #[arg(long)]
+        repo_slug: String,
+
+        /// Remote repository URL used for fetching or cache population
+        #[arg(long)]
+        remote_url: Option<String>,
+
+        /// Ref used as fetch/reachability context
+        #[arg(long = "ref")]
+        ref_: Option<String>,
+
+        /// Full 40-character commit SHA to check out
+        #[arg(long)]
+        sha: String,
+
+        /// Absolute directory containing wt-core bare mirror caches
+        #[arg(long)]
+        cache_root: Option<PathBuf>,
+
+        /// Absolute path where the detached workspace will be created
+        #[arg(long)]
+        workspace_root: PathBuf,
+
+        /// Absolute path to a read-only bare repository used as an object source
+        #[arg(long)]
+        object_source: Option<PathBuf>,
+
+        /// Checkout mode; only detached is supported in this version
+        #[arg(long, value_enum, default_value_t = MaterializeMode::Detached)]
+        mode: MaterializeMode,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Open a difftool for a worktree branch or dirty worktree changes
     Diff {
         /// Branch name of the worktree to diff
@@ -230,6 +278,11 @@ pub enum Shell {
     Zsh,
     Fish,
     Nu,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializeMode {
+    Detached,
 }
 
 #[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
