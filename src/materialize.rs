@@ -267,7 +267,7 @@ fn validate_repo_slug(slug: &str) -> Result<String> {
     }
 
     let segments: Vec<&str> = slug.split('/').collect();
-    if segments.len() < 2 || segments.iter().any(invalid_slug_segment) {
+    if segments.len() != 2 || segments.iter().any(invalid_slug_segment) {
         return Err(AppError::usage("invalid --repo-slug".to_string()));
     }
 
@@ -275,7 +275,12 @@ fn validate_repo_slug(slug: &str) -> Result<String> {
 }
 
 fn invalid_slug_segment(segment: &&str) -> bool {
-    segment.is_empty() || *segment == "." || *segment == ".." || segment.contains('\\')
+    segment.is_empty()
+        || *segment == "."
+        || *segment == ".."
+        || !segment
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-'))
 }
 
 fn slug_contains_control(slug: &str) -> bool {

@@ -189,6 +189,29 @@ fn materialize_rejects_existing_non_empty_workspace() {
 }
 
 #[test]
+fn materialize_rejects_unsafe_repo_slugs_before_git() {
+    let root = tempfile::tempdir().expect("temp dir");
+    let valid_sha = "0123456789abcdef0123456789abcdef01234567";
+
+    for slug in ["owner/repo/sub", "owner/re po", "owner/repo?", "../repo"] {
+        wt_core()
+            .arg("materialize")
+            .arg("--repo-slug")
+            .arg(slug)
+            .arg("--object-source")
+            .arg(root.path().join("missing.git"))
+            .arg("--sha")
+            .arg(valid_sha)
+            .arg("--workspace-root")
+            .arg(root.path().join("workspace"))
+            .assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("invalid --repo-slug"));
+    }
+}
+
+#[test]
 fn materialize_rejects_invalid_sha_and_unsafe_ref_before_git() {
     let repo = fixtures::ClonedTestRepo::new();
     let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
