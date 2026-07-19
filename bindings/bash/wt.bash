@@ -171,6 +171,13 @@ wt() {
                 return $rc
             fi
 
+            for arg in "$@"; do
+                if [ "$arg" = "--inspect" ]; then
+                    wt-core merge "$@"
+                    return $?
+                fi
+            done
+
             local cwd_before
             cwd_before=$(pwd)
             # --print-paths-v2 preserves the six legacy fields and appends

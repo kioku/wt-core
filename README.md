@@ -51,6 +51,7 @@ wt go [<branch>] [-i]                  Switch to an existing worktree
 wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
+wt merge [<branch>] --inspect         Inspect merge topology without mutation
 wt diff [<branch>] [--dry-run]         Open difftool for branch or dirty changes
 wt materialize --sha <sha> ...         Create an explicit detached checkout
 wt prune [--execute] [--force]         Remove worktrees integrated into mainline
@@ -124,7 +125,23 @@ wt merge feature/auth --into rc  # merge into checked-out branch rc
 wt merge feature/auth --into release/1.0  # destination may be linked
 wt merge --push                  # push target branch to origin after merge
 wt merge --no-cleanup            # keep worktree and branch after merge
+wt merge feature/auth --inspect  # report topology without changing the repo
 ```
+
+Before a merge, wt-core reports the destination's configured upstream and
+commit counts. Synchronized destinations are ready to merge; destinations
+that are ahead are called out prominently because a subsequent push includes
+those local commits. Destinations behind or diverged from their upstream are
+refused before Git's content merge starts, so update or reconcile the target
+first. A configured upstream whose remote-tracking ref is unavailable is also
+refused rather than treated as an untracked destination. A source that appears
+in a standard Git revert record is reported as previously merged then reverted.
+
+`--inspect` performs the same read-only preflight and never fetches, prunes
+worktree metadata, merges, pushes, or cleans up. With `--json`, the
+`preflight` object contains `upstream`, `ahead`, `behind`, `topology`, source
+history, and any structured refusal reason. Topology refusals are distinct
+from `content_conflict` refusals.
 
 ### `wt diff`
 
@@ -203,6 +220,7 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
 | `--print-paths`   | Version 1 merge metadata on stdout (for wrappers) |
 | `--print-paths-v2` | Version 2 merge metadata, including destination path (for wrappers) |
+| `--inspect` | Read-only merge topology preflight (use with `--json` for facts) |
 
 `--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
 

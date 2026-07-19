@@ -98,7 +98,14 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
 pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     // Prune stale worktrees first (matches current behavior expectation).
     let _ = git(&["worktree", "prune"], repo.as_ref());
+    list_worktrees_readonly(repo)
+}
 
+/// List worktrees without pruning Git's worktree metadata.
+///
+/// Merge preflight and `--inspect` use this variant so inspection never
+/// changes repository state, including stale-worktree administrative files.
+pub fn list_worktrees_readonly(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     let raw = git(&["worktree", "list", "--porcelain"], repo.as_ref())?;
     parse_worktree_porcelain(&raw, repo)
 }
@@ -301,6 +308,17 @@ fn resolve_origin_head(repo: &RepoRoot) -> Option<String> {
 /// 3. Local branch named `master`
 /// 4. The main worktree's branch (first entry from `git worktree list`)
 pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
+    resolve_mainline_with_worktree_listing(repo, true)
+}
+
+/// Resolve the mainline without pruning worktree metadata.
+///
+/// This is used by merge preflight because inspection must be read-only.
+pub fn resolve_mainline_readonly(repo: &RepoRoot) -> Result<String> {
+    resolve_mainline_with_worktree_listing(repo, false)
+}
+
+fn resolve_mainline_with_worktree_listing(repo: &RepoRoot, prune: bool) -> Result<String> {
     // 1. Try origin/HEAD — prefer the local branch name if it exists,
     //    otherwise use the full remote ref so git commands can resolve it
     //    even when there is no local tracking branch.
@@ -321,7 +339,11 @@ pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
     }
 
     // 4. Fall back to main worktree's branch
-    let worktrees = list_worktrees(repo)?;
+    let worktrees = if prune {
+        list_worktrees(repo)?
+    } else {
+        list_worktrees_readonly(repo)?
+    };
     worktrees
         .iter()
         .find(|wt| wt.is_main)
@@ -331,6 +353,127 @@ pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
                 "could not determine mainline branch; use --mainline to specify".to_string(),
             )
         })
+}
+
+/// Return the configured upstream ref for a checked-out branch.
+///
+/// `for-each-ref` reads branch configuration without requiring the upstream
+/// object to exist. This keeps a configured-but-stale remote visible to
+/// callers instead of misreporting it as a branch with no upstream.
+pub fn branch_upstream(path: &Path, branch: &str) -> Result<Option<String>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let output = git(
+        &["for-each-ref", "--format=%(upstream:short)", &branch_ref],
+        path,
+    )?;
+    Ok((!output.is_empty()).then_some(output))
+}
+
+/// Return ahead and behind commit counts for a branch and its upstream.
+///
+/// The first value is commits the branch is behind; the second is commits it
+/// is ahead, matching Git's `--left-right --count` ordering. `None` means the
+/// configured upstream ref is unavailable locally; this is distinct from a
+/// branch with no configured upstream.
+pub fn upstream_counts(path: &Path, upstream: &str, branch: &str) -> Result<Option<(u32, u32)>> {
+    if !git_success(&["rev-parse", "--verify", upstream], path) {
+        return Ok(None);
+    }
+
+    let range = format!("{upstream}...{branch}");
+    let output = git(&["rev-list", "--left-right", "--count", &range], path)?;
+    let mut fields = output.split_whitespace();
+    let behind = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| AppError::git("failed to parse upstream behind count".to_string()))?;
+    let ahead = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| AppError::git("failed to parse upstream ahead count".to_string()))?;
+    Ok(Some((ahead, behind)))
+}
+
+/// Find a standard Git revert commit that refers to source history.
+///
+/// Git records the reverted object in the body as `This reverts commit ...`.
+/// A marker alone is not enough: the reverted object must be in the
+/// destination history, and either the object itself or (for a reverted merge)
+/// its second parent must be reachable from `source`. This avoids warning for
+/// a revert message that merely names an unrelated object.
+pub fn reverted_source_commit(
+    path: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<Option<String>> {
+    let log = git(&["log", "--format=%H%x00%P%x00%B%x1e", destination], path)?;
+    let source_was_merged =
+        git_success(&["merge-base", "--is-ancestor", source, destination], path);
+    let common_base = git(&["merge-base", source, destination], path).ok();
+
+    for record in log.split('\x1e') {
+        let mut fields = record.splitn(3, '\0');
+        let Some(_revert_commit) = fields.next() else {
+            continue;
+        };
+        let Some(_revert_parents) = fields.next() else {
+            continue;
+        };
+        let Some(message) = fields.next() else {
+            continue;
+        };
+        let Some(marker) = message.find("This reverts commit ") else {
+            continue;
+        };
+        let start = marker + "This reverts commit ".len();
+        let Some(reverted) = message[start..]
+            .split(|character: char| !character.is_ascii_hexdigit())
+            .next()
+            .filter(|value| value.len() == 40)
+        else {
+            continue;
+        };
+
+        if !git_success(
+            &["merge-base", "--is-ancestor", reverted, destination],
+            path,
+        ) {
+            continue;
+        }
+
+        let reverted_parents = match git(&["show", "-s", "--format=%P", reverted], path) {
+            Ok(parents) => parents,
+            Err(_) => continue,
+        };
+        let parents: Vec<&str> = reverted_parents.split_whitespace().collect();
+        let source_history_commit = parents
+            .get(1)
+            .copied()
+            .filter(|second_parent| {
+                git_success(
+                    &["merge-base", "--is-ancestor", second_parent, source],
+                    path,
+                )
+            })
+            .unwrap_or(reverted);
+        let is_shared_base = common_base.as_deref().is_some_and(|base| {
+            git_success(
+                &["merge-base", "--is-ancestor", source_history_commit, base],
+                path,
+            )
+        });
+        if !source_was_merged && is_shared_base {
+            continue;
+        }
+        if git_success(
+            &["merge-base", "--is-ancestor", source_history_commit, source],
+            path,
+        ) {
+            return Ok(Some(reverted.to_string()));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Compute commit and diff stats for `branch` against `base`.

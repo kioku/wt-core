@@ -150,6 +150,13 @@ function wt --description "Git worktree manager"
                 return $rc
             end
 
+            for arg in $argv
+                if test "$arg" = "--inspect"
+                    wt-core merge $argv
+                    return $status
+                end
+            end
+
             set -l cwd_before (pwd)
             # --print-paths-v2 preserves the six legacy fields and appends
             # destination_path as field seven.

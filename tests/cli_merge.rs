@@ -1053,6 +1053,466 @@ fn merge_refuses_preexisting_destination_merge_without_aborting_it() {
     );
 }
 
+// ── Merge topology preflight tests ─────────────────────────────────
+
+#[test]
+fn merge_json_distinguishes_content_conflict_from_topology_refusal() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/json-conflict", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-json-conflict");
+    commit_file(&source, "shared.txt", "source", "source conflict");
+    commit_file(
+        &repo.path(),
+        "shared.txt",
+        "destination",
+        "destination conflict",
+    );
+    let destination_before = git_rev_parse(&repo.path(), "HEAD");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/json-conflict",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(5)
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["preflight"]["topology"], "no_upstream");
+    assert_eq!(json["refusal"]["kind"], "content");
+    assert_eq!(json["refusal"]["reason"], "content_conflict");
+    assert_eq!(git_rev_parse(&repo.path(), "HEAD"), destination_before);
+    assert!(source.exists(), "content conflict must preserve the source");
+}
+
+#[test]
+fn merge_inspect_reports_synchronized_topology_without_mutation() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/inspect", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-inspect");
+    commit_file(&source, "inspect.txt", "inspect", "inspect");
+    let main_before = git_rev_parse(&repo.path(), "main");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/inspect",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["inspect"], true);
+    assert_eq!(json["preflight"]["upstream"], "origin/main");
+    assert_eq!(json["preflight"]["ahead"], 0);
+    assert_eq!(json["preflight"]["behind"], 0);
+    assert_eq!(json["preflight"]["topology"], "synchronized");
+    assert_eq!(json["preflight"]["allowed"], true);
+    assert_eq!(git_rev_parse(&repo.path(), "main"), main_before);
+    assert!(
+        source.exists(),
+        "inspect must not clean up the source worktree"
+    );
+}
+
+#[test]
+fn merge_inspect_reports_absent_upstream_without_inventing_remote_state() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/no-upstream", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-no-upstream");
+    commit_file(
+        &source,
+        "no-upstream.txt",
+        "source",
+        "source without upstream",
+    );
+    let status_before = git_status(&repo.path());
+    let worktree_admin_before = worktree_admin_snapshot(&repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/no-upstream",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert!(json["preflight"]["upstream"].is_null());
+    assert_eq!(json["preflight"]["ahead"], serde_json::Value::Null);
+    assert_eq!(json["preflight"]["behind"], serde_json::Value::Null);
+    assert_eq!(json["preflight"]["topology"], "no_upstream");
+    assert_eq!(json["preflight"]["allowed"], true);
+    assert_eq!(git_status(&repo.path()), status_before);
+    assert_eq!(worktree_admin_snapshot(&repo.path()), worktree_admin_before);
+    assert!(
+        source.exists(),
+        "inspect must not clean up the source worktree"
+    );
+}
+
+#[test]
+fn merge_inspect_refuses_configured_upstream_missing_remote_ref() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    run_git(
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+        &repo.path(),
+    );
+
+    wt_core()
+        .args(["add", "feature/stale-upstream", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-stale-upstream");
+    commit_file(&source, "stale.txt", "source", "source with stale upstream");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/stale-upstream",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["preflight"]["upstream"], "origin/main");
+    assert_eq!(json["preflight"]["topology"], "upstream_unavailable");
+    assert_eq!(json["preflight"]["allowed"], false);
+    assert_eq!(json["refusal"]["kind"], "topology");
+    assert_eq!(
+        json["refusal"]["reason"],
+        "destination_upstream_unavailable"
+    );
+    assert!(
+        source.exists(),
+        "inspect must not clean up the source worktree"
+    );
+}
+
+#[test]
+fn merge_reports_ahead_destination_before_merging() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+
+    commit_file(
+        &repo.path(),
+        "local.txt",
+        "local",
+        "local destination commit",
+    );
+    wt_core()
+        .args(["add", "feature/ahead", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-ahead");
+    commit_file(&source, "ahead.txt", "ahead", "ahead source");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/ahead",
+            "--no-cleanup",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("AHEAD"))
+        .stdout(predicate::str::contains("ahead 1, behind 0"));
+}
+
+#[test]
+fn merge_inspect_reports_behind_destination() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+
+    // Move origin/main forward, then leave the checked-out destination one
+    // commit behind it. Preflight must report this without fetching.
+    commit_file(
+        &repo.path(),
+        "remote.txt",
+        "remote",
+        "remote destination commit",
+    );
+    run_git(&["push", "origin", "main"], &repo.path());
+    run_git(&["reset", "--hard", "HEAD~1"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/behind", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-behind");
+    commit_file(&source, "behind.txt", "behind", "behind source");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/behind",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["preflight"]["topology"], "behind");
+    assert_eq!(json["preflight"]["ahead"], 0);
+    assert_eq!(json["preflight"]["behind"], 1);
+    assert_eq!(json["preflight"]["allowed"], false);
+    assert_eq!(json["refusal"]["reason"], "destination_behind_upstream");
+    assert!(
+        source.exists(),
+        "inspect must not clean up the source worktree"
+    );
+}
+
+#[test]
+fn merge_rejects_diverged_destination_before_mutation_with_json_reason() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/diverged-topology", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-diverged-topology");
+    commit_file(&source, "source.txt", "source", "source");
+
+    run_git(&["checkout", "-b", "remote-simulation"], &repo.path());
+    commit_file(&repo.path(), "remote.txt", "remote", "remote");
+    let remote_head = git_rev_parse(&repo.path(), "HEAD");
+    run_git(&["checkout", "main"], &repo.path());
+    run_git(&["branch", "-D", "remote-simulation"], &repo.path());
+    run_git(
+        &["update-ref", "refs/remotes/origin/main", &remote_head],
+        &repo.path(),
+    );
+    commit_file(&repo.path(), "local.txt", "local", "local");
+    let main_before = git_rev_parse(&repo.path(), "main");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/diverged-topology",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(5)
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["preflight"]["topology"], "diverged");
+    assert_eq!(json["preflight"]["ahead"], 1);
+    assert_eq!(json["preflight"]["behind"], 1);
+    assert_eq!(json["preflight"]["allowed"], false);
+    assert_eq!(json["refusal"]["kind"], "topology");
+    assert_eq!(
+        json["refusal"]["reason"],
+        "destination_diverged_from_upstream"
+    );
+    assert_eq!(git_rev_parse(&repo.path(), "main"), main_before);
+    assert!(source.exists(), "topology refusal must preserve the source");
+}
+
+#[test]
+fn merge_inspect_explains_merged_then_reverted_source() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/reverted", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-reverted");
+    commit_file(&source, "reverted.txt", "reverted", "reverted source");
+    run_git(
+        &[
+            "merge",
+            "--no-ff",
+            "feature/reverted",
+            "-m",
+            "Merge branch 'feature/reverted'",
+        ],
+        &repo.path(),
+    );
+    run_git(&["revert", "-m", "1", "HEAD", "--no-edit"], &repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/reverted",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["preflight"]["source_history"], "merged_then_reverted");
+    assert_eq!(json["preflight"]["source_was_merged"], true);
+    assert_eq!(json["preflight"]["source_was_reverted"], true);
+    assert!(
+        json["preflight"]["reverted_commit"]
+            .as_str()
+            .is_some_and(|sha| sha.len() == 40),
+        "reverted commit should be exposed"
+    );
+    assert!(
+        source.exists(),
+        "inspect must not clean up the source worktree"
+    );
+}
+
+#[test]
+fn merge_inspect_ignores_revert_marker_for_unmerged_source() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/unmerged-revert", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-unmerged-revert");
+    commit_file(&source, "unmerged.txt", "source", "unmerged source");
+    let shared_base = git_rev_parse(&repo.path(), "main");
+    let message =
+        format!("Revert a shared base, not the source\n\nThis reverts commit {shared_base}.");
+    run_git(&["commit", "--allow-empty", "-m", &message], &repo.path());
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/unmerged-revert",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["preflight"]["source_history"], "not_merged");
+    assert_eq!(json["preflight"]["source_was_merged"], false);
+    assert_eq!(json["preflight"]["source_was_reverted"], false);
+    assert!(json["preflight"]["reverted_commit"].is_null());
+    assert!(
+        source.exists(),
+        "inspect must not clean up the source worktree"
+    );
+}
+
+#[test]
+fn merge_inspect_reports_linked_destination_topology() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/inspect");
+    run_git(&["push", "-u", "origin", "release/inspect"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/linked-inspect", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-linked-inspect");
+    commit_file(&source, "linked-inspect.txt", "linked", "linked inspect");
+    let destination_before = git_rev_parse(&destination, "HEAD");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/linked-inspect",
+            "--into",
+            "release/inspect",
+            "--inspect",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["preflight"]["destination"], "release/inspect");
+    assert_eq!(
+        json["preflight"]["destination_path"],
+        destination.display().to_string()
+    );
+    assert_eq!(json["preflight"]["topology"], "synchronized");
+    assert_eq!(git_rev_parse(&destination, "HEAD"), destination_before);
+    assert!(
+        source.exists(),
+        "linked inspect must not clean up the source"
+    );
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 /// Run a git command and return its raw output, allowing expected failures.
@@ -1079,6 +1539,47 @@ fn git_path(cwd: &std::path::Path, marker: &str) -> std::path::PathBuf {
     } else {
         cwd.join(path)
     }
+}
+
+/// Resolve a revision to its full commit ID.
+fn git_rev_parse(repo: &std::path::Path, revision: &str) -> String {
+    let mut cmd = StdCommand::new("git");
+    cmd.args(["rev-parse", revision]).current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("git rev-parse failed");
+    assert!(
+        output.status.success(),
+        "git rev-parse {revision} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string()
+}
+
+/// Snapshot Git's per-worktree administrative entries without pruning them.
+fn worktree_admin_snapshot(repo: &std::path::Path) -> Vec<(String, String)> {
+    let admin_dir = repo.join(".git/worktrees");
+    let Ok(entries) = std::fs::read_dir(admin_dir) else {
+        return Vec::new();
+    };
+
+    let mut snapshot = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let gitdir = std::fs::read_to_string(path.join("gitdir")).unwrap_or_default();
+        let head = std::fs::read_to_string(path.join("HEAD")).unwrap_or_default();
+        snapshot.push((name, format!("{gitdir}\0{head}")));
+    }
+    snapshot.sort();
+    snapshot
 }
 
 /// Get the git log as one-line entries.

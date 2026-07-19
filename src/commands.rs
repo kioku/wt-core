@@ -7,9 +7,10 @@ use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
     find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse,
-    JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse, JsonPruneDryRunEntry,
-    JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
-    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    JsonMaterializeResponse, JsonMaterializeTimings, JsonMergePreflight, JsonMergeRefusal,
+    JsonMergeResponse, JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse,
+    JsonPrunedEntry, JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat,
+    RemoveFormat, StatusFormat,
 };
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
@@ -62,6 +63,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Merge {
             branch,
             into,
+            inspect,
             push,
             no_cleanup,
             repo,
@@ -71,6 +73,7 @@ pub fn run(cli: Cli) -> Result<()> {
         } => cmd_merge(
             branch.as_deref().map(BranchName::new),
             into,
+            inspect,
             push,
             no_cleanup,
             repo,
@@ -1051,6 +1054,7 @@ fn resolve_diff_branch(repo: &domain::RepoRoot) -> Result<BranchName> {
 fn cmd_merge(
     branch: Option<BranchName>,
     into: Option<String>,
+    inspect: bool,
     push: bool,
     no_cleanup: bool,
     repo: Option<PathBuf>,
@@ -1059,24 +1063,48 @@ fn cmd_merge(
     let repo = resolve_repo(repo)?;
 
     let resolved_branch = match branch {
-        Some(b) => Some(b),
+        Some(branch) => Some(branch),
         None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge")?,
     };
+    let preflight = worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref())?;
 
-    let result = worktree::merge(
-        &repo,
-        resolved_branch.as_ref(),
-        into.as_deref(),
-        push,
-        no_cleanup,
-    )?;
+    if inspect {
+        return print_merge_inspection(&repo, &preflight, fmt);
+    }
+
+    if fmt == MergeFormat::Human {
+        print_merge_preflight(&preflight);
+    }
+
+    if let Some(refusal) = &preflight.refusal {
+        let error = AppError::conflict(refusal.message.clone());
+        return report_merge_failure(&repo, &preflight, fmt, error, None);
+    }
+
+    let preflight_for_error = preflight.clone();
+    let result = match worktree::merge_with_preflight(&repo, preflight, push, no_cleanup) {
+        Ok(result) => result,
+        Err(error) => {
+            return report_merge_failure(
+                &repo,
+                &preflight_for_error,
+                fmt,
+                error,
+                Some(JsonMergeRefusal {
+                    kind: "content".to_string(),
+                    reason: "content_conflict".to_string(),
+                    message: Some("destination content conflicts with the source".to_string()),
+                }),
+            )
+        }
+    };
 
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;
     let removed_str = result
         .removed_path
         .as_ref()
-        .map(|p| p.display().to_string())
+        .map(|path| path.display().to_string())
         .unwrap_or_default();
 
     match fmt {
@@ -1118,6 +1146,9 @@ fn cmd_merge(
                     None
                 },
                 pushed: result.pushed,
+                preflight: Some(JsonMergePreflight::from_preflight(&result.preflight)),
+                refusal: None,
+                inspect: false,
             })?;
         }
         MergeFormat::Human => {
@@ -1134,10 +1165,167 @@ fn cmd_merge(
             }
         }
     }
-    for w in &result.warnings {
-        eprintln!("warning: {w}");
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+fn print_merge_preflight(preflight: &worktree::MergePreflight) {
+    println!(
+        "Merge preflight: destination '{}' at {}",
+        preflight.destination,
+        preflight.destination_path.display()
+    );
+    match (&preflight.upstream, preflight.ahead, preflight.behind) {
+        (Some(upstream), Some(ahead), Some(behind)) => {
+            println!("  Destination upstream: {upstream}");
+            println!(
+                "  Topology: {} (ahead {ahead}, behind {behind})",
+                merge_topology_label(preflight.topology)
+            );
+            if preflight.topology == worktree::MergeTopology::Ahead {
+                println!(
+                    "  WARNING: destination is AHEAD of upstream by {ahead} commit{}; merge/push will preserve those local commits",
+                    if ahead == 1 { "" } else { "s" }
+                );
+            }
+        }
+        (Some(upstream), None, None) => {
+            println!("  Destination upstream: {upstream} (unavailable locally)");
+            println!(
+                "  Topology: {} (ahead/behind counts unavailable)",
+                merge_topology_label(preflight.topology)
+            );
+        }
+        (None, _, _) => {
+            println!("  Destination upstream: none");
+            println!("  Topology: no upstream (ahead/behind counts unavailable)");
+        }
+        _ => {
+            println!("  Destination upstream: unavailable");
+            println!(
+                "  Topology: {} (ahead/behind counts unavailable)",
+                merge_topology_label(preflight.topology)
+            );
+        }
+    }
+
+    print_source_history(preflight);
+    match &preflight.refusal {
+        Some(refusal) => println!("  REFUSED ({}): {}", refusal.kind, refusal.message),
+        None => println!("  Result: ready for content merge"),
+    }
+}
+
+fn print_source_history(preflight: &worktree::MergePreflight) {
+    match preflight.source_history {
+        worktree::SourceHistory::NotMerged => {}
+        worktree::SourceHistory::AlreadyMerged => println!(
+            "  Source history: source '{}' is already merged into the destination",
+            preflight.source
+        ),
+        worktree::SourceHistory::MergedThenReverted => {
+            let commit = preflight
+                .reverted_commit
+                .as_deref()
+                .unwrap_or("an earlier source commit");
+            println!(
+                "  WARNING: source '{}' was previously merged then reverted (revert of {commit}); merging again may intentionally reintroduce reverted changes",
+                preflight.source
+            );
+        }
+    }
+}
+
+fn merge_topology_label(topology: worktree::MergeTopology) -> &'static str {
+    match topology {
+        worktree::MergeTopology::NoUpstream => "no upstream",
+        worktree::MergeTopology::UpstreamUnavailable => "upstream unavailable",
+        worktree::MergeTopology::Synchronized => "synchronized",
+        worktree::MergeTopology::Ahead => "ahead",
+        worktree::MergeTopology::Behind => "behind",
+        worktree::MergeTopology::Diverged => "diverged",
+    }
+}
+
+fn print_merge_inspection(
+    repo: &domain::RepoRoot,
+    preflight: &worktree::MergePreflight,
+    fmt: MergeFormat,
+) -> Result<()> {
+    match fmt {
+        MergeFormat::Json => print_json(&JsonMergeResponse {
+            ok: true,
+            event: None,
+            message: format!(
+                "inspected merge of '{}' into {}",
+                preflight.source, preflight.destination
+            ),
+            branch: preflight.source.clone(),
+            mainline: preflight.destination.clone(),
+            destination_path: preflight.destination_path.display().to_string(),
+            repo_root: repo.display().to_string(),
+            cleaned_up: false,
+            removed_path: None,
+            pushed: false,
+            preflight: Some(JsonMergePreflight::from_preflight(preflight)),
+            refusal: preflight.refusal.as_ref().map(|refusal| JsonMergeRefusal {
+                kind: refusal.kind.clone(),
+                reason: refusal.reason.clone(),
+                message: Some(refusal.message.clone()),
+            }),
+            inspect: true,
+        }),
+        MergeFormat::Human => {
+            println!(
+                "Inspecting merge of '{}' (no repository mutation)",
+                preflight.source
+            );
+            print_merge_preflight(preflight);
+            Ok(())
+        }
+        MergeFormat::PrintPaths | MergeFormat::PrintPathsV2 => Err(AppError::usage(
+            "--inspect cannot be used with path output formats".to_string(),
+        )),
+    }
+}
+
+fn report_merge_failure(
+    repo: &domain::RepoRoot,
+    preflight: &worktree::MergePreflight,
+    fmt: MergeFormat,
+    error: AppError,
+    refusal: Option<JsonMergeRefusal>,
+) -> Result<()> {
+    if fmt == MergeFormat::Json {
+        let json_refusal = refusal.or_else(|| {
+            preflight
+                .refusal
+                .as_ref()
+                .map(|preflight_refusal| JsonMergeRefusal {
+                    kind: preflight_refusal.kind.clone(),
+                    reason: preflight_refusal.reason.clone(),
+                    message: Some(preflight_refusal.message.clone()),
+                })
+        });
+        print_json(&JsonMergeResponse {
+            ok: false,
+            event: None,
+            message: error.message.clone(),
+            branch: preflight.source.clone(),
+            mainline: preflight.destination.clone(),
+            destination_path: preflight.destination_path.display().to_string(),
+            repo_root: repo.display().to_string(),
+            cleaned_up: false,
+            removed_path: None,
+            pushed: false,
+            preflight: Some(JsonMergePreflight::from_preflight(preflight)),
+            refusal: json_refusal,
+            inspect: false,
+        })?;
+    }
+    Err(error)
 }
 
 fn cmd_remove(

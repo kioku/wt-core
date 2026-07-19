@@ -133,6 +133,7 @@ export def --env "wt remove" [
 export def --env "wt merge" [
     branch?: string  # Branch name (defaults to current worktree)
     --into: string   # Merge into a branch checked out in any worktree
+    --inspect        # Inspect topology without mutating the repository
     --push           # Push mainline to origin after merge
     --no-cleanup     # Keep worktree and branch after merge
     --repo: path     # Repository path (defaults to cwd)
@@ -143,10 +144,14 @@ export def --env "wt merge" [
     mut args = ["merge"]
     if $branch != null { $args = ($args | append $branch) }
     if $into != null { $args = ($args | append ["--into" $into]) }
+    if $inspect { $args = ($args | append "--inspect") }
     if $push { $args = ($args | append "--push") }
     if $no_cleanup { $args = ($args | append "--no-cleanup") }
 
-    if $json {
+    if $inspect and not $json {
+        let full_args = (build-args $args $repo false false)
+        ^wt-core ...$full_args
+    } else if $json {
         let full_args = (build-args $args $repo true false)
         let result = (^wt-core ...$full_args | from json)
 
