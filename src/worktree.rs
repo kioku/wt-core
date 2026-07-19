@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{BranchName, RepoRoot, Worktree};
@@ -79,6 +80,8 @@ pub struct RemoveResult {
     pub removed_path: PathBuf,
     pub branch: BranchName,
     pub repo_root: PathBuf,
+    /// Whether the local branch was deleted by this operation.
+    pub branch_deleted: bool,
     /// Non-fatal warning (e.g. branch deletion failed after worktree removal).
     pub warning: Option<String>,
 }
@@ -291,7 +294,17 @@ pub fn go(repo: &RepoRoot, branch: &BranchName) -> Result<GoResult> {
 
 /// Remove a worktree and delete its local branch.
 pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Result<RemoveResult> {
-    remove_with_branch_context(repo, branch, force, repo.as_ref())
+    remove_with_branch_context(repo, branch, force, repo.as_ref(), false)
+}
+
+/// Remove a worktree, optionally preserving its local branch.
+pub fn remove_with_keep_branch(
+    repo: &RepoRoot,
+    branch: Option<&BranchName>,
+    force: bool,
+    keep_branch: bool,
+) -> Result<RemoveResult> {
+    remove_with_branch_context(repo, branch, force, repo.as_ref(), keep_branch)
 }
 
 /// Remove a worktree and evaluate safe branch deletion from `branch_context`.
@@ -304,6 +317,7 @@ fn remove_with_branch_context(
     branch: Option<&BranchName>,
     force: bool,
     branch_context: &Path,
+    keep_branch: bool,
 ) -> Result<RemoveResult> {
     let worktrees = git::list_worktrees(repo)?;
 
@@ -330,17 +344,70 @@ fn remove_with_branch_context(
 
     let removed_path = wt.path.clone();
 
-    // Remove worktree first, then branch.
-    git::remove_worktree(repo, &removed_path, force)?;
-    // Branch deletion: best-effort — bubble warning instead of blocking.
-    let warning = git::delete_branch_at(branch_context, &target_branch, force)
-        .err()
-        .map(|e| format!("worktree removed but branch deletion failed: {e}"));
+    // Snapshot the previous marker before updating it. A repeated keep
+    // request may be retrying a branch that was already preserved, and a
+    // failed removal must not discard that valid cleanup eligibility.
+    let previous_marker = if keep_branch {
+        git::preserved_branch_oid(repo, &target_branch)?
+    } else {
+        None
+    };
+
+    // Record preservation before removal so a successful worktree removal
+    // cannot lose the branch's later prune eligibility.
+    if keep_branch {
+        git::mark_preserved_branch(repo, &target_branch)?;
+    }
+
+    // Remove worktree first, then optionally delete the branch. A failed
+    // worktree removal prevents branch cleanup and preserves the old safety
+    // ordering. Restore a prior marker only when it still matches the branch;
+    // otherwise clear the newly-created marker instead of retaining invalid
+    // lifecycle state.
+    if let Err(error) = git::remove_worktree(repo, &removed_path, force) {
+        match (
+            keep_branch,
+            previous_marker
+                .filter(|oid| git::branch_oid(repo, &target_branch).as_deref() == Some(oid)),
+        ) {
+            (true, Some(oid)) => {
+                let _ = git::restore_preserved_branch(repo, &target_branch, &oid);
+            }
+            (true, None) => {
+                let _ = git::clear_preserved_branch(repo, &target_branch);
+            }
+            (false, _) => {}
+        }
+        return Err(error);
+    }
+    let (branch_deleted, warning) = if keep_branch {
+        (false, None)
+    } else {
+        // Branch deletion is best-effort: the worktree is already gone, so
+        // report a warning while accurately retaining the branch state.
+        match git::delete_branch_at(branch_context, &target_branch, force) {
+            Ok(()) => {
+                let warning = git::clear_preserved_branch(repo, &target_branch)
+                    .err()
+                    .map(|e| {
+                        format!(
+                            "branch '{target_branch}' deleted but lifecycle marker cleanup failed: {e}"
+                        )
+                    });
+                (true, warning)
+            }
+            Err(e) => (
+                false,
+                Some(format!("worktree removed but branch deletion failed: {e}")),
+            ),
+        }
+    };
 
     Ok(RemoveResult {
         removed_path,
         branch: target_branch,
         repo_root: repo.to_path_buf(),
+        branch_deleted,
         warning,
     })
 }
@@ -370,8 +437,18 @@ pub enum IntegrationStatus {
 #[derive(Debug)]
 pub struct WorktreePruneEntry {
     pub branch: Option<String>,
-    pub path: std::path::PathBuf,
+    /// `None` means the branch was preserved after its worktree was removed.
+    pub path: Option<std::path::PathBuf>,
     pub status: IntegrationStatus,
+    /// Marker OID captured during planning for a preserved branch. Execution
+    /// rechecks it so a moved/recreated branch cannot be deleted by an old
+    /// preservation request.
+    pub preserved_oid: Option<String>,
+    /// `git branch -d` can only verify the currently checked-out branch. For
+    /// another branch, a commit, or a remote ref, integration was checked
+    /// against an explicit target, so deletion must use `-D` after that
+    /// check rather than accidentally retaining a valid candidate.
+    pub force_branch_delete: bool,
 }
 
 /// Result of a prune dry-run.
@@ -385,14 +462,17 @@ pub struct PruneDryRun {
 #[derive(Debug)]
 pub struct PrunedEntry {
     pub branch: String,
-    pub path: std::path::PathBuf,
+    /// `None` means this entry only deleted a preserved branch.
+    pub path: Option<std::path::PathBuf>,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
 }
 
 /// An entry that was skipped during pruning.
 #[derive(Debug)]
 pub struct SkippedEntry {
     pub branch: Option<String>,
-    pub path: std::path::PathBuf,
+    pub path: Option<std::path::PathBuf>,
     pub reason: String,
 }
 
@@ -420,25 +500,127 @@ fn classify_integration(repo: &RepoRoot, branch: &str, mainline: &str) -> Integr
     IntegrationStatus::NotIntegrated
 }
 
-/// Dry-run: scan worktrees and report integration status without removing anything.
-pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result<PruneDryRun> {
-    let mainline = match mainline_override {
-        Some(m) => {
-            if !git::rev_exists(repo, m) {
-                return Err(AppError::usage(format!(
-                    "mainline branch '{m}' does not exist"
-                )));
-            }
-            m.to_string()
-        }
+/// The revision used for integration checks plus the target identity that
+/// prune must protect. Branch refs have a stable local name; commit-only and
+/// remote refs additionally protect matching branch tips because their target
+/// worktree cannot always be identified by name.
+#[derive(Debug, Clone)]
+struct IntegrationTarget {
+    revision: String,
+    protected_branches: HashSet<String>,
+    protected_tip: Option<String>,
+    force_branch_delete: bool,
+}
+
+impl IntegrationTarget {
+    fn protects_branch(&self, repo: &RepoRoot, branch: &str) -> bool {
+        self.protected_branches.contains(branch)
+            || self.protected_tip.as_deref().is_some_and(|tip| {
+                git::branch_oid(repo, &BranchName::new(branch)).as_deref() == Some(tip)
+            })
+    }
+}
+
+fn local_branch_revision(repo: &RepoRoot, revision: &str) -> Option<String> {
+    if let Some(branch) = revision.strip_prefix("refs/heads/") {
+        let branch_name = BranchName::new(branch);
+        return git::branch_exists(repo, &branch_name).then_some(branch.to_string());
+    }
+
+    if revision == "HEAD" {
+        return git::current_branch(repo);
+    }
+
+    if revision.starts_with("refs/") {
+        return None;
+    }
+
+    let branch_name = BranchName::new(revision);
+    git::branch_exists(repo, &branch_name).then_some(revision.to_string())
+}
+
+fn resolve_integration_target(
+    repo: &RepoRoot,
+    mainline_override: Option<&str>,
+) -> Result<IntegrationTarget> {
+    let requested = match mainline_override {
+        Some(revision) => revision.to_string(),
         None => git::resolve_mainline(repo)?,
     };
 
+    if let Some(branch) = local_branch_revision(repo, &requested) {
+        let force_branch_delete = git::current_branch(repo).as_deref() != Some(branch.as_str());
+        return Ok(IntegrationTarget {
+            revision: branch.clone(),
+            protected_branches: [branch].into_iter().collect(),
+            protected_tip: None,
+            force_branch_delete,
+        });
+    }
+
+    if let Some(remote) = git::remote_branch_revision(repo, &requested) {
+        let protected_branches = git::local_branch_for_remote(repo, &remote)
+            .into_iter()
+            .collect();
+        return Ok(IntegrationTarget {
+            revision: remote,
+            protected_branches,
+            protected_tip: Some(git::resolve_commit(repo, &requested)?),
+            force_branch_delete: true,
+        });
+    }
+
+    let commit = git::resolve_commit(repo, &requested)
+        .map_err(|_| AppError::usage(format!("mainline branch '{requested}' does not exist")))?;
+
+    Ok(IntegrationTarget {
+        revision: commit.clone(),
+        protected_branches: HashSet::new(),
+        protected_tip: Some(commit),
+        force_branch_delete: true,
+    })
+}
+
+/// Dry-run: scan worktrees and preserved local branches without removing anything.
+pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result<PruneDryRun> {
+    let target = resolve_integration_target(repo, mainline_override)?;
+    let mainline = target.revision.clone();
+
     let worktrees = git::list_worktrees(repo)?;
+    let worktree_branches: HashSet<String> = worktrees
+        .iter()
+        .filter_map(|wt| wt.branch.clone())
+        .collect();
+    let mut stale_marker_branches = HashSet::new();
+    let preserved_branches = git::list_preserved_branches(repo)?;
+    let mut valid_preserved_branches = Vec::new();
+
+    // Validate every marker before adding worktree entries. This also blocks a
+    // moved preserved branch that was recreated/reattached as a worktree from
+    // falling through the ordinary worktree cleanup path.
+    for preserved in preserved_branches {
+        let branch = BranchName::new(&preserved.name);
+        if git::branch_oid(repo, &branch).as_deref() != Some(preserved.oid.as_str()) {
+            git::clear_preserved_branch(repo, &branch)?;
+            stale_marker_branches.insert(preserved.name);
+        } else {
+            valid_preserved_branches.push(preserved);
+        }
+    }
+
     let mut entries = Vec::new();
 
     for wt in &worktrees {
-        if wt.is_main {
+        if wt.is_main
+            || wt
+                .branch
+                .as_deref()
+                .is_some_and(|branch| target.protects_branch(repo, branch))
+            || wt
+                .branch
+                .as_deref()
+                .is_some_and(|branch| stale_marker_branches.contains(branch))
+        {
             continue;
         }
 
@@ -449,8 +631,32 @@ pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result
 
         entries.push(WorktreePruneEntry {
             branch: wt.branch.clone(),
-            path: wt.path.clone(),
+            path: Some(wt.path.clone()),
             status,
+            preserved_oid: None,
+            force_branch_delete: target.force_branch_delete,
+        });
+    }
+
+    // A worktree removed with --keep-branch no longer appears in `git
+    // worktree list`. Its private lifecycle marker lets a later prune delete
+    // the preserved branch once its commits reach the selected target,
+    // without treating every unrelated local branch as pruneable. The marker
+    // OID is checked before planning; a moved, deleted, or recreated branch
+    // invalidates the old preservation request and its marker is cleared.
+    for preserved in valid_preserved_branches {
+        if worktree_branches.contains(&preserved.name)
+            || target.protects_branch(repo, &preserved.name)
+        {
+            continue;
+        }
+
+        entries.push(WorktreePruneEntry {
+            status: classify_integration(repo, &preserved.name, &mainline),
+            branch: Some(preserved.name),
+            path: None,
+            preserved_oid: Some(preserved.oid),
+            force_branch_delete: target.force_branch_delete,
         });
     }
 
@@ -464,47 +670,106 @@ struct PruneAccumulator {
     warnings: Vec<String>,
 }
 
-/// Try to remove an integrated worktree and its branch.
+/// Try to remove an integrated worktree and delete its branch.
 ///
 /// When the branch was integrated via rebase (patch-id match), Git's own
 /// ancestry check (`git branch -d`) would refuse deletion because the
-/// original commits are not ancestors of mainline.  We auto-escalate to
-/// `-D` in that case since the cherry check already confirmed integration.
+/// original commits are not ancestors of mainline. We auto-escalate to `-D`
+/// in that case since the cherry check already confirmed integration.
 fn prune_integrated_entry(
     repo: &RepoRoot,
     entry: WorktreePruneEntry,
     force: bool,
     acc: &mut PruneAccumulator,
 ) {
-    let branch_name = entry.branch.clone().expect("integrated implies branch");
+    let Some(branch_name) = entry.branch.clone() else {
+        acc.skipped.push(SkippedEntry {
+            branch: None,
+            path: entry.path,
+            reason: "no_branch".to_string(),
+        });
+        return;
+    };
+
+    // Recheck the marker immediately before deleting. `prune_execute` plans
+    // first, so a branch moved between planning and execution must not be
+    // authorized by an old preservation marker.
+    match entry.preserved_oid.as_deref() {
+        Some(expected_oid)
+            if git::branch_oid(repo, &BranchName::new(&branch_name)).as_deref()
+                != Some(expected_oid) =>
+        {
+            git::clear_preserved_branch(repo, &BranchName::new(&branch_name))
+                .err()
+                .into_iter()
+                .for_each(|e| {
+                    acc.warnings.push(format!(
+                        "stale lifecycle marker for '{branch_name}' could not be cleared: {e}"
+                    ));
+                });
+            acc.skipped.push(SkippedEntry {
+                branch: Some(branch_name),
+                path: entry.path,
+                reason: "stale_marker".to_string(),
+            });
+            return;
+        }
+        _ => {}
+    }
 
     let force_branch = force
+        || entry.force_branch_delete
         || matches!(
-            entry.status,
+            &entry.status,
             IntegrationStatus::Integrated(IntegrationMethod::Rebase)
         );
 
-    if let Err(e) = git::remove_worktree(repo, &entry.path, force) {
-        acc.warnings.push(format!(
-            "failed to remove worktree for '{branch_name}': {e}"
-        ));
-        acc.skipped.push(SkippedEntry {
-            branch: Some(branch_name),
-            path: entry.path,
-            reason: "removal_failed".to_string(),
-        });
-        return;
-    }
+    let worktree_removed = match entry.path.as_ref() {
+        Some(path) => match git::remove_worktree(repo, path, force) {
+            Ok(()) => true,
+            Err(e) => {
+                acc.warnings.push(format!(
+                    "failed to remove worktree for '{branch_name}': {e}"
+                ));
+                acc.skipped.push(SkippedEntry {
+                    branch: Some(branch_name),
+                    path: entry.path,
+                    reason: "removal_failed".to_string(),
+                });
+                return;
+            }
+        },
+        None => false,
+    };
 
     let bn = BranchName::new(&branch_name);
-    if let Err(e) = git::delete_branch(repo, &bn, force_branch) {
-        acc.warnings.push(format!(
-            "worktree removed but branch deletion failed for '{branch_name}': {e}"
-        ));
-    }
+    let branch_deleted = match git::delete_branch(repo, &bn, force_branch) {
+        Ok(()) => {
+            if let Err(e) = git::clear_preserved_branch(repo, &bn) {
+                acc.warnings.push(format!(
+                    "branch '{branch_name}' deleted but lifecycle marker cleanup failed: {e}"
+                ));
+            }
+            true
+        }
+        Err(e) => {
+            let subject = if worktree_removed {
+                "worktree removed"
+            } else {
+                "no worktree removed"
+            };
+            acc.warnings.push(format!(
+                "{subject} but branch deletion failed for '{branch_name}': {e}"
+            ));
+            false
+        }
+    };
+
     acc.pruned.push(PrunedEntry {
         branch: branch_name,
         path: entry.path,
+        worktree_removed,
+        branch_deleted,
     });
 }
 
@@ -786,7 +1051,13 @@ pub fn merge(
     let (cleaned_up, removed_path) = if no_cleanup {
         (false, None)
     } else {
-        match remove_with_branch_context(repo, Some(&target_branch), false, &destination.path) {
+        match remove_with_branch_context(
+            repo,
+            Some(&target_branch),
+            false,
+            &destination.path,
+            false,
+        ) {
             Ok(result) => {
                 if let Some(w) = result.warning {
                     warnings.push(w);

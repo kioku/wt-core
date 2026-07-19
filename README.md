@@ -25,7 +25,8 @@ these conventions upfront makes everything else predictable.
 
 - **Branch cleanup is the default.** `remove` and `merge` delete the local
   branch after removing the worktree (`git branch -d` by default, `-D` with
-  `--force`). This keeps the branch namespace clean.
+  `--force`). Use `remove --keep-branch` when staged integration still needs
+  the local branch, without keeping its worktree alive.
 
 - **Mainline is auto-detected.** Commands that need a mainline branch (`merge`,
   `prune`) resolve it automatically from `HEAD` of the default remote, so you
@@ -50,10 +51,12 @@ wt add <branch> [--base <rev>]         Create a worktree and branch
 wt go [<branch>] [-i]                  Switch to an existing worktree
 wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
+                                      [--keep-branch] preserves the branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
 wt diff [<branch>] [--dry-run]         Open difftool for branch or dirty changes
 wt materialize --sha <sha> ...         Create an explicit detached checkout
-wt prune [--execute] [--force]         Remove worktrees integrated into mainline
+wt prune [--execute] [--force]         Remove integrated worktrees and branches
+                                      [--integrated-into <rev>] sets the target
 wt doctor                              Diagnose worktree/repo health
 ```
 
@@ -101,12 +104,15 @@ wt list --stats --color never
 ### `wt remove`
 
 Removes a worktree and deletes its local branch. When called without a branch
-argument, infers the target from `cwd` or opens a fuzzy picker in a TTY.
+argument, infers the target from `cwd` or opens a fuzzy picker in a TTY. Use
+`--keep-branch` to remove only the worktree; dirty-worktree checks still apply,
+and default branch-deletion safety is unchanged.
 
 ```
-wt remove feature/auth     # explicit branch
-wt remove                  # infer from cwd or pick interactively
-wt remove --force          # remove even if dirty, use -D for branch
+wt remove feature/auth               # explicit branch and branch cleanup
+wt remove                             # infer from cwd or pick interactively
+wt remove --force                     # remove even if dirty, use -D for branch
+wt remove feature/auth --keep-branch  # remove worktree, preserve local branch
 ```
 
 ### `wt merge`
@@ -164,15 +170,18 @@ wt materialize \
 
 ### `wt prune`
 
-Scans all worktrees and identifies branches that are fully integrated into
-mainline. Integration is detected via both ancestry checks (merge/fast-forward)
-and patch-id comparison (rebase merges). Defaults to dry-run.
+Scans linked worktrees and preserved local branches and identifies branches
+that are fully integrated into the selected revision. Integration is detected
+via both ancestry checks (merge/fast-forward) and patch-id comparison (rebase
+merges). Defaults to dry-run. `--integrated-into` accepts any revision and
+`--mainline` remains an alias.
 
 ```
-wt prune                               # dry-run: show what would be pruned
-wt prune --execute                     # actually remove integrated worktrees
-wt prune --execute --force             # also remove dirty worktrees
-wt prune --mainline develop            # override mainline branch
+wt prune                                      # dry-run: show cleanup candidates
+wt prune --execute                            # remove worktrees and branches
+wt prune --execute --force                    # also remove dirty worktrees
+wt prune --integrated-into integration/release # use a staged integration target
+wt prune --mainline develop                   # backwards-compatible alias
 ```
 
 ### `wt doctor`
@@ -204,7 +213,13 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | `--print-paths`   | Version 1 merge metadata on stdout (for wrappers) |
 | `--print-paths-v2` | Version 2 merge metadata, including destination path (for wrappers) |
 
-`--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
+For `remove --print-paths`, the exact legacy protocol is three lines:
+`removed_path`, `repo_root`, and `branch`. This format is intentionally stable
+for already-installed shell bindings. Use `--json` when lifecycle status is
+needed: `worktree_removed` and `branch_deleted` explicitly report each action.
+Prune dry-runs report `worktree_present` and `branch_will_be_deleted`; execute
+results report `worktree_removed` and `branch_deleted`. A preserved branch has
+a null prune `path` because no worktree remains.
 
 The merge `--print-paths` protocol is version 1 and emits six lines:
 `repo_root`, `branch`, `mainline`, `cleaned_up`, `removed_path`, and
@@ -223,6 +238,15 @@ JSON envelope example (`add`, `go`, `remove`):
   "cd_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4",
   "branch": "feature/auth",
   "tracking": false
+}
+```
+
+A `remove --keep-branch --json` response includes the distinct cleanup state:
+
+```json
+{
+  "worktree_removed": true,
+  "branch_deleted": false
 }
 ```
 

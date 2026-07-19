@@ -24,7 +24,8 @@ pub enum StatusFormat {
 pub enum RemoveFormat {
     Human,
     Json,
-    /// `--print-paths`: prints removed_path, repo_root, and branch (one per line).
+    /// Stable legacy `--print-paths`: removed_path, repo_root, and branch
+    /// (exactly three lines). Lifecycle status is exposed by JSON.
     PrintPaths,
 }
 
@@ -48,6 +49,12 @@ pub struct JsonResponse {
     pub removed_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Whether the worktree was removed (only set for `remove`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_removed: Option<bool>,
+    /// Whether the local branch was deleted (only set for `remove`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_deleted: Option<bool>,
     /// Whether the branch tracks a remote branch (only set for `add`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracking: Option<bool>,
@@ -67,6 +74,8 @@ impl JsonResponse {
             cd_path: None,
             removed_path: None,
             branch: None,
+            worktree_removed: None,
+            branch_deleted: None,
             tracking: None,
             symlinks: None,
         }
@@ -94,6 +103,16 @@ impl JsonResponse {
 
     pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
         self.branch = Some(branch.into());
+        self
+    }
+
+    pub fn with_worktree_removed(mut self, removed: bool) -> Self {
+        self.worktree_removed = Some(removed);
+        self
+    }
+
+    pub fn with_branch_deleted(mut self, deleted: bool) -> Self {
+        self.branch_deleted = Some(deleted);
         self
     }
 
@@ -304,7 +323,11 @@ pub struct JsonPruneDryRunEntry {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    pub path: String,
+    pub path: Option<String>,
+    /// Whether executing this entry would remove a worktree.
+    pub worktree_present: bool,
+    /// Whether executing this entry would delete the local branch.
+    pub branch_will_be_deleted: bool,
 }
 
 /// JSON response for prune execute.
@@ -320,14 +343,16 @@ pub struct JsonPruneExecuteResponse {
 #[derive(Debug, Serialize)]
 pub struct JsonPrunedEntry {
     pub branch: String,
-    pub path: String,
+    pub path: Option<String>,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct JsonSkippedEntry {
     pub branch: Option<String>,
     pub reason: String,
-    pub path: String,
+    pub path: Option<String>,
 }
 
 /// Output format for the merge command.

@@ -96,7 +96,15 @@ function wt --description "Git worktree manager"
             end
 
             set -l cwd_before (pwd)
-            # --print-paths outputs three lines: removed_path, repo_root, branch.
+            # --print-paths is the stable legacy three-line protocol:
+            # removed_path, repo_root, branch. Lifecycle status is explicit in
+            # --json; the binding also knows whether --keep-branch was requested.
+            set -l keep_branch false
+            for arg in $argv
+                if test "$arg" = "--keep-branch"
+                    set keep_branch true
+                end
+            end
             # stderr is left connected to the terminal so the interactive picker
             # (if triggered) renders correctly and errors are visible.
             set -l lines (wt-core remove $argv --print-paths)
@@ -109,7 +117,11 @@ function wt --description "Git worktree manager"
                 if string match -q "$removed_path*" "$cwd_before"
                     cd "$repo_root"; or true
                 end
-                echo "Removed worktree and branch '$branch'"
+                if test "$keep_branch" = true
+                    echo "Removed worktree and kept branch '$branch'"
+                else
+                    echo "Removed worktree and branch '$branch'"
+                end
             else
                 return $rc
             end

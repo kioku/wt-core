@@ -80,10 +80,11 @@ export def --env "wt go" [
     }
 }
 
-# Remove a worktree and its local branch
+# Remove a worktree, optionally preserving its local branch
 export def --env "wt remove" [
     branch?: string  # Branch name (defaults to current worktree)
     --force          # Force removal even if dirty
+    --keep-branch    # Preserve the local branch after removing its worktree
     --repo: path     # Repository path (defaults to cwd)
     --json           # Output as JSON
 ] {
@@ -92,6 +93,7 @@ export def --env "wt remove" [
     mut args = ["remove"]
     if $branch != null { $args = ($args | append $branch) }
     if $force { $args = ($args | append "--force") }
+    if $keep_branch { $args = ($args | append "--keep-branch") }
 
     if $json {
         # --json: machine output, no interactive picker.
@@ -116,6 +118,9 @@ export def --env "wt remove" [
         # inherited, keeping the interactive picker and error messages
         # visible in the terminal.
         let output = try { ^wt-core ...$full_args } catch { return }
+        # --print-paths is the stable legacy three-line protocol:
+        # removed_path, repo_root, branch. Lifecycle status is explicit in
+        # --json; the binding already knows whether --keep-branch was requested.
         let lines = ($output | lines)
         let removed_path = ($lines | get 0)
         let repo_root = ($lines | get 1)
@@ -125,7 +130,11 @@ export def --env "wt remove" [
             cd $repo_root
         }
 
-        print $"Removed worktree and branch '($branch_name)'"
+        if $keep_branch {
+            print $"Removed worktree and kept branch '($branch_name)'"
+        } else {
+            print $"Removed worktree and branch '($branch_name)'"
+        }
     }
 }
 
