@@ -166,11 +166,11 @@ wt() {
                 esac
             done
 
-            # Status and abort are lifecycle reports, not the legacy
-            # navigation protocol. --continue uses the normal merge protocol.
+            # Status, continue, and abort are lifecycle reports, not the
+            # legacy navigation protocol or path-only output protocol.
             for arg in "$@"; do
                 case "$arg" in
-                    --status|--abort)
+                    --status|--continue|--abort)
                         wt-core merge "$@"
                         return $?
                         ;;

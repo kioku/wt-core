@@ -480,6 +480,9 @@ pub struct JsonMergeOperation {
     pub push: bool,
     pub cleanup: bool,
     pub keep_branch: bool,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
+    pub push_done: bool,
     pub pending_actions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recovery: Option<String>,
@@ -509,6 +512,7 @@ pub struct JsonMergeResponse {
     pub destination_path: String,
     pub repo_root: String,
     pub cleaned_up: bool,
+    pub branch_deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_path: Option<String>,
     pub pushed: bool,

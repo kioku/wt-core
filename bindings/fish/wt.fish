@@ -192,10 +192,10 @@ function wt --description "Git worktree manager"
                 end
             end
 
-            # Status and abort are lifecycle reports, not the legacy
-            # navigation protocol. --continue uses the normal merge protocol.
+            # Status, continue, and abort are lifecycle reports, not the
+            # legacy navigation protocol or path-only output protocol.
             for arg in $argv
-                if test "$arg" = "--status" -o "$arg" = "--abort"
+                if test "$arg" = "--status" -o "$arg" = "--continue" -o "$arg" = "--abort"
                     wt-core merge $argv
                     return $status
                 end

@@ -252,7 +252,7 @@ export def --env "wt merge" [
     if $push { $args = ($args | append "--push") }
     if $no_cleanup { $args = ($args | append "--no-cleanup") }
 
-    if $status or $abort {
+    if $status or $continue or $abort {
         # Lifecycle reports have no navigation or path-only protocol. Keep
         # stdout JSON-native when requested and preserve the core exit status.
         let full_args = (build-args $args $repo $json false)

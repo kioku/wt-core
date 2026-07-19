@@ -224,10 +224,10 @@ echo "$status_json" | grep -q '"state":"conflicted"' \
     || fail "wt merge --status: missing conflicted state"
 printf 'resolved\n' > binding-conflict.txt
 git add binding-conflict.txt
-continue_json=$(wt merge --continue --json)
-echo "$continue_json" | grep -q '"cleaned_up":true' \
-    && pass "wt merge --continue: completes and cleans up" \
-    || fail "wt merge --continue: missing cleanup result"
+continue_human=$(wt merge --continue)
+echo "$continue_human" | grep -q "Merged 'matrix-conflict' into " \
+    && pass "wt merge --continue: human lifecycle path completes" \
+    || fail "wt merge --continue: human lifecycle path failed"
 [[ ! -e "$conflict_source" ]] \
     && pass "wt merge --continue: source worktree removed" \
     || fail "wt merge --continue: source worktree remains"

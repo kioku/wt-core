@@ -201,9 +201,11 @@ from `content_conflict` refusals.
 A content conflict is intentionally left in the destination worktree. The
 source worktree and branch are not cleaned up, and wt-core records the
 operation under Git's common directory at
-`git rev-parse --git-path wt-core/merge-operation.json`. The record is written
-atomically and includes the schema version, exact source/destination worktree
-registrations, merge commit identity, push intent, and cleanup policy. Resolve
+`git rev-parse --git-path wt-core/merge-operation.json`. The record is written atomically and includes the schema version, exact
+source/destination worktree registrations, captured source and destination
+heads, merge commit identity, typed lifecycle progress, push intent, and cleanup
+policy. Its directory is private and its state/temp records are owner-only;
+insecure existing records are refused. Resolve
 and stage every path, then continue through Git's normal merge commit and hook
 path:
 
@@ -222,9 +224,9 @@ identity, branch heads, or Git's merge marker no longer match the record,
 wt-core refuses mutation and prints recovery guidance rather than selecting a
 replacement by branch name.
 
-The Bash, Zsh, Fish, and Nushell bindings pass `--status` and `--abort`
-through without applying legacy navigation parsing. `--continue` retains the
-normal merge navigation behavior, including JSON output.
+The Bash, Zsh, Fish, and Nushell bindings pass `--status`, `--continue`, and
+`--abort` through without applying legacy navigation or path-only parsing.
+JSON output remains available for all three lifecycle commands.
 
 ### `wt diff`
 

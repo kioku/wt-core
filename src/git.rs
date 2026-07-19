@@ -1180,10 +1180,48 @@ pub fn head_commit(path: &Path) -> Result<String> {
     git(&["rev-parse", "--verify", "HEAD^{commit}"], path)
 }
 
-/// Return the full commit currently referenced by a local branch.
-pub fn branch_head(repo: &RepoRoot, branch: &str) -> Result<String> {
+/// Return the parent commits of a commit, in Git's recorded order.
+pub fn commit_parents(path: &Path, revision: &str) -> Result<Vec<String>> {
+    let output = git(&["rev-list", "--parents", "-n", "1", revision], path)?;
+    Ok(output
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect())
+}
+
+/// Identify the merge commit created from the captured destination/source
+/// heads. If a hook or concurrent writer advanced the destination once more,
+/// return the merge commit as the expected result so callers can refuse the
+/// newer HEAD rather than silently treating it as the merge result.
+pub fn merge_result_head(
+    path: &Path,
+    destination_head: &str,
+    source_head: &str,
+) -> Result<Option<String>> {
+    let current = head_commit(path)?;
+    let parents = commit_parents(path, &current)?;
+    if parents.len() == 2 && parents[0] == destination_head && parents[1] == source_head {
+        return Ok(Some(current));
+    }
+    let Some(first_parent) = parents.first() else {
+        return Ok(None);
+    };
+    let first_parents = commit_parents(path, first_parent)?;
+    if first_parents.len() == 2
+        && first_parents[0] == destination_head
+        && first_parents[1] == source_head
+    {
+        return Ok(Some(first_parent.clone()));
+    }
+    Ok(None)
+}
+
+/// Read the authoritative remote branch head without changing local refs.
+pub fn remote_branch_head(repo: &RepoRoot, branch: &str) -> Result<Option<String>> {
     let reference = format!("refs/heads/{branch}");
-    git(&["rev-parse", "--verify", &reference], repo.as_ref())
+    let output = git(&["ls-remote", "origin", &reference], repo.as_ref())?;
+    Ok(output.split_whitespace().next().map(str::to_string))
 }
 
 /// Return the source commit recorded by Git for an in-progress merge.

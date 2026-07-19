@@ -1396,7 +1396,7 @@ fn print_merge_result(
     if let Some(Err(error)) = navigation_file.map(|path| {
         write_navigation_file(
             path,
-            result.cleaned_up,
+            result.removed_path.is_some(),
             result.removed_path.as_deref(),
             &result.repo_root,
         )
@@ -1423,11 +1423,7 @@ fn print_merge_result(
             println!("{}", result.destination_path.display());
         }
         MergeFormat::Json => {
-            let event = if result.cleaned_up {
-                Some("reset".to_string())
-            } else {
-                None
-            };
+            let event = result.removed_path.as_ref().map(|_| "reset".to_string());
             print_json(&JsonMergeResponse {
                 ok: true,
                 event,
@@ -1437,7 +1433,8 @@ fn print_merge_result(
                 destination_path: result.destination_path.display().to_string(),
                 repo_root: root_str,
                 cleaned_up: result.cleaned_up,
-                removed_path: if result.cleaned_up {
+                branch_deleted: result.branch_deleted,
+                removed_path: if result.removed_path.is_some() {
                     Some(removed_str)
                 } else {
                     None
@@ -1457,8 +1454,15 @@ fn print_merge_result(
                 "Destination worktree: {}",
                 result.destination_path.display()
             );
-            if result.cleaned_up {
-                println!("Removed worktree and branch '{}'", branch_name);
+            match (&result.removed_path, result.branch_deleted) {
+                (Some(_), true) => {
+                    println!("Removed worktree and branch '{}'", branch_name);
+                }
+                (Some(path), false) => {
+                    println!("Removed worktree: {}", path.display());
+                    println!("Source branch cleanup remains pending");
+                }
+                (None, _) => {}
             }
             if result.pushed {
                 println!("Pushed {} to origin", result.mainline);
@@ -1488,6 +1492,9 @@ fn json_merge_operation(report: &worktree::MergeOperationReport) -> JsonMergeOpe
         push: report.push,
         cleanup: report.cleanup,
         keep_branch: report.keep_branch,
+        worktree_removed: report.worktree_removed,
+        branch_deleted: report.branch_deleted,
+        push_done: report.push_done,
         pending_actions: report.pending_actions.clone(),
         recovery: report.recovery.clone(),
         state_path: Some(report.state_path.display().to_string()),
@@ -1505,6 +1512,9 @@ fn empty_merge_operation(message: &str) -> JsonMergeOperation {
         push: false,
         cleanup: false,
         keep_branch: false,
+        worktree_removed: false,
+        branch_deleted: false,
+        push_done: false,
         pending_actions: Vec::new(),
         recovery: Some(message.to_string()),
         state_path: None,
@@ -1725,6 +1735,7 @@ fn print_merge_inspection(
             destination_path: preflight.destination_path.display().to_string(),
             repo_root: repo.display().to_string(),
             cleaned_up: false,
+            branch_deleted: false,
             removed_path: None,
             pushed: false,
             warnings: Vec::new(),
@@ -1778,6 +1789,7 @@ fn report_merge_failure(
             destination_path: preflight.destination_path.display().to_string(),
             repo_root: repo.display().to_string(),
             cleaned_up: false,
+            branch_deleted: false,
             removed_path: None,
             pushed: false,
             warnings: Vec::new(),

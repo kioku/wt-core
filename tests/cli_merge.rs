@@ -301,6 +301,227 @@ fn merge_continue_keeps_source_when_original_merge_skipped_cleanup() {
 
 #[cfg(unix)]
 #[test]
+fn merge_continue_reconciles_commit_after_state_write_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    create_conflicted_merge(&repo, "feature/state-write-commit");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let state_dir = repo.path().join(".git/wt-core");
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o500))
+        .expect("make journal unwritable");
+    wt_core()
+        .args(["merge", "--continue", "--json", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("\"state\":\"committed\""));
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore journal permissions");
+
+    let status = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let status_json: serde_json::Value = serde_json::from_slice(&status).expect("status JSON");
+    assert_eq!(status_json["state"], "committed");
+    assert_eq!(status_json["worktree_removed"], false);
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert_branch_deleted(&repo.path(), "feature/state-write-commit");
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_reconciles_push_after_progress_write_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (repo, upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    create_conflicted_merge_at(&repo.path(), "feature/push-state-write", false, true);
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let state_dir = repo.path().join(".git/wt-core");
+    install_hook(
+        &repo,
+        "pre-push",
+        &format!(
+            "#!/bin/sh\nchmod 0500 {}\n",
+            shell_quote(&state_dir.display().to_string())
+        ),
+    );
+    let output = wt_core()
+        .args(["merge", "--continue", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("merge JSON");
+    assert_eq!(json["pushed"], true);
+    assert_eq!(json["operation"]["push_done"], true);
+    assert!(git_log_oneline(upstream.path(), "main")
+        .contains("Merge branch 'feature/push-state-write'"));
+
+    std::fs::set_permissions(&state_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("restore journal permissions");
+    std::fs::remove_file(repo.path().join(".git/hooks/pre-push")).expect("remove hook");
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_source_head_race_preserves_source_and_followup_intent() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/source-head-race", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-source-head-race");
+    commit_file(&source, "source.txt", "source", "source");
+    let source_str = source.display().to_string();
+    install_hook(
+        &repo,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX\nprintf race > {}/race.txt\ngit -C {} add race.txt\ngit -C {} commit -m race\n",
+            shell_quote(&source_str),
+            shell_quote(&source_str),
+            shell_quote(&source_str)
+        ),
+    );
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/source-head-race",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("merge JSON");
+    assert_eq!(json["cleaned_up"], false);
+    assert!(json["operation"]["state"] == "stale");
+    assert!(
+        source.exists(),
+        "source HEAD race must preserve the source worktree"
+    );
+    assert_branch_exists(&repo.path(), "feature/source-head-race");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_destination_head_race_refuses_cleanup_and_push() {
+    let (repo, _upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/destination-head-race", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-destination-head-race");
+    commit_file(&source, "destination-race.txt", "race", "race");
+    install_hook(
+        &repo,
+        "post-merge",
+        "#!/bin/sh\nunset GIT_EDITOR\ngit commit --allow-empty -m destination-race\n",
+    );
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/destination-head-race",
+            "--push",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("merge JSON");
+    assert_eq!(json["cleaned_up"], false);
+    assert_eq!(json["pushed"], false);
+    assert!(
+        source.exists(),
+        "destination HEAD race must preserve cleanup intent"
+    );
+    assert_branch_exists(&repo.path(), "feature/destination-head-race");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_state_and_directory_are_private() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::TestRepo::new();
+    create_conflicted_merge(&repo, "feature/private-state");
+    let state_dir = repo.path().join(".git/wt-core");
+    let state = state_dir.join("merge-operation.json");
+    assert_eq!(
+        std::fs::metadata(&state_dir)
+            .expect("state dir")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_eq!(
+        std::fs::metadata(&state)
+            .expect("state")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let mut insecure = std::fs::metadata(&state)
+        .expect("state metadata")
+        .permissions();
+    insecure.set_mode(0o644);
+    std::fs::set_permissions(&state, insecure).expect("make state insecure");
+    wt_core()
+        .args([
+            "merge",
+            "--status",
+            "--json",
+            "--repo",
+            &repo.path().display().to_string(),
+        ])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("insecure permissions"));
+}
+
+#[cfg(unix)]
+#[test]
 fn merge_continue_hook_failure_preserves_merge_for_retry() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
