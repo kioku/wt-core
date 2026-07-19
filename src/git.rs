@@ -775,14 +775,42 @@ fn registered_worktree_admin(common_dir: &Path, worktree: &Path) -> Result<PathB
     }
 }
 
-/// Verify that a listed worktree is the exact worktree registered by `repo`.
+/// Stable registration identity for a worktree.
+///
+/// The main worktree uses the repository's common Git directory as its admin
+/// directory. A linked worktree uses its unique entry below
+/// `<common-dir>/worktrees`. The path is captured before a merge and compared
+/// later; path, branch, and common-directory checks alone cannot distinguish a
+/// replacement worktree registered during a hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeIdentity {
+    Main { admin_dir: PathBuf },
+    Linked { admin_dir: PathBuf },
+}
+
+impl WorktreeIdentity {
+    pub fn admin_dir(&self) -> &Path {
+        match self {
+            Self::Main { admin_dir } | Self::Linked { admin_dir } => admin_dir,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Main { .. } => "main",
+            Self::Linked { .. } => "linked",
+        }
+    }
+}
+
+/// Resolve and validate the exact worktree registration owned by `repo`.
 ///
 /// `git worktree list` reports branch and path metadata from the owning
 /// repository even when the directory at that path has been replaced. Before
 /// merge code uses a path, compare both Git's canonical common directory and
 /// the per-worktree admin linkage. This prevents an unrelated, nested, or
 /// symlink-aliased repository from receiving a merge or cleanup operation.
-pub fn validate_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Result<()> {
+pub fn capture_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Result<WorktreeIdentity> {
     let path = &worktree.path;
     if has_symlink_component(path) {
         return Err(AppError::conflict(format!(
@@ -825,7 +853,7 @@ pub fn validate_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Resul
     }
 
     let worktree_git_file = path.join(".git");
-    match worktree.is_main {
+    let identity = match worktree.is_main {
         true => {
             let worktree_git_dir = canonical_git_path(path, "--git-dir")?;
             if worktree_git_dir != common_dir {
@@ -834,6 +862,9 @@ pub fn validate_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Resul
                     worktree_git_dir.display(),
                     common_dir.display()
                 )));
+            }
+            WorktreeIdentity::Main {
+                admin_dir: common_dir.clone(),
             }
         }
         false => {
@@ -961,8 +992,9 @@ pub fn validate_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Resul
                     worktree.branch.as_deref().unwrap_or("(detached)")
                 )));
             }
+            WorktreeIdentity::Linked { admin_dir }
         }
-    }
+    };
 
     let actual_branch = git(&["symbolic-ref", "--quiet", "--short", "HEAD"], path).ok();
     if actual_branch != worktree.branch {
@@ -980,7 +1012,7 @@ pub fn validate_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Resul
         )));
     }
 
-    Ok(())
+    Ok(identity)
 }
 
 /// Return whether Git left unmerged index entries in a worktree.

@@ -1960,7 +1960,276 @@ fn merge_json_distinguishes_pre_merge_hook_failure_from_content_conflict() {
     assert_branch_exists(&repo.path(), "feature/hook-failure");
 }
 
+#[cfg(unix)]
+#[test]
+fn merge_source_identity_race_skips_cleanup_after_commit() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/source-identity-race", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-source-identity-race");
+    commit_file(&source, "source-race.txt", "source", "source race");
+
+    install_identity_replacement_hook(
+        &repo,
+        "pre-merge-commit",
+        &source,
+        "feature/source-identity-race",
+        "replacement-source-identity",
+    );
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/source-identity-race",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["cleaned_up"], false);
+    assert_eq!(json["pushed"], false);
+    assert!(json["warnings"]
+        .as_array()
+        .is_some_and(|warnings| warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|message| message.contains("identity changed"))
+        })));
+    assert!(source.exists(), "replacement source must remain untouched");
+    assert_branch_exists(&repo.path(), "feature/source-identity-race");
+    assert!(
+        git_log_oneline(&repo.path(), "main")
+            .contains("Merge branch 'feature/source-identity-race'"),
+        "successful merge must remain committed"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_linked_destination_identity_race_skips_cleanup_and_push() {
+    let (repo, upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/destination-identity-race");
+    run_git(
+        &["push", "-u", "origin", "release/destination-identity-race"],
+        &repo.path(),
+    );
+
+    wt_core()
+        .args([
+            "add",
+            "feature/destination-identity-race",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-destination-identity-race");
+    commit_file(
+        &source,
+        "destination-race.txt",
+        "source",
+        "destination race",
+    );
+
+    install_identity_replacement_hook(
+        &repo,
+        "post-merge",
+        &destination,
+        "release/destination-identity-race",
+        "replacement-destination-identity",
+    );
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/destination-identity-race",
+            "--into",
+            "release/destination-identity-race",
+            "--push",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["cleaned_up"], false);
+    assert_eq!(json["pushed"], false);
+    assert!(json["warnings"].as_array().is_some_and(|warnings| {
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|message| message.contains("identity changed"))
+        })
+    }));
+    assert!(
+        destination.exists(),
+        "replacement destination must remain untouched"
+    );
+    assert!(
+        source.exists(),
+        "cleanup must stop when destination identity changed"
+    );
+    assert_branch_exists(&repo.path(), "feature/destination-identity-race");
+    assert!(
+        !git_log_oneline(upstream.path(), "release/destination-identity-race")
+            .contains("Merge branch 'feature/destination-identity-race'")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_source_identity_control_keeps_cleanup_with_non_replacing_hook() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args([
+            "add",
+            "feature/source-identity-control",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-source-identity-control");
+    commit_file(&source, "source-control.txt", "source", "source control");
+    install_hook(&repo, "pre-merge-commit", "#!/bin/sh\nexit 0\n");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/source-identity-control",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("identity changed").not());
+
+    assert!(
+        !source.exists(),
+        "stable source identity should be cleaned up"
+    );
+    assert_branch_deleted(&repo.path(), "feature/source-identity-control");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_linked_destination_identity_control_keeps_push_with_non_replacing_hook() {
+    let (repo, upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/destination-identity-control");
+    run_git(
+        &[
+            "push",
+            "-u",
+            "origin",
+            "release/destination-identity-control",
+        ],
+        &repo.path(),
+    );
+
+    wt_core()
+        .args([
+            "add",
+            "feature/destination-identity-control",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-destination-identity-control");
+    commit_file(
+        &source,
+        "destination-control.txt",
+        "source",
+        "destination control",
+    );
+    install_hook(&repo, "post-merge", "#!/bin/sh\nexit 0\n");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/destination-identity-control",
+            "--into",
+            "release/destination-identity-control",
+            "--push",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("identity changed").not());
+
+    assert!(
+        !source.exists(),
+        "stable source identity should be cleaned up"
+    );
+    assert_branch_deleted(&repo.path(), "feature/destination-identity-control");
+    assert!(
+        git_log_oneline(upstream.path(), "release/destination-identity-control")
+            .contains("Merge branch 'feature/destination-identity-control'")
+    );
+    assert!(destination.exists(), "linked destination must remain");
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
+
+#[cfg(unix)]
+fn install_hook(repo: &fixtures::TestRepo, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let hook = repo.path().join(".git/hooks").join(name);
+    std::fs::write(&hook, script).expect("write hook");
+    let mut permissions = std::fs::metadata(&hook)
+        .expect("hook metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).expect("chmod hook");
+}
+
+#[cfg(unix)]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+#[cfg(unix)]
+fn install_identity_replacement_hook(
+    repo: &fixtures::TestRepo,
+    hook_name: &str,
+    target: &std::path::Path,
+    branch: &str,
+    replacement_name: &str,
+) {
+    let repo_path = repo.path().display().to_string();
+    let target_path = target.display().to_string();
+    let script = format!(
+        "#!/bin/sh\nset -eu\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX\nrepo={}\ntarget={}\nreplacement=\"$target.{}\"\ngit -C \"$repo\" worktree remove --force \"$target\"\ngit -C \"$repo\" worktree add \"$replacement\" {}\nadmin=$(git -C \"$replacement\" rev-parse --git-dir)\nmv \"$replacement\" \"$target\"\nprintf '%s\\n' \"$target/.git\" > \"$admin/gitdir\"\n",
+        shell_quote(&repo_path),
+        shell_quote(&target_path),
+        replacement_name,
+        shell_quote(branch),
+    );
+    install_hook(repo, hook_name, &script);
+}
 
 /// Run a git command and return its raw output, allowing expected failures.
 fn git_allow_failure(args: &[&str], cwd: &std::path::Path) -> std::process::Output {

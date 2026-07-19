@@ -1161,6 +1161,7 @@ fn cmd_merge(
                     None
                 },
                 pushed: result.pushed,
+                warnings: result.warnings.clone(),
                 preflight: Some(JsonMergePreflight::from_preflight(&result.preflight)),
                 refusal: None,
                 inspect: false,
@@ -1284,6 +1285,7 @@ fn print_merge_inspection(
             cleaned_up: false,
             removed_path: None,
             pushed: false,
+            warnings: Vec::new(),
             preflight: Some(JsonMergePreflight::from_preflight(preflight)),
             refusal: preflight.refusal.as_ref().map(|refusal| JsonMergeRefusal {
                 kind: refusal.kind.clone(),
@@ -1335,6 +1337,7 @@ fn report_merge_failure(
             cleaned_up: false,
             removed_path: None,
             pushed: false,
+            warnings: Vec::new(),
             preflight: Some(JsonMergePreflight::from_preflight(preflight)),
             refusal: json_refusal,
             inspect: false,

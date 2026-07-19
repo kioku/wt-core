@@ -680,8 +680,14 @@ pub struct MergePreflight {
     /// exposes the destination path.
     #[serde(skip)]
     pub(crate) source_path: PathBuf,
+    /// Stable Git registration identity captured before any merge mutation.
+    #[serde(skip)]
+    pub(crate) source_identity: git::WorktreeIdentity,
     pub destination: String,
     pub destination_path: PathBuf,
+    /// Stable Git registration identity captured before any merge mutation.
+    #[serde(skip)]
+    pub(crate) destination_identity: git::WorktreeIdentity,
     pub upstream: Option<String>,
     pub ahead: Option<u32>,
     pub behind: Option<u32>,
@@ -847,13 +853,18 @@ fn topology_refusal(
     }
 }
 
-/// Validate a worktree record before using it for a merge.
+/// Validate a worktree record before using it for a merge and capture its
+/// stable Git registration identity.
 ///
 /// Normal merges prune stale Git metadata before this check. Keeping the
 /// explicit identity validation here also handles locked or otherwise
 /// replaced records without falling through to a low-level Git mutation.
-fn validate_merge_worktree(repo: &RepoRoot, wt: &Worktree, role: &str) -> Result<()> {
-    git::validate_worktree_identity(repo, wt).map_err(|error| {
+fn validate_merge_worktree(
+    repo: &RepoRoot,
+    wt: &Worktree,
+    role: &str,
+) -> Result<git::WorktreeIdentity> {
+    git::capture_worktree_identity(repo, wt).map_err(|error| {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
         AppError::conflict(format!(
             "stale {role} worktree metadata for branch '{branch}' at {}: {error}",
@@ -862,9 +873,27 @@ fn validate_merge_worktree(repo: &RepoRoot, wt: &Worktree, role: &str) -> Result
     })
 }
 
-/// Re-read both sides of a merge and require the paths and branch metadata to
-/// still be the exact records used by preflight. This is intentionally
-/// read-only so cleanup never selects a replacement by branch name alone.
+fn identity_changed(
+    role: &str,
+    branch: &str,
+    path: &Path,
+    expected: &git::WorktreeIdentity,
+    actual: &git::WorktreeIdentity,
+) -> AppError {
+    AppError::conflict(format!(
+        "worktree identity changed for {role} branch '{branch}' at {}: preflight {} Git admin directory '{}' is now {} Git admin directory '{}'; refusing to use the replacement",
+        path.display(),
+        expected.kind(),
+        expected.admin_dir().display(),
+        actual.kind(),
+        actual.admin_dir().display()
+    ))
+}
+
+/// Re-read both sides of a merge and require the paths, branch metadata, and
+/// stable Git registration identities to still be the exact records used by
+/// preflight. This is intentionally read-only so cleanup never selects a
+/// replacement by branch name alone.
 fn validate_preflight_worktrees(
     repo: &RepoRoot,
     preflight: &MergePreflight,
@@ -899,8 +928,26 @@ fn validate_preflight_worktrees(
             ))
         })?;
 
-    validate_merge_worktree(repo, source, source_role)?;
-    validate_merge_worktree(repo, destination, destination_role)?;
+    let source_identity = validate_merge_worktree(repo, source, source_role)?;
+    if source_identity != preflight.source_identity {
+        return Err(identity_changed(
+            source_role,
+            &preflight.source,
+            &preflight.source_path,
+            &preflight.source_identity,
+            &source_identity,
+        ));
+    }
+    let destination_identity = validate_merge_worktree(repo, destination, destination_role)?;
+    if destination_identity != preflight.destination_identity {
+        return Err(identity_changed(
+            destination_role,
+            &preflight.destination,
+            &preflight.destination_path,
+            &preflight.destination_identity,
+            &destination_identity,
+        ));
+    }
     Ok((source.clone(), destination.clone()))
 }
 
@@ -924,7 +971,16 @@ fn validate_preflight_destination(
                 preflight.destination_path.display()
             ))
         })?;
-    validate_merge_worktree(repo, destination, role)?;
+    let identity = validate_merge_worktree(repo, destination, role)?;
+    if identity != preflight.destination_identity {
+        return Err(identity_changed(
+            role,
+            &preflight.destination,
+            &preflight.destination_path,
+            &preflight.destination_identity,
+            &identity,
+        ));
+    }
     Ok(destination.clone())
 }
 
@@ -960,7 +1016,7 @@ pub fn merge_preflight(
             "refusing to merge the main worktree".to_string(),
         ));
     }
-    validate_merge_worktree(repo, source_wt, "source")?;
+    let source_identity = validate_merge_worktree(repo, source_wt, "source")?;
 
     let destination = resolve_merge_destination(repo, &worktrees, into)?;
     let destination_wt = worktrees
@@ -972,7 +1028,7 @@ pub fn merge_preflight(
                 destination.path.display()
             ))
         })?;
-    validate_merge_worktree(repo, destination_wt, "destination")?;
+    let destination_identity = validate_merge_worktree(repo, destination_wt, "destination")?;
     if target_branch.as_str() == destination.branch {
         return Err(AppError::invariant(
             "refusing to merge a branch into itself".to_string(),
@@ -1031,8 +1087,10 @@ pub fn merge_preflight(
     Ok(MergePreflight {
         source: target_branch.to_string(),
         source_path: source_wt.path.clone(),
+        source_identity,
         destination: destination.branch,
         destination_path: destination.path,
+        destination_identity,
         upstream,
         ahead,
         behind,
@@ -1073,6 +1131,16 @@ fn classify_merge_failure(
         },
     };
     MergeFailure { kind, error }
+}
+
+fn partial_success_warning(action: &str, replacement_action: &str, error: &AppError) -> String {
+    if error.message.contains("worktree identity changed") {
+        format!(
+            "partial success: merge succeeded; {action} skipped because {error}. The merge commit was preserved; the replacement was not {replacement_action}. Inspect the original worktree and recover manually before retrying."
+        )
+    } else {
+        format!("merge succeeded but {action} failed: {error}")
+    }
 }
 
 /// Run a merge using an already collected preflight.
@@ -1128,7 +1196,7 @@ pub fn merge_with_preflight(
                 (true, Some(result.removed_path))
             }
             Err(error) => {
-                warnings.push(format!("merge succeeded but cleanup failed: {error}"));
+                warnings.push(partial_success_warning("cleanup", "removed", &error));
                 (false, None)
             }
         }
@@ -1147,7 +1215,11 @@ pub fn merge_with_preflight(
                 }
             },
             Err(error) => {
-                warnings.push(format!("merge succeeded but push refused: {error}"));
+                warnings.push(partial_success_warning(
+                    "destination push",
+                    "pushed",
+                    &error,
+                ));
                 false
             }
         }

@@ -452,6 +452,9 @@ pub struct JsonMergeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_path: Option<String>,
     pub pushed: bool,
+    /// Partial-success diagnostics, such as an identity change after commit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preflight: Option<JsonMergePreflight>,
     #[serde(skip_serializing_if = "Option::is_none")]
