@@ -384,6 +384,20 @@ pub struct JsonMergeResponse {
     pub pushed: bool,
 }
 
+/// Resolution metadata emitted before an `exec --json` child starts.
+///
+/// This is intentionally not an execution result: child stdout and stderr
+/// remain inherited, and child stderr is appended to the same stderr stream.
+#[derive(Debug, Serialize)]
+pub struct JsonExecResponse {
+    pub event: &'static str,
+    pub resolved: bool,
+    pub message: String,
+    pub branch: String,
+    pub repo_root: String,
+    pub worktree_path: String,
+}
+
 /// JSON response for the materialize command.
 #[derive(Debug, Serialize)]
 pub struct JsonMaterializeResponse {
@@ -422,6 +436,17 @@ pub struct JsonSetupResponse {
 /// Serialize a value as a compact single-line JSON object to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
+        "{}",
+        serde_json::to_string(value)
+            .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
+    );
+    Ok(())
+}
+
+/// Serialize pre-execution metadata to stderr so the child owns stdout
+/// unchanged. The stream may contain child diagnostics after this line.
+pub fn print_json_stderr(value: &impl Serialize) -> crate::error::Result<()> {
+    eprintln!(
         "{}",
         serde_json::to_string(value)
             .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?

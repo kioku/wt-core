@@ -768,6 +768,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

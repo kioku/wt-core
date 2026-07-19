@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -80,6 +81,25 @@ pub enum Command {
         /// Print only the worktree path (for shell wrappers)
         #[arg(long, conflicts_with = "json")]
         print_cd_path: bool,
+    },
+
+    /// Execute a command in an existing worktree
+    Exec {
+        /// Branch name of the worktree to execute in
+        branch: String,
+
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Emit one resolved-worktree metadata line on stderr
+        /// (child stderr follows on the same stream)
+        #[arg(long)]
+        json: bool,
+
+        /// Command and arguments to execute; must follow `--`
+        #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+        command: Vec<OsString>,
     },
 
     /// Remove a worktree and its local branch

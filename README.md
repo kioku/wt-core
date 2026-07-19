@@ -36,8 +36,11 @@ these conventions upfront makes everything else predictable.
   and require `--execute` to take action.
 
 - **Three output modes everywhere.** Every command supports human-readable
-  output (default), `--json` for machine consumption, and a
+  output (default), `--json` for machine consumption, and
   `--print-cd-path` / versioned `--print-paths` modes for shell wrappers.
+  `exec --json` is the exception: it writes resolution metadata to stderr so
+  the child owns stdout unchanged; child diagnostics may follow on that stderr
+  stream.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -49,6 +52,7 @@ these conventions upfront makes everything else predictable.
 ```
 wt add <branch> [--base <rev>]         Create a worktree and branch
 wt go [<branch>] [-i]                  Switch to an existing worktree
+wt exec <branch> -- <command...>       Run a command in a worktree
 wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
                                       [--keep-branch] preserves the branch
@@ -84,6 +88,46 @@ wt go feature/auth     # switch directly
 wt go                  # interactive picker (auto-selects if only one)
 wt go -i               # force picker even with one candidate
 ```
+
+### `wt exec`
+
+Resolves the branch using the same worktree lookup as `wt go`, then runs the
+command directly in that worktree. Arguments after `--` are passed unchanged;
+no shell is inserted. The child inherits stdin, stdout, and stderr, and its
+exit status is returned by `wt-core`.
+
+```bash
+wt exec feature/auth -- cargo test
+wt exec feature/auth -- make preview
+```
+
+Use `--json` to emit one compact `exec_resolved` metadata object on stderr
+before the child starts. The first line is resolution metadata, not a command
+result (`resolved: true` means only that the worktree was resolved). Child
+stdout and stderr remain inherited. After the metadata line, stderr may contain
+inherited child diagnostics or a `wt-core` launch error if the command cannot
+be started, so the entire stream is not one parseable JSON document.
+
+The metadata schema is:
+
+```json
+{
+  "event": "exec_resolved",
+  "resolved": true,
+  "message": "resolved worktree for branch 'feature/auth'",
+  "branch": "feature/auth",
+  "repo_root": "/abs/repo",
+  "worktree_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4"
+}
+```
+
+On Unix, `wt-core` replaces itself with the resolved command, preserving
+native stdio, status, and signal behavior. On Windows, it waits for the child
+inside a kill-on-close Job Object so descendants are terminated if `wt-core`
+is terminated. If containment cannot be established, execution is stopped
+rather than leaving an uncontained child. Windows console-control behavior is
+still governed by Windows console semantics, and the short CreateProcess/job
+attachment interval is an unavoidable residual race.
 
 ### `wt list`
 
@@ -208,7 +252,7 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | Flag              | Behavior                                     |
 |-------------------|----------------------------------------------|
 | *(default)*       | Human-readable text                          |
-| `--json`          | Single-line JSON envelope on stdout          |
+| `--json`          | Single-line JSON envelope on stdout (except `exec`, which emits resolution metadata on stderr) |
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
 | `--print-paths`   | Version 1 merge metadata on stdout (for wrappers) |
 | `--print-paths-v2` | Version 2 merge metadata, including destination path (for wrappers) |
@@ -226,6 +270,11 @@ The merge `--print-paths` protocol is version 1 and emits six lines:
 `pushed`. It remains unchanged for existing consumers. Bindings use the
 explicitly versioned `--print-paths-v2` protocol, which emits those same six
 lines followed by `destination_path` as line seven.
+
+For commands other than `exec`, `--json` emits one compact JSON object per
+line on stdout. `exec --json` emits only its first resolution line as JSON on
+stderr; post-metadata stderr may contain inherited child diagnostics or a
+`wt-core` launch error if the command cannot be started.
 
 JSON envelope example (`add`, `go`, `remove`):
 

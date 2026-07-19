@@ -1,20 +1,117 @@
+use std::ffi::{OsStr, OsString};
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
+
+#[cfg(not(unix))]
+use std::process::ExitStatus;
 
 use crate::cli::{Cli, ColorChoice, Command, MaterializeMode, Shell};
 use crate::domain::{self, BranchName, WorktreeStatsStatus};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse,
-    JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse, JsonPruneDryRunEntry,
-    JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
-    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    find_current_worktree, print_json, print_json_stderr, JsonDoctorResponse, JsonExecResponse,
+    JsonListResponse, JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse,
+    JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry,
+    JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat,
+    StatusFormat,
 };
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
 
-pub fn run(cli: Cli) -> Result<()> {
+#[cfg(windows)]
+mod windows_job {
+    use std::io;
+    use std::mem::size_of;
+    use std::os::windows::io::AsRawHandle;
+    use std::process::Child;
+
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
+    use windows_sys::Win32::System::JobObjects::{
+        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
+        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    };
+
+    /// Keeps the child and its descendants in a kill-on-close job.
+    ///
+    /// Windows has no Unix-style `exec`, so a terminated `wt-core` process
+    /// cannot otherwise guarantee that descendants do not outlive it.
+    pub struct ChildJob(HANDLE);
+
+    impl ChildJob {
+        pub fn for_child(child: &Child) -> io::Result<Self> {
+            // A private job with KILL_ON_JOB_CLOSE is closed automatically by
+            // the OS if wt-core is terminated without unwinding.
+            let handle =
+                // SAFETY: null attributes and name request an unnamed private job.
+                unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            if handle.is_null() {
+                return Err(last_error());
+            }
+
+            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured =
+                // SAFETY: handle is valid and limits remains alive for this call.
+                unsafe {
+                    SetInformationJobObject(
+                        handle,
+                        JobObjectExtendedLimitInformation,
+                        (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
+                            .cast::<core::ffi::c_void>(),
+                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                    )
+                } != 0;
+            if !configured {
+                let error = last_error();
+                let _ =
+                    // SAFETY: handle was returned by CreateJobObjectW and is owned here.
+                    unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+
+            let assigned =
+                // SAFETY: handle is valid and the live child owns a valid process handle.
+                unsafe { AssignProcessToJobObject(handle, child.as_raw_handle()) } != 0;
+            if !assigned {
+                let error = last_error();
+                let _ =
+                    // SAFETY: handle was returned by CreateJobObjectW and is owned here.
+                    unsafe { CloseHandle(handle) };
+                return Err(error);
+            }
+
+            Ok(Self(handle))
+        }
+    }
+
+    impl Drop for ChildJob {
+        fn drop(&mut self) {
+            // Closing the final job handle terminates all remaining members.
+            let _ =
+                // SAFETY: self.0 is the owned handle returned by CreateJobObjectW.
+                unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn last_error() -> io::Error {
+        let error =
+            // SAFETY: GetLastError has no preconditions and returns this thread's error.
+            unsafe { GetLastError() };
+        io::Error::from_raw_os_error(error as i32)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Success,
+    #[cfg_attr(unix, allow(dead_code))]
+    Exit(i32),
+}
+
+pub fn run(cli: Cli) -> Result<RunOutcome> {
     match cli.command {
         Command::List {
             repo,
@@ -22,31 +119,43 @@ pub fn run(cli: Cli) -> Result<()> {
             stats,
             against,
             color,
-        } => cmd_list(repo, status_fmt(json), stats, against.as_deref(), color),
+        } => success(cmd_list(
+            repo,
+            status_fmt(json),
+            stats,
+            against.as_deref(),
+            color,
+        )),
         Command::Add {
             branch,
             base,
             repo,
             json,
             print_cd_path,
-        } => cmd_add(
+        } => success(cmd_add(
             &BranchName::new(&branch),
             base.as_deref(),
             repo,
             nav_fmt(json, print_cd_path),
-        ),
+        )),
         Command::Go {
             branch,
             interactive,
             repo,
             json,
             print_cd_path,
-        } => cmd_go(
+        } => success(cmd_go(
             branch.as_deref(),
             interactive,
             repo,
             nav_fmt(json, print_cd_path),
-        ),
+        )),
+        Command::Exec {
+            branch,
+            repo,
+            json,
+            command,
+        } => cmd_exec(&branch, repo, json, command),
         Command::Remove {
             branch,
             force,
@@ -54,13 +163,13 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
             print_paths,
-        } => cmd_remove(
+        } => success(cmd_remove(
             branch.as_deref().map(BranchName::new),
             force,
             keep_branch,
             repo,
             remove_fmt(json, print_paths),
-        ),
+        )),
         Command::Merge {
             branch,
             into,
@@ -70,14 +179,14 @@ pub fn run(cli: Cli) -> Result<()> {
             json,
             print_paths,
             print_paths_v2,
-        } => cmd_merge(
+        } => success(cmd_merge(
             branch.as_deref().map(BranchName::new),
             into,
             push,
             no_cleanup,
             repo,
             merge_fmt(json, print_paths, print_paths_v2),
-        ),
+        )),
         Command::Materialize {
             repo_slug,
             remote_url,
@@ -88,7 +197,7 @@ pub fn run(cli: Cli) -> Result<()> {
             object_source,
             mode,
             json,
-        } => cmd_materialize(
+        } => success(cmd_materialize(
             crate::materialize::MaterializeOptions {
                 repo_slug,
                 remote_url,
@@ -100,7 +209,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 mode,
             },
             json,
-        ),
+        )),
         Command::Diff {
             branch,
             against,
@@ -111,31 +220,35 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             print_command,
             repo,
-        } => cmd_diff(
+        } => success(cmd_diff(
             branch.as_deref().map(BranchName::new),
             against.as_deref(),
             DiffMode::from_flags(dirty, staged, unstaged)?,
             tool.as_deref(),
             dry_run || print_command,
             repo,
-        ),
+        )),
         Command::Prune {
             execute,
             force,
             integrated_into,
             repo,
             json,
-        } => cmd_prune(
+        } => success(cmd_prune(
             execute,
             force,
             integrated_into.as_deref(),
             repo,
             prune_fmt(json),
-        ),
-        Command::Setup { repo, json } => cmd_setup(repo, status_fmt(json)),
-        Command::Init { shell } => cmd_init(shell),
-        Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
+        )),
+        Command::Setup { repo, json } => success(cmd_setup(repo, status_fmt(json))),
+        Command::Init { shell } => success(cmd_init(shell)),
+        Command::Doctor { repo, json } => success(cmd_doctor(repo, status_fmt(json))),
     }
+}
+
+fn success(result: Result<()>) -> Result<RunOutcome> {
+    result.map(|()| RunOutcome::Success)
 }
 
 fn nav_fmt(json: bool, cd_path: bool) -> NavigationFormat {
@@ -670,6 +783,101 @@ fn cmd_go(
         }
     }
     Ok(())
+}
+
+fn cmd_exec(
+    branch: &str,
+    repo: Option<PathBuf>,
+    json: bool,
+    command: Vec<OsString>,
+) -> Result<RunOutcome> {
+    let program = command
+        .first()
+        .ok_or_else(|| AppError::usage("command is required after `--`"))?;
+    let repo = resolve_repo(repo)?;
+    let result = worktree::go(&repo, &BranchName::new(branch))?;
+
+    if json {
+        print_json_stderr(&JsonExecResponse {
+            event: "exec_resolved",
+            resolved: true,
+            message: format!("resolved worktree for branch '{branch}'"),
+            branch: result.branch.to_string(),
+            repo_root: result.repo_root.display().to_string(),
+            worktree_path: result.worktree_path.display().to_string(),
+        })?;
+    }
+
+    let mut process = ProcessCommand::new(program);
+    process
+        .args(&command[1..])
+        .current_dir(&result.worktree_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // Match internal Git invocations: a hook's GIT_DIR must not redirect the
+    // command away from the resolved worktree.
+    git::sanitize_git_environment(&mut process);
+
+    run_resolved_command(process, program)
+}
+
+#[cfg(unix)]
+fn run_resolved_command(mut process: ProcessCommand, program: &OsStr) -> Result<RunOutcome> {
+    use std::os::unix::process::CommandExt;
+
+    // Resolution has already completed. Replacing this process gives the
+    // command exact inherited stdio, exit status, and signal semantics; a
+    // supervisor terminating wt-core therefore terminates the command itself.
+    let error = process.exec();
+    Err(execution_error(program, error))
+}
+
+#[cfg(windows)]
+fn run_resolved_command(mut process: ProcessCommand, program: &OsStr) -> Result<RunOutcome> {
+    let mut child = process
+        .spawn()
+        .map_err(|error| execution_error(program, error))?;
+    let _job = match windows_job::ChildJob::for_child(&child) {
+        Ok(job) => job,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(AppError::usage(format!(
+                "failed to contain '{}': {error}",
+                program.to_string_lossy()
+            )));
+        }
+    };
+
+    let status = child
+        .wait()
+        .map_err(|error| execution_error(program, error))?;
+    Ok(child_outcome(status))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn run_resolved_command(mut process: ProcessCommand, program: &OsStr) -> Result<RunOutcome> {
+    let status = process
+        .status()
+        .map_err(|error| execution_error(program, error))?;
+    Ok(child_outcome(status))
+}
+
+fn execution_error(program: &OsStr, error: std::io::Error) -> AppError {
+    AppError::usage(format!(
+        "failed to execute '{}': {error}",
+        program.to_string_lossy()
+    ))
+}
+
+#[cfg(not(unix))]
+fn child_outcome(status: ExitStatus) -> RunOutcome {
+    if status.success() {
+        RunOutcome::Success
+    } else {
+        RunOutcome::Exit(status.code().unwrap_or(1))
+    }
 }
 
 /// Resolve a branch via interactive picker or error if not possible.

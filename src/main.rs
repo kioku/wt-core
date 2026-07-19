@@ -16,7 +16,8 @@ fn main() -> process::ExitCode {
     let cli = cli::Cli::parse();
 
     match commands::run(cli) {
-        Ok(()) => process::ExitCode::SUCCESS,
+        Ok(commands::RunOutcome::Success) => process::ExitCode::SUCCESS,
+        Ok(commands::RunOutcome::Exit(code)) => process::exit(code),
         Err(e) => {
             eprintln!("error: {e}");
             e.code.into()
