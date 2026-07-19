@@ -36,7 +36,9 @@ these conventions upfront makes everything else predictable.
 
 - **Three output modes everywhere.** Every command supports human-readable
   output (default), `--json` for machine consumption, and a
-  `--print-cd-path` / `--print-paths` mode for shell wrappers.
+  `--print-cd-path` / `--print-paths` mode for shell wrappers. `exec --json`
+  is the exception: it writes metadata to stderr so the child owns stdout
+  unchanged.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -48,6 +50,7 @@ these conventions upfront makes everything else predictable.
 ```
 wt add <branch> [--base <rev>]         Create a worktree and branch
 wt go [<branch>] [-i]                  Switch to an existing worktree
+wt exec <branch> -- <command...>       Run a command in a worktree
 wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
@@ -81,6 +84,21 @@ wt go feature/auth     # switch directly
 wt go                  # interactive picker (auto-selects if only one)
 wt go -i               # force picker even with one candidate
 ```
+
+### `wt exec`
+
+Resolves the branch using the same worktree lookup as `wt go`, then runs the
+command directly in that worktree. Arguments after `--` are passed unchanged;
+no shell is inserted. The child inherits stdin, stdout, and stderr, and its
+exit status is returned by `wt-core`.
+
+```bash
+wt exec feature/auth -- cargo test
+wt exec feature/auth -- make preview
+```
+
+Use `--json` to emit one compact metadata object on stderr before the child
+starts. This keeps child stdout suitable for command output and pipelines.
 
 ### `wt list`
 

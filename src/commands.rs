@@ -1,20 +1,29 @@
+use std::ffi::OsString;
 use std::io::IsTerminal;
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, ExitStatus, Stdio};
 
 use crate::cli::{Cli, ColorChoice, Command, MaterializeMode, Shell};
 use crate::domain::{self, BranchName, WorktreeStatsStatus};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse,
-    JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse, JsonPruneDryRunEntry,
-    JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
-    JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    find_current_worktree, print_json, print_json_stderr, JsonDoctorResponse, JsonExecResponse,
+    JsonListResponse, JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse,
+    JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry,
+    JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat,
+    StatusFormat,
 };
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
 
-pub fn run(cli: Cli) -> Result<()> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    Success,
+    Exit(i32),
+}
+
+pub fn run(cli: Cli) -> Result<RunOutcome> {
     match cli.command {
         Command::List {
             repo,
@@ -22,43 +31,55 @@ pub fn run(cli: Cli) -> Result<()> {
             stats,
             against,
             color,
-        } => cmd_list(repo, status_fmt(json), stats, against.as_deref(), color),
+        } => success(cmd_list(
+            repo,
+            status_fmt(json),
+            stats,
+            against.as_deref(),
+            color,
+        )),
         Command::Add {
             branch,
             base,
             repo,
             json,
             print_cd_path,
-        } => cmd_add(
+        } => success(cmd_add(
             &BranchName::new(&branch),
             base.as_deref(),
             repo,
             nav_fmt(json, print_cd_path),
-        ),
+        )),
         Command::Go {
             branch,
             interactive,
             repo,
             json,
             print_cd_path,
-        } => cmd_go(
+        } => success(cmd_go(
             branch.as_deref(),
             interactive,
             repo,
             nav_fmt(json, print_cd_path),
-        ),
+        )),
+        Command::Exec {
+            branch,
+            repo,
+            json,
+            command,
+        } => cmd_exec(&branch, repo, json, command),
         Command::Remove {
             branch,
             force,
             repo,
             json,
             print_paths,
-        } => cmd_remove(
+        } => success(cmd_remove(
             branch.as_deref().map(BranchName::new),
             force,
             repo,
             remove_fmt(json, print_paths),
-        ),
+        )),
         Command::Merge {
             branch,
             into,
@@ -67,14 +88,14 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
             print_paths,
-        } => cmd_merge(
+        } => success(cmd_merge(
             branch.as_deref().map(BranchName::new),
             into,
             push,
             no_cleanup,
             repo,
             merge_fmt(json, print_paths),
-        ),
+        )),
         Command::Materialize {
             repo_slug,
             remote_url,
@@ -85,7 +106,7 @@ pub fn run(cli: Cli) -> Result<()> {
             object_source,
             mode,
             json,
-        } => cmd_materialize(
+        } => success(cmd_materialize(
             crate::materialize::MaterializeOptions {
                 repo_slug,
                 remote_url,
@@ -97,7 +118,7 @@ pub fn run(cli: Cli) -> Result<()> {
                 mode,
             },
             json,
-        ),
+        )),
         Command::Diff {
             branch,
             against,
@@ -108,25 +129,35 @@ pub fn run(cli: Cli) -> Result<()> {
             dry_run,
             print_command,
             repo,
-        } => cmd_diff(
+        } => success(cmd_diff(
             branch.as_deref().map(BranchName::new),
             against.as_deref(),
             DiffMode::from_flags(dirty, staged, unstaged)?,
             tool.as_deref(),
             dry_run || print_command,
             repo,
-        ),
+        )),
         Command::Prune {
             execute,
             force,
             mainline,
             repo,
             json,
-        } => cmd_prune(execute, force, mainline.as_deref(), repo, prune_fmt(json)),
-        Command::Setup { repo, json } => cmd_setup(repo, status_fmt(json)),
-        Command::Init { shell } => cmd_init(shell),
-        Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
+        } => success(cmd_prune(
+            execute,
+            force,
+            mainline.as_deref(),
+            repo,
+            prune_fmt(json),
+        )),
+        Command::Setup { repo, json } => success(cmd_setup(repo, status_fmt(json))),
+        Command::Init { shell } => success(cmd_init(shell)),
+        Command::Doctor { repo, json } => success(cmd_doctor(repo, status_fmt(json))),
     }
+}
+
+fn success(result: Result<()>) -> Result<RunOutcome> {
+    result.map(|()| RunOutcome::Success)
 }
 
 fn nav_fmt(json: bool, cd_path: bool) -> NavigationFormat {
@@ -659,6 +690,65 @@ fn cmd_go(
         }
     }
     Ok(())
+}
+
+fn cmd_exec(
+    branch: &str,
+    repo: Option<PathBuf>,
+    json: bool,
+    command: Vec<OsString>,
+) -> Result<RunOutcome> {
+    let program = command
+        .first()
+        .ok_or_else(|| AppError::usage("command is required after `--`"))?;
+    let repo = resolve_repo(repo)?;
+    let result = worktree::go(&repo, &BranchName::new(branch))?;
+
+    if json {
+        print_json_stderr(&JsonExecResponse {
+            ok: true,
+            message: format!("executing command in worktree for branch '{branch}'"),
+            branch: result.branch.to_string(),
+            repo_root: result.repo_root.display().to_string(),
+            worktree_path: result.worktree_path.display().to_string(),
+        })?;
+    }
+
+    let status = ProcessCommand::new(program)
+        .args(&command[1..])
+        .current_dir(&result.worktree_path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .map_err(|error| {
+            AppError::usage(format!(
+                "failed to execute '{}': {error}",
+                program.to_string_lossy()
+            ))
+        })?;
+
+    Ok(child_outcome(status))
+}
+
+fn child_outcome(status: ExitStatus) -> RunOutcome {
+    if status.success() {
+        return RunOutcome::Success;
+    }
+
+    let code = status.code().unwrap_or_else(|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+
+            status.signal().map_or(1, |signal| 128 + signal)
+        }
+        #[cfg(not(unix))]
+        {
+            1
+        }
+    });
+    RunOutcome::Exit(code)
 }
 
 /// Resolve a branch via interactive picker or error if not possible.

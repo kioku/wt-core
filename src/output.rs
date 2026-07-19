@@ -356,6 +356,16 @@ pub struct JsonMergeResponse {
     pub pushed: bool,
 }
 
+/// JSON response emitted on stderr when `exec --json` resolves a worktree.
+#[derive(Debug, Serialize)]
+pub struct JsonExecResponse {
+    pub ok: bool,
+    pub message: String,
+    pub branch: String,
+    pub repo_root: String,
+    pub worktree_path: String,
+}
+
 /// JSON response for the materialize command.
 #[derive(Debug, Serialize)]
 pub struct JsonMaterializeResponse {
@@ -394,6 +404,16 @@ pub struct JsonSetupResponse {
 /// Serialize a value as a compact single-line JSON object to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
+        "{}",
+        serde_json::to_string(value)
+            .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
+    );
+    Ok(())
+}
+
+/// Serialize execution metadata to stderr so the child owns stdout unchanged.
+pub fn print_json_stderr(value: &impl Serialize) -> crate::error::Result<()> {
+    eprintln!(
         "{}",
         serde_json::to_string(value)
             .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
