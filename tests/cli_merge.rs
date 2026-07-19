@@ -592,22 +592,40 @@ fn merge_print_paths_into_reports_destination_branch() {
 }
 
 #[test]
-fn merge_print_paths_conflicts_with_json() {
+fn merge_json_takes_precedence_over_print_paths() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
     wt_core()
+        .args(["add", "feature/json-precedence-merge", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-json-precedence-merge");
+    commit_file(&wt_dir, "precedence.txt", "precedence", "precedence commit");
+
+    let output = wt_core()
         .args([
             "merge",
-            "any-branch",
+            "feature/json-precedence-merge",
             "--repo",
             &repo_str,
             "--print-paths",
             "--json",
         ])
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("cannot be used with"));
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert_eq!(stdout.lines().count(), 1, "expected one JSON document");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "feature/json-precedence-merge");
+    assert_eq!(json["cleaned_up"], true);
+    assert!(json["removed_path"].as_str().is_some());
 }
 
 // ── Mainline detection ──────────────────────────────────────────────

@@ -42,6 +42,21 @@ end
 
 set WT_PATH (realpath "$PWD")
 
+# ── JSON output selection ────────────────────────────────────────────
+cd "$REPO_PATH"
+set json_add (wt add feat-json --json)
+if string match -q '*"cd_path"*' "$json_add"
+    pass "wt add --json: returns one JSON document"
+else
+    fail "wt add --json: expected JSON with cd_path"
+end
+if test (realpath "$PWD") = "$REPO_PATH"
+    pass "wt add --json: cwd unchanged"
+else
+    fail "wt add --json: cwd changed unexpectedly"
+end
+wt remove feat-json >/dev/null 2>&1
+
 # ── wt list ──────────────────────────────────────────────────────────
 set output (wt list 2>&1)
 if string match -q "*feat-one*" "$output"

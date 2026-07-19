@@ -45,6 +45,8 @@ export def --env "wt add" [
     --repo: path        # Repository path (defaults to cwd)
     --json              # Output as JSON (no cd)
 ] {
+    # JSON is the canonical machine format; keep it separate from the
+    # legacy path-only output used for the parent-shell cd.
     if $json {
         mut args = (build-args ["add" $branch] $repo true false)
         if $base != null { $args = ($args | append ["--base" $base]) }

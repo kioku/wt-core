@@ -130,10 +130,12 @@ pub fn run(cli: Cli) -> Result<()> {
 }
 
 fn nav_fmt(json: bool, cd_path: bool) -> NavigationFormat {
-    if cd_path {
-        NavigationFormat::CdPath
-    } else if json {
+    // JSON is the canonical machine format. The path flag remains accepted
+    // so wrappers can append it without making --json invocations invalid.
+    if json {
         NavigationFormat::Json
+    } else if cd_path {
+        NavigationFormat::CdPath
     } else {
         NavigationFormat::Human
     }
@@ -148,20 +150,24 @@ fn status_fmt(json: bool) -> StatusFormat {
 }
 
 fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
-    if print_paths {
-        RemoveFormat::PrintPaths
-    } else if json {
+    // Keep the same precedence as add/go: JSON is canonical, while the
+    // legacy line-oriented output remains available when requested alone.
+    if json {
         RemoveFormat::Json
+    } else if print_paths {
+        RemoveFormat::PrintPaths
     } else {
         RemoveFormat::Human
     }
 }
 
 fn merge_fmt(json: bool, print_paths: bool) -> MergeFormat {
-    if print_paths {
-        MergeFormat::PrintPaths
-    } else if json {
+    // Keep the same precedence as add/go: JSON is canonical, while the
+    // legacy line-oriented output remains available when requested alone.
+    if json {
         MergeFormat::Json
+    } else if print_paths {
+        MergeFormat::PrintPaths
     } else {
         MergeFormat::Human
     }

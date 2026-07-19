@@ -42,6 +42,21 @@ if ($env.PWD | str contains ".worktrees") and ($env.PWD | str contains "feat-one
 
 let wt_path = $env.PWD
 
+# ── JSON output selection ────────────────────────────────────────────
+cd $"($work)/repo"
+let json_add = (wt add feat-json --json)
+if ($json_add.cd_path? != null) {
+    pass "wt add --json: returns one JSON document"
+} else {
+    fail "wt add --json: expected JSON with cd_path"
+}
+if $env.PWD == ($"($work)/repo" | path expand) {
+    pass "wt add --json: cwd unchanged"
+} else {
+    fail "wt add --json: cwd changed unexpectedly"
+}
+wt remove feat-json | ignore
+
 # ── wt list ──────────────────────────────────────────────────────────
 let output = (wt list | str join "\n")
 if ($output | str contains "feat-one") {

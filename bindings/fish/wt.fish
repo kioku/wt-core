@@ -16,6 +16,19 @@ function wt --description "Git worktree manager"
                 end
             end
 
+            # JSON is a caller-selected machine format. Do not append a
+            # path-only flag, which would otherwise change the JSON stream.
+            set -l want_json false
+            for arg in $argv
+                if test "$arg" = "--json"
+                    set want_json true
+                end
+            end
+            if test "$want_json" = true
+                wt-core add $argv
+                return $status
+            end
+
             set -l target (wt-core add $argv --print-cd-path 2>/dev/null)
             if test $status -eq 0 -a -n "$target"
                 cd "$target"

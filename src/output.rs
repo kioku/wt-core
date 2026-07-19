@@ -5,6 +5,9 @@ use serde::Serialize;
 use crate::domain::{Worktree, WorktreeStatsStatus};
 
 /// Output format for commands that produce a navigable path (add, go).
+///
+/// JSON is selected before the legacy path-only mode when both flags are
+/// present; this keeps wrapper-added path flags compatible with machine calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavigationFormat {
     Human,
@@ -24,7 +27,7 @@ pub enum StatusFormat {
 pub enum RemoveFormat {
     Human,
     Json,
-    /// `--print-paths`: prints removed_path, repo_root, and branch (one per line).
+    /// Legacy `--print-paths`: prints removed_path, repo_root, and branch (one per line).
     PrintPaths,
 }
 
@@ -335,7 +338,7 @@ pub struct JsonSkippedEntry {
 pub enum MergeFormat {
     Human,
     Json,
-    /// `--print-paths`: prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
+    /// Legacy `--print-paths`: prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
     PrintPaths,
 }
 

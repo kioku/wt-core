@@ -34,9 +34,11 @@ these conventions upfront makes everything else predictable.
 - **Dry-run first.** Destructive batch operations (`prune`) default to dry-run
   and require `--execute` to take action.
 
-- **Three output modes everywhere.** Every command supports human-readable
-  output (default), `--json` for machine consumption, and a
-  `--print-cd-path` / `--print-paths` mode for shell wrappers.
+- **One output contract for navigation.** `add`, `go`, `remove`, and `merge`
+  use human-readable output by default and `--json` as their canonical machine
+  format. The legacy `--print-cd-path` / `--print-paths` flags remain
+  available for existing shell scripts; if a legacy path flag is combined
+  with `--json`, JSON takes precedence.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -195,14 +197,18 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 
 ## Output Modes
 
-| Flag              | Behavior                                     |
-|-------------------|----------------------------------------------|
-| *(default)*       | Human-readable text                          |
-| `--json`          | Single-line JSON envelope on stdout          |
-| `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
-| `--print-paths`   | Multi-line key values on stdout (for wrappers) |
+| Flag              | Behavior                                                  |
+|-------------------|-----------------------------------------------------------|
+| *(default)*       | Human-readable text                                       |
+| `--json`          | One compact JSON document on stdout                       |
+| `--print-cd-path` | Legacy bare absolute path for `add` and `go`              |
+| `--print-paths`   | Legacy multi-line fields for `remove` and `merge`         |
 
-`--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
+For `add`, `go`, `remove`, and `merge`, `--json` is authoritative when it is
+combined with either legacy path flag. This lets a wrapper safely append its
+legacy selector while a caller requests JSON, without producing competing
+stdout formats. JSON is exactly one document on stdout; warnings and errors
+remain on stderr.
 
 JSON envelope example (`add`, `go`, `remove`):
 
@@ -246,7 +252,10 @@ JSON envelope example (`merge`):
 
 ## Shell Integration
 
-Each binding wraps the binary and handles `cd` in the parent shell.
+Each binding wraps the binary and handles `cd` in the parent shell. A
+caller-supplied `--json` is passed through unchanged, so it returns the JSON
+document and does not change the shell's cwd. Without `--json`, bindings use
+the legacy path output internally and preserve the normal `cd` behavior.
 
 You can either source files from `bindings/` directly, or generate them with
 `wt-core init <shell>`.

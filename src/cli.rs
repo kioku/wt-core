@@ -55,8 +55,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print only the worktree path (for shell wrappers)
-        #[arg(long, conflicts_with = "json")]
+        /// Print only the worktree path (legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_cd_path: bool,
     },
 
@@ -77,8 +79,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print only the worktree path (for shell wrappers)
-        #[arg(long, conflicts_with = "json")]
+        /// Print only the worktree path (legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_cd_path: bool,
     },
 
@@ -99,8 +103,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print removed_path, repo_root, and branch (one per line) for shell wrappers
-        #[arg(long, conflicts_with = "json")]
+        /// Print removed_path, repo_root, and branch (one per line; legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths: bool,
     },
 
@@ -129,8 +135,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line) for shell wrappers
-        #[arg(long, conflicts_with = "json")]
+        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line; legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths: bool,
     },
 

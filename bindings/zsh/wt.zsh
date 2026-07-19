@@ -22,6 +22,17 @@ wt() {
                 esac
             done
 
+            # JSON is a caller-selected machine format. Do not append a
+            # path-only flag, which would otherwise change the JSON stream.
+            local want_json=false
+            for arg in "$@"; do
+                [[ "$arg" == "--json" ]] && want_json=true
+            done
+            if [[ "$want_json" == true ]]; then
+                wt-core add "$@"
+                return $?
+            fi
+
             local target
             target=$(wt-core add "$@" --print-cd-path 2>/dev/null)
             if [[ $? -eq 0 ]] && [[ -n "$target" ]]; then

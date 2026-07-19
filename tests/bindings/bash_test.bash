@@ -33,6 +33,17 @@ wt add feat-one >/dev/null 2>&1
 
 WT_PATH="$(pwd -P)"
 
+# ── JSON output selection ────────────────────────────────────────────
+cd "$REPO_PATH"
+json_add=$(wt add feat-json --json)
+echo "$json_add" | grep -q '"cd_path"' \
+    && pass "wt add --json: returns one JSON document" \
+    || fail "wt add --json: expected JSON with cd_path"
+[[ "$(pwd -P)" == "$REPO_PATH" ]] \
+    && pass "wt add --json: cwd unchanged" \
+    || fail "wt add --json: cwd changed unexpectedly"
+wt remove feat-json >/dev/null 2>&1
+
 # ── wt list ──────────────────────────────────────────────────────────
 output=$(wt list 2>&1)
 echo "$output" | grep -q "feat-one" \
