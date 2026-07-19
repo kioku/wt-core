@@ -545,6 +545,43 @@ fn merge_print_paths_returns_six_lines() {
 }
 
 #[test]
+fn merge_print_paths_v2_appends_destination_path() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/paths-v2", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let wt_dir = find_worktree_dir(&repo.path(), "feature-paths-v2");
+    commit_file(&wt_dir, "v2.txt", "v2 work", "v2 commit");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/paths-v2",
+            "--repo",
+            &repo_str,
+            "--print-paths-v2",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 7, "expected 7 lines: {stdout}");
+    assert_eq!(lines[1], "feature/paths-v2");
+    assert_eq!(lines[2], "main");
+    assert_eq!(lines[3], "true");
+    assert_eq!(lines[5], "false");
+    assert_eq!(lines[6], repo_str);
+}
+
+#[test]
 fn merge_print_paths_into_reports_destination_branch() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -590,6 +627,25 @@ fn merge_print_paths_into_reports_destination_branch() {
     assert_eq!(lines[2], "release/paths");
 
     run_git(&["checkout", "main"], &repo.path());
+}
+
+#[test]
+fn merge_print_paths_v2_conflicts_with_json() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args([
+            "merge",
+            "any-branch",
+            "--repo",
+            &repo_str,
+            "--print-paths-v2",
+            "--json",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
 }
 
 #[test]
@@ -938,7 +994,92 @@ fn merge_no_branch_non_tty_from_main_worktree_errors() {
         .code(4);
 }
 
+#[test]
+fn merge_refuses_preexisting_destination_merge_without_aborting_it() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/preexisting-merge");
+
+    wt_core()
+        .args(["add", "feature/preexisting-merge", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-preexisting-merge");
+    commit_file(&source, "README.md", "source conflict", "source conflict");
+    commit_file(
+        &destination,
+        "README.md",
+        "destination conflict",
+        "destination conflict",
+    );
+
+    let merge_output = git_allow_failure(
+        &["merge", "--no-ff", "feature/preexisting-merge"],
+        &destination,
+    );
+    assert!(
+        !merge_output.status.success(),
+        "manual merge should leave a conflict"
+    );
+    let merge_head = git_path(&destination, "MERGE_HEAD");
+    let merge_head_before = std::fs::read(&merge_head).expect("MERGE_HEAD should exist");
+    let status_before = git_status(&destination);
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/preexisting-merge",
+            "--into",
+            "release/preexisting-merge",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains("in-progress merge"))
+        .stderr(predicate::str::contains("finish or abort it"))
+        .stderr(predicate::str::contains("merge aborted").not());
+
+    assert_eq!(
+        std::fs::read(&merge_head).expect("MERGE_HEAD should remain"),
+        merge_head_before,
+        "pre-existing merge marker must not be changed"
+    );
+    assert_eq!(
+        git_status(&destination),
+        status_before,
+        "pre-existing conflict state must be preserved"
+    );
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
+
+/// Run a git command and return its raw output, allowing expected failures.
+fn git_allow_failure(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
+    let mut cmd = StdCommand::new("git");
+    cmd.args(args).current_dir(cwd);
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+    cmd.output().expect("failed to run git")
+}
+
+/// Resolve a git marker path for a specific worktree.
+fn git_path(cwd: &std::path::Path, marker: &str) -> std::path::PathBuf {
+    let output = git_allow_failure(&["rev-parse", "--git-path", marker], cwd);
+    assert!(output.status.success(), "git path lookup failed");
+    let path = std::path::PathBuf::from(
+        String::from_utf8(output.stdout)
+            .expect("invalid utf8")
+            .trim(),
+    );
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
 
 /// Get the git log as one-line entries.
 fn git_log_oneline(repo: &std::path::Path, branch: &str) -> String {

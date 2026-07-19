@@ -400,6 +400,47 @@ pub fn rev_exists(repo: &RepoRoot, rev: &str) -> bool {
     git(&["rev-parse", "--verify", rev], repo.as_ref()).is_ok()
 }
 
+/// Return the path Git uses for a repository-local marker from `cwd`.
+fn git_path(cwd: &Path, marker: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(git(&["rev-parse", "--git-path", marker], cwd)?);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(cwd.join(path))
+    }
+}
+
+/// Detect an operation already in progress in a particular worktree.
+///
+/// Git stores these markers in the per-worktree git directory when linked
+/// worktrees are enabled, so resolving them from `path` avoids inspecting the
+/// main worktree's state by mistake.
+pub fn operation_state(path: &Path) -> Result<Option<&'static str>> {
+    let markers = [
+        ("merge", &["MERGE_HEAD"][..]),
+        ("rebase", &["rebase-merge", "rebase-apply"][..]),
+        ("cherry-pick", &["CHERRY_PICK_HEAD", "sequencer"][..]),
+        ("revert", &["REVERT_HEAD"][..]),
+    ];
+
+    for (state, state_markers) in markers {
+        for marker in state_markers {
+            if git_path(path, marker)?.exists() {
+                return Ok(Some(state));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Check whether this invocation's merge left a merge state to abort.
+pub fn merge_in_progress(path: &Path) -> bool {
+    git_path(path, "MERGE_HEAD")
+        .map(|marker| marker.exists())
+        .unwrap_or(false)
+}
+
 /// Check if a remote-tracking branch exists for `origin/<branch>`.
 pub fn remote_branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
     let refspec = format!("refs/remotes/origin/{}", branch.as_str());

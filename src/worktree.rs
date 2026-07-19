@@ -703,14 +703,22 @@ fn resolve_merge_destination(
     }
 }
 
+/// Abort the merge marker created by this invocation, if any.
+fn abort_created_merge(path: &Path) {
+    if git::merge_in_progress(path) {
+        git::merge_abort(path);
+    }
+}
+
 /// Merge a worktree's branch into the selected destination.
 ///
 /// 1. Resolve the source branch (argument, cwd inference, or picker)
 /// 2. Resolve the destination worktree (`--into` or detected mainline)
 /// 3. Refuse self-merges and source merges from the main worktree
-/// 4. Run `git merge --no-ff <branch>` from the destination worktree
-/// 5. On conflict: abort the merge in that worktree and return an error
-/// 6. On success: optionally remove only the source worktree+branch, optionally push
+/// 4. Refuse destinations with an existing Git operation in progress
+/// 5. Run `git merge --no-ff <branch>` from the destination worktree
+/// 6. On conflict: abort only a merge state created by this invocation
+/// 7. On success: optionally remove only the source worktree+branch, optionally push
 pub fn merge(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
@@ -748,10 +756,22 @@ pub fn merge(
         ));
     }
 
+    // Never inspect or mutate an operation that was started before this
+    // invocation. In particular, `git merge --abort` below must not erase a
+    // user's existing merge, rebase, cherry-pick, or revert state.
+    if let Some(state) = git::operation_state(&destination.path)? {
+        return Err(AppError::conflict(format!(
+            "destination worktree '{}' has an in-progress {state}; finish or abort it before merging",
+            destination.path.display()
+        )));
+    }
+
     // Attempt the merge from the selected destination worktree's context.
     if let Err(e) = git::merge_no_ff(&destination.path, target_branch.as_str()) {
-        // Abort to restore the destination worktree to its pre-merge state.
-        git::merge_abort(&destination.path);
+        // The preflight above established that any merge state now belongs to
+        // this invocation. Do not abort unrelated failures that created no
+        // merge state.
+        abort_created_merge(&destination.path);
         return Err(AppError::conflict(format!(
             "merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{e}",
             target_branch

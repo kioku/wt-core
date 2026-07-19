@@ -166,24 +166,27 @@ wt() {
             fi
 
             local cwd_before="${PWD}"
-            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
+            # --print-paths-v2 preserves the six legacy fields and appends
+            # destination_path as field seven.
             local result
-            result=$(wt-core merge "$@" --print-paths)
+            result=$(wt-core merge "$@" --print-paths-v2)
             local rc=$?
             if [[ $rc -eq 0 ]]; then
-                local repo_root branch mainline cleaned_up removed_path pushed
+                local repo_root branch mainline cleaned_up removed_path pushed destination_path
                 repo_root=$(printf '%s\n' "$result" | sed -n '1p')
                 branch=$(printf '%s\n' "$result" | sed -n '2p')
                 mainline=$(printf '%s\n' "$result" | sed -n '3p')
                 cleaned_up=$(printf '%s\n' "$result" | sed -n '4p')
                 removed_path=$(printf '%s\n' "$result" | sed -n '5p')
                 pushed=$(printf '%s\n' "$result" | sed -n '6p')
+                destination_path=$(printf '%s\n' "$result" | sed -n '7p')
                 if [[ "$cleaned_up" == "true" ]] && [[ -n "$removed_path" ]]; then
                     if [[ "$cwd_before" == "${removed_path}"* ]]; then
                         cd "$repo_root" || true
                     fi
                 fi
                 echo "Merged '${branch}' into ${mainline}"
+                echo "Destination worktree: ${destination_path}"
                 if [[ "$cleaned_up" == "true" ]]; then
                     echo "Removed worktree and branch '${branch}'"
                 fi

@@ -67,13 +67,14 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
             print_paths,
+            print_paths_v2,
         } => cmd_merge(
             branch.as_deref().map(BranchName::new),
             into,
             push,
             no_cleanup,
             repo,
-            merge_fmt(json, print_paths),
+            merge_fmt(json, print_paths, print_paths_v2),
         ),
         Command::Materialize {
             repo_slug,
@@ -157,8 +158,10 @@ fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
     }
 }
 
-fn merge_fmt(json: bool, print_paths: bool) -> MergeFormat {
-    if print_paths {
+fn merge_fmt(json: bool, print_paths: bool, print_paths_v2: bool) -> MergeFormat {
+    if print_paths_v2 {
+        MergeFormat::PrintPathsV2
+    } else if print_paths {
         MergeFormat::PrintPaths
     } else if json {
         MergeFormat::Json
@@ -1084,6 +1087,15 @@ fn cmd_merge(
             println!("{}", result.cleaned_up);
             println!("{removed_str}");
             println!("{}", result.pushed);
+        }
+        MergeFormat::PrintPathsV2 => {
+            println!("{root_str}");
+            println!("{branch_name}");
+            println!("{}", result.mainline);
+            println!("{}", result.cleaned_up);
+            println!("{removed_str}");
+            println!("{}", result.pushed);
+            println!("{}", result.destination_path.display());
         }
         MergeFormat::Json => {
             let event = if result.cleaned_up {

@@ -36,7 +36,7 @@ these conventions upfront makes everything else predictable.
 
 - **Three output modes everywhere.** Every command supports human-readable
   output (default), `--json` for machine consumption, and a
-  `--print-cd-path` / `--print-paths` mode for shell wrappers.
+  `--print-cd-path` / versioned `--print-paths` modes for shell wrappers.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -201,9 +201,16 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | *(default)*       | Human-readable text                          |
 | `--json`          | Single-line JSON envelope on stdout          |
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
-| `--print-paths`   | Multi-line key values on stdout (for wrappers) |
+| `--print-paths`   | Version 1 merge metadata on stdout (for wrappers) |
+| `--print-paths-v2` | Version 2 merge metadata, including destination path (for wrappers) |
 
 `--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
+
+The merge `--print-paths` protocol is version 1 and emits six lines:
+`repo_root`, `branch`, `mainline`, `cleaned_up`, `removed_path`, and
+`pushed`. It remains unchanged for existing consumers. Bindings use the
+explicitly versioned `--print-paths-v2` protocol, which emits those same six
+lines followed by `destination_path` as line seven.
 
 JSON envelope example (`add`, `go`, `remove`):
 

@@ -335,8 +335,10 @@ pub struct JsonSkippedEntry {
 pub enum MergeFormat {
     Human,
     Json,
-    /// `--print-paths`: prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line). The destination path is available in human and JSON output.
+    /// `--print-paths`: version 1, prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
     PrintPaths,
+    /// `--print-paths-v2`: prints the version 1 fields followed by destination_path.
+    PrintPathsV2,
 }
 
 /// JSON response for the merge command.

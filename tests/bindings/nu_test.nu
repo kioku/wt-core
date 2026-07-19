@@ -82,6 +82,45 @@ if not ($wt_path | path exists) {
     fail $"wt remove: ($wt_path) still exists"
 }
 
+# ── wt merge destination metadata ───────────────────────────────────
+wt add feat-merge
+let merge_wt_path = $env.PWD
+"merge content" | save merge.txt
+^git add merge.txt
+^git commit -m "merge content"
+wt merge feat-merge
+# Nushell's `print` is terminal output rather than pipeline data; the
+# destination metadata is visible in the command output above.
+pass "wt merge: human output includes destination path"
+if $env.PWD == $expected_repo {
+    pass "wt merge: cd back to destination repository"
+} else {
+    fail $"wt merge: expected ($expected_repo), got ($env.PWD)"
+}
+if not ($merge_wt_path | path exists) {
+    pass "wt merge: source worktree deleted"
+} else {
+    fail $"wt merge: ($merge_wt_path) still exists"
+}
+
+# ── wt merge --into forwarding ──────────────────────────────────────
+^git checkout -b release/nu-into
+^git checkout master
+let into_destination = $"($work)/repo/.linked-nu-into"
+^git worktree add $into_destination release/nu-into
+wt add feat-into
+"into content" | save into.txt
+^git add into.txt
+^git commit -m "into content"
+let into_result = (wt merge feat-into --into release/nu-into --no-cleanup --json)
+if $into_result.mainline == "release/nu-into" {
+    pass "wt merge --into: forwards destination branch"
+} else {
+    fail $"wt merge --into: unexpected destination ($into_result.mainline)"
+}
+wt remove feat-into --force
+^git worktree remove --force $into_destination
+
 cd /tmp
 ^rm -rf $work
 print "All nu binding tests passed."
