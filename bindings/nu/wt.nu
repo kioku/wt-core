@@ -206,20 +206,32 @@ export def --env "wt remove" [
         cd $command_repo
         let effective_repo = if $repo != null { $command_repo } else { null }
         # --print-paths is the stable legacy three-line protocol:
-        # removed_path, repo_root, branch. Lifecycle status is explicit in
-        # --json; the binding already knows whether --keep-branch was requested.
-        let full_args = (build-args $args $effective_repo false false | append "--print-paths")
-        let output = (run-core $full_args)
+        # removed_path, repo_root, branch. Branch cleanup status is private
+        # navigation metadata so partial cleanup is not reported as complete.
+        let nav_file = (navigation-file)
+        let full_args = (build-args $args $effective_repo false false | append ["--print-paths" "--navigation-file" $nav_file])
+        let output = try { run-core $full_args } catch { |err|
+            cd $cwd_before
+            ^rm -f $nav_file
+            error make $err
+        }
         let lines = ($output | lines)
         let removed_path = ($lines | get 0)
         let repo_root = ($lines | get 1)
         let branch_name = ($lines | get 2)
+        let navigation = if ($nav_file | path exists) {
+            try { read-navigation $nav_file } catch { [] }
+        } else {
+            []
+        }
+        let branch_deleted = (($navigation | get 3 | default "false") == "true")
+        ^rm -f $nav_file
 
         if (path-is-within $cwd_before $removed_path) {
             cd $repo_root
         }
 
-        if $keep_branch {
+        if $keep_branch or not $branch_deleted {
             print $"Removed worktree and kept branch '($branch_name)'"
         } else {
             print $"Removed worktree and branch '($branch_name)'"

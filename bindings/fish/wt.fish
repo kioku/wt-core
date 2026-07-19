@@ -152,8 +152,8 @@ function wt --description "Git worktree manager"
 
             set -l cwd_before (pwd)
             # --print-paths is the stable legacy three-line protocol:
-            # removed_path, repo_root, branch. Lifecycle status is explicit in
-            # --json; the binding also knows whether --keep-branch was requested.
+            # removed_path, repo_root, branch. Branch cleanup status is private
+            # navigation metadata so partial cleanup is not reported as complete.
             set -l keep_branch false
             for arg in $argv
                 if test "$arg" = "--keep-branch"
@@ -162,22 +162,30 @@ function wt --description "Git worktree manager"
             end
             # stderr is left connected to the terminal so the interactive picker
             # (if triggered) renders correctly and errors are visible.
-            set -l lines (wt-core remove $argv --print-paths)
+            set -l nav_file (wt__navigation_file)
+            set -l lines (wt-core remove $argv --print-paths --navigation-file "$nav_file")
             set -l rc $status
             if test $rc -eq 0
                 set -l removed_path $lines[1]
                 set -l repo_root $lines[2]
                 set -l branch $lines[3]
+                set -l navigation (string split0 < "$nav_file")
+                set -l branch_deleted false
+                if test (count $navigation) -ge 4
+                    set branch_deleted $navigation[4]
+                end
+                rm -f -- "$nav_file"
                 # Check if cwd is under the removed worktree path.
                 if wt__path_is_within "$cwd_before" "$removed_path"
                     cd "$repo_root"; or true
                 end
-                if test "$keep_branch" = true
+                if test "$keep_branch" = true -o "$branch_deleted" != true
                     echo "Removed worktree and kept branch '$branch'"
                 else
                     echo "Removed worktree and branch '$branch'"
                 end
             else
+                rm -f -- "$nav_file"
                 return $rc
             end
 

@@ -294,6 +294,25 @@ else
     fail "matrix remove --json: cwd was not reset"
 end
 
+wt add matrix-partial >/dev/null 2>&1
+printf 'partial\n' > partial.txt
+git add partial.txt
+git commit -m "partial cleanup" >/dev/null 2>&1
+set partial_output_file "$WORK/fish-partial.out"
+wt remove matrix-partial >"$partial_output_file"
+set partial_output (cat "$partial_output_file")
+if string match -q "*kept branch 'matrix-partial'*" "$partial_output"
+    pass "matrix remove: partial cleanup reports kept branch"
+else
+    fail "matrix remove: partial cleanup claimed branch deletion"
+end
+git show-ref --verify --quiet refs/heads/matrix-partial
+if test $status -eq 0
+    pass "matrix remove: partial cleanup retains branch"
+else
+    fail "matrix remove: partial cleanup deleted branch"
+end
+
 wt add matrix-merge >/dev/null 2>&1
 printf 'merge\n' > merge.txt
 git add merge.txt

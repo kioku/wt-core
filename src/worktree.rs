@@ -323,7 +323,16 @@ fn remove_with_branch_context(
     branch_context: &Path,
     keep_branch: bool,
 ) -> Result<RemoveResult> {
-    let worktrees = git::list_worktrees(repo)?;
+    // Removal shares the merge lifecycle lock so it cannot race a managed
+    // merge's journal, Git operation, or post-commit cleanup. A live journal
+    // also owns its source and destination until continue/abort finishes.
+    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
+    let active_merge = active_merge_operation(repo)?;
+    let worktrees = if active_merge.is_some() {
+        git::list_worktrees_readonly(repo)?
+    } else {
+        git::list_worktrees(repo)?
+    };
 
     // Resolve which branch to remove.
     let target_branch = match branch {
@@ -344,6 +353,15 @@ fn remove_with_branch_context(
         return Err(AppError::invariant(
             "refusing to remove the main worktree".to_string(),
         ));
+    }
+    if let Some(active_merge) = active_merge
+        .as_ref()
+        .filter(|active| active.protects(target_branch.as_str()))
+    {
+        return Err(AppError::conflict(format!(
+            "refusing to remove branch '{}' while managed merge '{}' -> '{}' is active; use `wt merge --continue` or `wt merge --abort` first",
+            target_branch, active_merge.source, active_merge.destination
+        )));
     }
 
     let removed_path = wt.path.clone();
@@ -546,9 +564,11 @@ fn local_branch_revision(repo: &RepoRoot, revision: &str) -> Option<String> {
 fn resolve_integration_target(
     repo: &RepoRoot,
     mainline_override: Option<&str>,
+    readonly: bool,
 ) -> Result<IntegrationTarget> {
     let requested = match mainline_override {
         Some(revision) => revision.to_string(),
+        None if readonly => git::resolve_mainline_readonly(repo)?,
         None => git::resolve_mainline(repo)?,
     };
 
@@ -587,10 +607,24 @@ fn resolve_integration_target(
 
 /// Dry-run: scan worktrees and preserved local branches without removing anything.
 pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result<PruneDryRun> {
-    let target = resolve_integration_target(repo, mainline_override)?;
+    // Take the same lifecycle lock as execution so the plan cannot be built
+    // against a concurrently changing managed merge. The plan itself remains
+    // read-only: in particular, stale preservation refs are only reported.
+    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
+    let active_merge = active_merge_operation(repo)?;
+    prune_dry_run_inner(repo, mainline_override, false, active_merge.as_ref())
+}
+
+fn prune_dry_run_inner(
+    repo: &RepoRoot,
+    mainline_override: Option<&str>,
+    repair_stale_markers: bool,
+    active_merge: Option<&ActiveMergeOperation>,
+) -> Result<PruneDryRun> {
+    let target = resolve_integration_target(repo, mainline_override, !repair_stale_markers)?;
     let mainline = target.revision.clone();
 
-    let worktrees = git::list_worktrees(repo)?;
+    let worktrees = git::list_worktrees_readonly(repo)?;
     let worktree_branches: HashSet<String> = worktrees
         .iter()
         .filter_map(|wt| wt.branch.clone())
@@ -605,7 +639,13 @@ pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result
     for preserved in preserved_branches {
         let branch = BranchName::new(&preserved.name);
         if git::branch_oid(repo, &branch).as_deref() != Some(preserved.oid.as_str()) {
-            git::clear_preserved_branch(repo, &branch)?;
+            // Dry-run is read-only. Execution repairs stale markers only when
+            // the branch is not owned by a live managed merge journal.
+            repair_stale_markers
+                .then(|| active_merge.is_some_and(|active| active.protects(&preserved.name)))
+                .filter(|protected| !protected)
+                .map(|_| git::clear_preserved_branch(repo, &branch))
+                .transpose()?;
             stale_marker_branches.insert(preserved.name);
         } else {
             valid_preserved_branches.push(preserved);
@@ -624,6 +664,10 @@ pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result
                 .branch
                 .as_deref()
                 .is_some_and(|branch| stale_marker_branches.contains(branch))
+            || wt
+                .branch
+                .as_deref()
+                .is_some_and(|branch| active_merge.is_some_and(|active| active.protects(branch)))
         {
             continue;
         }
@@ -651,6 +695,7 @@ pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result
     for preserved in valid_preserved_branches {
         if worktree_branches.contains(&preserved.name)
             || target.protects_branch(repo, &preserved.name)
+            || active_merge.is_some_and(|active| active.protects(&preserved.name))
         {
             continue;
         }
@@ -783,7 +828,18 @@ pub fn prune_execute(
     mainline_override: Option<&str>,
     force: bool,
 ) -> Result<PruneExecuteResult> {
-    let dry_run = prune_dry_run(repo, mainline_override)?;
+    // Hold the repository lifecycle lock across planning, stale-marker repair,
+    // worktree removal, and branch deletion. A managed merge owns its source
+    // and destination until recovery completes, so fail closed rather than
+    // allowing prune to invalidate that journal.
+    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
+    if let Some(active_merge) = active_merge_operation(repo)? {
+        return Err(AppError::conflict(format!(
+            "refusing prune while managed merge '{}' -> '{}' is active; use `wt merge --continue` or `wt merge --abort` first",
+            active_merge.source, active_merge.destination
+        )));
+    }
+    let dry_run = prune_dry_run_inner(repo, mainline_override, true, None)?;
     let mainline = dry_run.mainline;
 
     let mut acc = PruneAccumulator {
@@ -968,6 +1024,34 @@ enum MergeOperationFile {
     Missing,
     Valid(Box<MergeOperationState>),
     Corrupt { path: PathBuf, reason: String },
+}
+
+/// Branches owned by a live managed merge journal. Destructive commands must
+/// not remove either side while the merge lifecycle can still recover them.
+#[derive(Debug, Clone)]
+struct ActiveMergeOperation {
+    source: String,
+    destination: String,
+}
+
+impl ActiveMergeOperation {
+    fn protects(&self, branch: &str) -> bool {
+        self.source == branch || self.destination == branch
+    }
+}
+
+fn active_merge_operation(repo: &RepoRoot) -> Result<Option<ActiveMergeOperation>> {
+    match merge_operation_file(repo)? {
+        MergeOperationFile::Missing => Ok(None),
+        MergeOperationFile::Valid(state) => Ok(Some(ActiveMergeOperation {
+            source: state.source.clone(),
+            destination: state.destination.clone(),
+        })),
+        MergeOperationFile::Corrupt { path, reason } => Err(AppError::conflict(format!(
+            "managed merge state is corrupt ({reason}); preserve '{}', recover the destination manually, and do not run destructive cleanup until it is repaired",
+            path.display()
+        ))),
+    }
 }
 
 fn merge_operation_file(repo: &RepoRoot) -> Result<MergeOperationFile> {

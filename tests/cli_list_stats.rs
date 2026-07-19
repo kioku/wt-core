@@ -62,6 +62,40 @@ fn strip_stats_ansi(text: &str) -> String {
         .replace("\x1b[0m", "")
 }
 
+#[test]
+fn list_ignores_inherited_common_dir_from_another_repository() {
+    let repo_a = fixtures::TestRepo::new();
+    let repo_b = fixtures::TestRepo::new();
+    let repo_a_path = repo_a.path();
+    let repo_b_common = repo_b.path().join(".git");
+    add_worktree(&repo_a_path, "only-a");
+    add_worktree(&repo_b.path(), "only-b");
+
+    let output = wt_core()
+        .args([
+            "list",
+            "--repo",
+            &repo_a_path.display().to_string(),
+            "--json",
+        ])
+        .env("GIT_COMMON_DIR", &repo_b_common)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let branches: Vec<_> = json["worktrees"]
+        .as_array()
+        .expect("worktrees array")
+        .iter()
+        .filter_map(|entry| entry["branch"].as_str())
+        .collect();
+    assert!(branches.contains(&"main"));
+    assert!(branches.contains(&"only-a"));
+    assert!(!branches.contains(&"only-b"));
+}
+
 fn worktree_entry<'a>(json: &'a serde_json::Value, branch: &str) -> &'a serde_json::Value {
     json["worktrees"]
         .as_array()

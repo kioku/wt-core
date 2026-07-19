@@ -183,6 +183,20 @@ parsed_removed_path=$(printf '%s\n' "$json_remove" | jq -er '.removed_path | str
     && pass "matrix remove --json: cwd reset to repository root" \
     || fail "matrix remove --json: cwd was not reset"
 
+wt add matrix-partial >/dev/null 2>&1
+printf 'partial\n' > partial.txt
+git add partial.txt
+git commit -m "partial cleanup" >/dev/null 2>&1
+partial_output_file="$WORK/bash-partial.out"
+wt remove matrix-partial >"$partial_output_file"
+partial_output=$(cat "$partial_output_file")
+echo "$partial_output" | grep -q "kept branch 'matrix-partial'" \
+    && pass "matrix remove: partial cleanup reports kept branch" \
+    || fail "matrix remove: partial cleanup claimed branch deletion"
+git show-ref --verify --quiet refs/heads/matrix-partial \
+    && pass "matrix remove: partial cleanup retains branch" \
+    || fail "matrix remove: partial cleanup deleted branch"
+
 wt add matrix-merge >/dev/null 2>&1
 printf 'merge\n' > merge.txt
 git add merge.txt

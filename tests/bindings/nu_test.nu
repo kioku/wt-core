@@ -227,6 +227,23 @@ if ($env.PWD | path expand) == $matrix_root {
     fail "matrix remove --json: cwd was not reset"
 }
 
+wt add matrix-partial | ignore
+"partial" | save --force partial.txt
+^git add partial.txt
+^git commit -m "partial cleanup" o+e>| ignore
+cd $matrix_root
+let partial_output = (^nu -c $"source ($binding_path); wt remove matrix-partial" | complete)
+if $partial_output.exit_code == 0 and ($partial_output.stdout | str contains "kept branch 'matrix-partial'") {
+    pass "matrix remove: partial cleanup reports kept branch"
+} else {
+    fail $"matrix remove: partial cleanup claimed branch deletion: ($partial_output.stdout)"
+}
+if (^git show-ref --verify --quiet refs/heads/matrix-partial | complete).exit_code == 0 {
+    pass "matrix remove: partial cleanup retains branch"
+} else {
+    fail "matrix remove: partial cleanup deleted branch"
+}
+
 wt add matrix-merge | ignore
 "merge" | save --force merge.txt
 ^git add merge.txt
@@ -255,6 +272,15 @@ if $remove_failure.exit_code != 0 and ($remove_failure.stderr | str contains "no
     pass "wt remove --json: failure script preserves status and diagnostics"
 } else {
     fail $"wt remove --json: expected non-zero status and diagnostics, got ($remove_failure.exit_code)"
+}
+
+let remove_failure_cwd_script = $"source ($binding_path); try { wt remove missing --repo ($failure_repo) } catch { |err| print $env.PWD; error make $err }"
+let expected_failure_cwd = ($env.PWD | path expand)
+let remove_failure_cwd = (^nu -c $remove_failure_cwd_script | complete)
+if $remove_failure_cwd.exit_code != 0 and ($remove_failure_cwd.stdout | str contains $expected_failure_cwd) {
+    pass "wt remove: non-JSON failure restores caller cwd"
+} else {
+    fail $"wt remove: expected non-JSON failure to restore cwd, got ($remove_failure_cwd.exit_code), ($remove_failure_cwd.stdout)"
 }
 
 let merge_failure_script = $"source ($binding_path); wt merge missing --json --repo ($failure_repo)"

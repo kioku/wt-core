@@ -132,31 +132,43 @@ wt() {
             local cwd_before
             cwd_before=$(pwd -P)
             # --print-paths is the stable legacy three-line protocol:
-            # removed_path, repo_root, branch. Lifecycle status is explicit in
-            # --json; the binding also knows whether --keep-branch was requested.
+            # removed_path, repo_root, branch. Branch cleanup status is private
+            # navigation metadata so partial cleanup is not reported as complete.
             local keep_branch=false
             for arg in "$@"; do
                 [[ "$arg" == "--keep-branch" ]] && keep_branch=true
             done
             # stderr is left connected to the terminal so the interactive picker
             # (if triggered) renders correctly and errors are visible.
+            local nav_file
+            nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
             local result
-            result=$(wt-core remove "$@" --print-paths)
+            result=$(wt-core remove "$@" --print-paths --navigation-file "$nav_file")
             local rc=$?
             if [[ $rc -eq 0 ]]; then
-                local removed_path repo_root branch
+                local removed_path repo_root branch branch_deleted
                 removed_path=$(printf '%s\n' "$result" | sed -n '1p')
                 repo_root=$(printf '%s\n' "$result" | sed -n '2p')
                 branch=$(printf '%s\n' "$result" | sed -n '3p')
+                local nav_fd nav_action nav_removed nav_root
+                exec {nav_fd}<"$nav_file"
+                IFS= read -r -d $'\0' nav_action <&$nav_fd
+                IFS= read -r -d $'\0' nav_removed <&$nav_fd
+                IFS= read -r -d $'\0' nav_root <&$nav_fd
+                IFS= read -r -d $'\0' branch_deleted <&$nav_fd
+                exec {nav_fd}<&-
+                branch_deleted=${branch_deleted:-false}
+                rm -f "$nav_file"
                 if wt__path_is_within "$cwd_before" "$removed_path"; then
                     cd "$repo_root" || true
                 fi
-                if [[ "$keep_branch" == true ]]; then
+                if [[ "$keep_branch" == true || "$branch_deleted" != true ]]; then
                     echo "Removed worktree and kept branch '${branch}'"
                 else
                     echo "Removed worktree and branch '${branch}'"
                 fi
             else
+                rm -f "$nav_file"
                 return $rc
             fi
             ;;

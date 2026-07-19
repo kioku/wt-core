@@ -592,11 +592,31 @@ pub fn write_navigation_file(
     removed_path: Option<&Path>,
     repo_root: &Path,
 ) -> crate::error::Result<()> {
+    write_navigation_file_with_cleanup(file, reset, removed_path, repo_root, None)
+}
+
+/// Write navigation metadata plus private cleanup status for legacy wrappers.
+///
+/// The optional fourth field is deliberately side-channel-only: `--print-paths`
+/// keeps its established three-line stdout protocol while wrappers can avoid
+/// claiming branch deletion when worktree removal succeeded but branch cleanup
+/// was partial.
+pub fn write_navigation_file_with_cleanup(
+    file: &Path,
+    reset: bool,
+    removed_path: Option<&Path>,
+    repo_root: &Path,
+    branch_deleted: Option<bool>,
+) -> crate::error::Result<()> {
     let action = if reset { "reset" } else { "none" };
     let removed = removed_path
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    let record = format!("{action}\0{removed}\0{}\0", repo_root.display());
+    let mut record = format!("{action}\0{removed}\0{}\0", repo_root.display());
+    branch_deleted.into_iter().for_each(|branch_deleted| {
+        record.push_str(if branch_deleted { "true" } else { "false" });
+        record.push('\0');
+    });
     std::fs::write(file, record.as_bytes()).map_err(|error| {
         crate::error::AppError::git(format!(
             "could not write navigation metadata to {}: {error}",

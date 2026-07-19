@@ -431,6 +431,46 @@ fn prune_integrated_into_removes_preserved_branch_without_worktree() {
 }
 
 #[test]
+fn prune_dry_run_does_not_clear_stale_preservation_marker() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/dry-marker", "--repo", &repo_str])
+        .assert()
+        .success();
+    wt_core()
+        .args([
+            "remove",
+            "feature/dry-marker",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    let marker_ref = "refs/wt-core/preserved/feature/dry-marker";
+    let marker = git_ref_hash(&repo.path(), marker_ref).expect("preservation marker");
+
+    fixtures::commit_file(&repo.path(), "dry-marker.txt", "advanced\n", "advance main");
+    run_git(
+        &["branch", "-f", "feature/dry-marker", "main"],
+        &repo.path(),
+    );
+
+    wt_core()
+        .args(["prune", "--json", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(
+        git_ref_hash(&repo.path(), marker_ref).as_deref(),
+        Some(marker.as_str()),
+        "dry-run must not clear stale preservation refs"
+    );
+}
+
+#[test]
 fn prune_rejects_moved_preserved_branch_and_clears_marker() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -945,6 +985,7 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
     "GIT_PREFIX",
 ];
 

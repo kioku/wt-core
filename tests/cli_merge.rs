@@ -49,6 +49,7 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
     "GIT_PREFIX",
 ];
 
@@ -202,6 +203,49 @@ fn merge_conflict_preserves_destination_and_managed_state() {
             .is_file(),
         "managed merge state should be durable"
     );
+}
+
+#[test]
+fn remove_refuses_managed_merge_source_while_conflicted() {
+    let repo = fixtures::TestRepo::new();
+    let source = create_conflicted_merge(&repo, "feature/remove-while-conflicted");
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args([
+            "remove",
+            "feature/remove-while-conflicted",
+            "--force",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "while managed merge 'feature/remove-while-conflicted' -> 'main' is active",
+        ));
+
+    assert!(source.exists(), "managed merge source must remain present");
+    assert_branch_exists(&repo.path(), "feature/remove-while-conflicted");
+}
+
+#[test]
+fn prune_refuses_cleanup_while_managed_merge_is_active() {
+    let repo = fixtures::TestRepo::new();
+    let source = create_conflicted_merge(&repo, "feature/prune-while-conflicted");
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["prune", "--execute", "--json", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "refusing prune while managed merge 'feature/prune-while-conflicted' -> 'main' is active",
+        ));
+
+    assert!(source.exists(), "managed merge source must remain present");
+    assert_branch_exists(&repo.path(), "feature/prune-while-conflicted");
 }
 
 #[test]
@@ -468,7 +512,7 @@ fn merge_source_head_race_preserves_source_and_followup_intent() {
         &repo,
         "post-merge",
         &format!(
-            "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX\nprintf race > {}/race.txt\ngit -C {} add race.txt\ngit -C {} commit -m race\n",
+            "#!/bin/sh\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX\nprintf race > {}/race.txt\ngit -C {} add race.txt\ngit -C {} commit -m race\n",
             shell_quote(&source_str),
             shell_quote(&source_str),
             shell_quote(&source_str)
@@ -3039,7 +3083,7 @@ fn install_identity_replacement_hook(
     let repo_path = repo.path().display().to_string();
     let target_path = target.display().to_string();
     let script = format!(
-        "#!/bin/sh\nset -eu\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_PREFIX\nrepo={}\ntarget={}\nreplacement=\"$target.{}\"\ngit -C \"$repo\" worktree remove --force \"$target\"\ngit -C \"$repo\" worktree add \"$replacement\" {}\nadmin=$(git -C \"$replacement\" rev-parse --git-dir)\nmv \"$replacement\" \"$target\"\nprintf '%s\\n' \"$target/.git\" > \"$admin/gitdir\"\n",
+        "#!/bin/sh\nset -eu\nunset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_PREFIX\nrepo={}\ntarget={}\nreplacement=\"$target.{}\"\ngit -C \"$repo\" worktree remove --force \"$target\"\ngit -C \"$repo\" worktree add \"$replacement\" {}\nadmin=$(git -C \"$replacement\" rev-parse --git-dir)\nmv \"$replacement\" \"$target\"\nprintf '%s\\n' \"$target/.git\" > \"$admin/gitdir\"\n",
         shell_quote(&repo_path),
         shell_quote(&target_path),
         replacement_name,

@@ -256,8 +256,10 @@ fn exec_returns_nonzero_child_exit_status() {
 #[test]
 fn exec_sanitizes_inherited_git_context() {
     let repo = fixtures::TestRepo::new();
+    let other_repo = fixtures::TestRepo::new();
     add_worktree(&repo, "exec-git-env");
     let git_dir = repo.path().join(".git");
+    let other_common_dir = other_repo.path().join(".git");
 
     let output = wt_core()
         .args([
@@ -271,6 +273,7 @@ fn exec_sanitizes_inherited_git_context() {
             "--show-current",
         ])
         .env("GIT_DIR", &git_dir)
+        .env("GIT_COMMON_DIR", &other_common_dir)
         .output()
         .expect("exec should start");
 

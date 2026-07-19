@@ -12,11 +12,12 @@ use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
     find_current_worktree, print_json, print_json_stderr, write_navigation_file,
-    JsonDoctorResponse, JsonExecResponse, JsonListResponse, JsonMaterializeResponse,
-    JsonMaterializeTimings, JsonMergeOperation, JsonMergeOperationResponse, JsonMergePreflight,
-    JsonMergeRefusal, JsonMergeResponse, JsonPruneDryRunEntry, JsonPruneDryRunResponse,
-    JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse, JsonSkippedEntry, MergeFormat,
-    NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
+    write_navigation_file_with_cleanup, JsonDoctorResponse, JsonExecResponse, JsonListResponse,
+    JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeOperation,
+    JsonMergeOperationResponse, JsonMergePreflight, JsonMergeRefusal, JsonMergeResponse,
+    JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry,
+    JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat,
+    StatusFormat,
 };
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
@@ -833,8 +834,8 @@ fn cmd_exec(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-    // Match internal Git invocations: a hook's GIT_DIR must not redirect the
-    // command away from the resolved worktree.
+    // Match internal Git invocations: inherited Git repository context must
+    // not redirect the command away from the resolved worktree.
     git::sanitize_git_environment(&mut process);
 
     run_resolved_command(process, program)
@@ -1835,8 +1836,15 @@ fn cmd_remove(
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;
 
-    if let Some(Err(error)) = navigation_file.map(|path| {
-        write_navigation_file(path, true, Some(&result.removed_path), &result.repo_root)
+    if let Some(Err(error)) = navigation_file.map(|path| match fmt {
+        RemoveFormat::PrintPaths => write_navigation_file_with_cleanup(
+            path,
+            true,
+            Some(&result.removed_path),
+            &result.repo_root,
+            Some(result.branch_deleted),
+        ),
+        _ => write_navigation_file(path, true, Some(&result.removed_path), &result.repo_root),
     }) {
         eprintln!("warning: could not write navigation metadata: {error}");
     }

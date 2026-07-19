@@ -17,6 +17,7 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_INDEX_FILE",
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
     "GIT_PREFIX",
 ];
 
@@ -283,6 +284,53 @@ fn remove_deletes_worktree_and_branch() {
         .filter(|e| e.path().is_dir())
         .collect();
     assert_eq!(entries.len(), 0);
+}
+
+#[test]
+fn remove_print_paths_side_channel_reports_partial_branch_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "partial-cleanup", "--repo", &repo_str])
+        .assert()
+        .success();
+    let worktree = fixtures::find_worktree_dir(&repo.path(), "partial-cleanup");
+    fixtures::commit_file(
+        &worktree,
+        "partial.txt",
+        "not integrated\n",
+        "partial cleanup",
+    );
+    let navigation = tempfile::NamedTempFile::new().expect("navigation file");
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "partial-cleanup",
+            "--print-paths",
+            "--navigation-file",
+            &navigation.path().display().to_string(),
+            "--repo",
+            &repo_str,
+        ])
+        .output()
+        .expect("remove should start");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        3,
+        "legacy stdout must remain three lines"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("branch deletion failed"));
+    let navigation_contents =
+        std::fs::read_to_string(navigation.path()).expect("navigation metadata");
+    let fields: Vec<_> = navigation_contents
+        .split('\0')
+        .filter(|field| !field.is_empty())
+        .collect();
+    assert_eq!(fields.get(3), Some(&"false"));
+    assert_branch_exists(&repo.path(), "partial-cleanup");
+    assert!(!worktree.exists(), "worktree removal should still succeed");
 }
 
 #[test]
@@ -1030,6 +1078,7 @@ fn add_remote_tracking_sets_correct_upstream() {
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
         "GIT_PREFIX",
     ] {
         cmd.env_remove(var);
