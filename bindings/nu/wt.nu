@@ -35,6 +35,13 @@ def navigation-file [] {
     ^mktemp $"($tmpdir)/wt-core-nav.XXXXXX" | str trim
 }
 
+# Nushell turns a failed external command into a ShellError. Re-raise that
+# error instead of returning, so the original stderr remains visible and the
+# caller receives wt-core's non-zero exit status.
+def run-core [args: list<string>] {
+    try { ^wt-core ...$args } catch { |err| error make $err }
+}
+
 # List all worktrees
 export def "wt list" [
     --repo: path        # Repository path (defaults to cwd)
@@ -50,7 +57,7 @@ export def "wt list" [
 
     let full_args = (build-args $args $repo $json false)
     if $json {
-        let output = try { ^wt-core ...$full_args } catch { return }
+        let output = (run-core $full_args)
         $output
     } else {
         ^wt-core ...$full_args
@@ -69,7 +76,7 @@ export def --env "wt add" [
     if $json {
         mut args = (build-args ["add" $branch] $repo true false)
         if $base != null { $args = ($args | append ["--base" $base]) }
-        let output = try { ^wt-core ...$args } catch { return }
+        let output = (run-core $args)
         $output
     } else {
         mut args = (build-args ["add" $branch] $repo false true)
@@ -92,7 +99,7 @@ export def --env "wt go" [
 
     if $json {
         let full_args = (build-args $args $repo true false)
-        let output = try { ^wt-core ...$full_args } catch { return }
+        let output = (run-core $full_args)
         $output
     } else {
         # --print-cd-path works with the interactive picker:
@@ -126,7 +133,7 @@ export def --env "wt remove" [
                 ^git rev-parse --path-format=absolute --git-common-dir
                 | str trim
                 | path dirname
-            } catch { return }
+            } catch { |err| error make $err }
         }
         if $branch == null {
             let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
@@ -138,10 +145,10 @@ export def --env "wt remove" [
         let effective_repo = if $repo != null { $command_repo } else { null }
         let nav_file = (navigation-file)
         let full_args = (build-args $args $effective_repo true false | append ["--navigation-file" $nav_file])
-        let output = try { ^wt-core ...$full_args } catch {
+        let output = try { run-core $full_args } catch { |err|
             cd $cwd_before
             ^rm -f $nav_file
-            return
+            error make $err
         }
         let navigation = if ($nav_file | path exists) {
             try { read-navigation $nav_file } catch { [] }
@@ -170,7 +177,7 @@ export def --env "wt remove" [
         # directly would silently swallow the failure).  Stderr is
         # inherited, keeping the interactive picker and error messages
         # visible in the terminal.
-        let output = try { ^wt-core ...$full_args } catch { return }
+        let output = (run-core $full_args)
         let lines = ($output | lines)
         let removed_path = ($lines | get 0)
         let repo_root = ($lines | get 1)
@@ -209,7 +216,7 @@ export def --env "wt merge" [
                 ^git rev-parse --path-format=absolute --git-common-dir
                 | str trim
                 | path dirname
-            } catch { return }
+            } catch { |err| error make $err }
         }
         if $branch == null {
             let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
@@ -221,10 +228,10 @@ export def --env "wt merge" [
         let effective_repo = if $repo != null { $command_repo } else { null }
         let nav_file = (navigation-file)
         let full_args = (build-args $args $effective_repo true false | append ["--navigation-file" $nav_file])
-        let output = try { ^wt-core ...$full_args } catch {
+        let output = try { run-core $full_args } catch { |err|
             cd $cwd_before
             ^rm -f $nav_file
-            return
+            error make $err
         }
         let navigation = if ($nav_file | path exists) {
             try { read-navigation $nav_file } catch { [] }
@@ -245,7 +252,7 @@ export def --env "wt merge" [
         $output
     } else {
         let full_args = (build-args $args $repo false false | append "--print-paths")
-        let output = try { ^wt-core ...$full_args } catch { return }
+        let output = (run-core $full_args)
         let lines = ($output | lines)
         let repo_root = ($lines | get 0)
         let branch_name = ($lines | get 1)
@@ -277,7 +284,7 @@ export def "wt doctor" [
 ] {
     let args = (build-args ["doctor"] $repo $json false)
     if $json {
-        let output = try { ^wt-core ...$args } catch { return }
+        let output = (run-core $args)
         $output
     } else {
         ^wt-core ...$args

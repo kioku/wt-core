@@ -120,9 +120,11 @@ json_add=$(wt add matrix-json --json)
 echo "$json_add" | grep -q '"cd_path"' \
     && pass "matrix add --json: command fields preserved" \
     || fail "matrix add --json: missing cd_path"
-echo "$json_add" | grep -Fq 'quote\\slash' \
-    && pass "matrix add --json: escaped path preserved" \
-    || fail "matrix add --json: escaped path was lost"
+matrix_add_path=$(printf '%s\n' "$json_add" | jq -er '.cd_path | strings')
+expected_matrix_path=$(find "$MATRIX_ROOT/.worktrees" -maxdepth 1 -type d -name 'matrix-json--*' -print -quit)
+[[ "$matrix_add_path" == "$expected_matrix_path" ]] \
+    && pass "matrix add --json: parsed escaped path preserved" \
+    || fail "matrix add --json: parsed path did not match Git path"
 [[ "$(pwd -P)" == "$MATRIX_ROOT" ]] \
     && pass "matrix add --json: cwd unchanged" \
     || fail "matrix add --json: cwd changed"
@@ -145,6 +147,7 @@ grep -q 'pnpm install --prefer-offline --frozen-lockfile' "$legacy_stderr" \
 wt remove matrix-diagnostics >/dev/null 2>&1
 
 wt add matrix-remove >/dev/null 2>&1
+expected_matrix_remove_path=$(find "$MATRIX_ROOT/.worktrees" -maxdepth 1 -type d -name 'matrix-remove--*' -print -quit)
 json_remove_file="$WORK/bash-remove.json"
 wt remove matrix-remove --json >"$json_remove_file"
 json_remove=$(cat "$json_remove_file")
@@ -154,9 +157,10 @@ json_remove=$(cat "$json_remove_file")
 echo "$json_remove" | grep -q '"removed_path"' \
     && pass "matrix remove --json: command fields preserved" \
     || fail "matrix remove --json: missing removed_path"
-echo "$json_remove" | grep -Fq 'quote\\slash' \
-    && pass "matrix remove --json: escaped path preserved" \
-    || fail "matrix remove --json: escaped path was lost"
+parsed_removed_path=$(printf '%s\n' "$json_remove" | jq -er '.removed_path | strings')
+[[ "$parsed_removed_path" == "$expected_matrix_remove_path" ]] \
+    && pass "matrix remove --json: parsed escaped path preserved" \
+    || fail "matrix remove --json: parsed path did not match Git path"
 [[ "$(pwd -P)" == "$MATRIX_ROOT" ]] \
     && pass "matrix remove --json: cwd reset to repository root" \
     || fail "matrix remove --json: cwd was not reset"

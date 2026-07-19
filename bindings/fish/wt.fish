@@ -2,6 +2,7 @@
 # Source this file or place in ~/.config/fish/conf.d/wt.fish
 
 # Match complete path components without treating path characters as a glob.
+# Call this directly in conditions so Fish preserves its exit status.
 function wt__path_is_within
     set -l child $argv[1]
     set -l parent $argv[2]
@@ -50,8 +51,16 @@ function wt --description "Git worktree manager"
 
             # Keep stdout private for the path while leaving stderr inherited so
             # setup recommendations and warnings remain visible on success.
-            set -l target (wt-core add $argv --print-cd-path)
+            # Run wt-core as a simple command: Fish command substitutions do
+            # not inherit a caller's stderr redirection.
+            set -l path_file (wt__navigation_file)
+            if test $status -ne 0
+                return 1
+            end
+            wt-core add $argv --print-cd-path >"$path_file"
             set -l rc $status
+            set -l target (cat "$path_file")
+            rm -f -- "$path_file"
             if test $rc -eq 0 -a -n "$target"
                 cd "$target"
             else
@@ -84,8 +93,15 @@ function wt --description "Git worktree manager"
 
             # --print-cd-path works with the interactive picker:
             # the picker UI renders on stderr/tty, the path goes to stdout.
-            set -l target (wt-core go $argv --print-cd-path)
+            # Run wt-core as a simple command for caller stderr redirections.
+            set -l path_file (wt__navigation_file)
+            if test $status -ne 0
+                return 1
+            end
+            wt-core go $argv --print-cd-path >"$path_file"
             set -l rc $status
+            set -l target (cat "$path_file")
+            rm -f -- "$path_file"
             if test $rc -eq 0 -a -n "$target"
                 cd "$target"
             else
@@ -123,9 +139,10 @@ function wt --description "Git worktree manager"
                     set -l navigation (string split0 < "$nav_file")
                     if test "$navigation[1]" = reset \
                         -a -n "$navigation[2]" \
-                        -a -n "$navigation[3]" \
-                        -a (wt__path_is_within "$cwd_before" "$navigation[2]")
-                        cd "$navigation[3]"; or true
+                        -a -n "$navigation[3]"
+                        if wt__path_is_within "$cwd_before" "$navigation[2]"
+                            cd "$navigation[3]"; or true
+                        end
                     end
                 end
                 rm -f -- "$nav_file"
@@ -183,9 +200,10 @@ function wt --description "Git worktree manager"
                     set -l navigation (string split0 < "$nav_file")
                     if test "$navigation[1]" = reset \
                         -a -n "$navigation[2]" \
-                        -a -n "$navigation[3]" \
-                        -a (wt__path_is_within "$cwd_before" "$navigation[2]")
-                        cd "$navigation[3]"; or true
+                        -a -n "$navigation[3]"
+                        if wt__path_is_within "$cwd_before" "$navigation[2]"
+                            cd "$navigation[3]"; or true
+                        end
                     end
                 end
                 rm -f -- "$nav_file"

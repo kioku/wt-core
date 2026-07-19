@@ -4,6 +4,9 @@
 
 source ../../bindings/nu/wt.nu
 
+let repo_root = (pwd | path expand)
+let binding_path = ($repo_root | path join "bindings/nu/wt.nu")
+
 def pass [msg: string] { print $"  ✓ ($msg)" }
 def fail [msg: string] { print $"  ✗ ($msg)"; exit 1 }
 
@@ -119,10 +122,12 @@ if ($matrix_add | str contains '"cd_path"') {
 } else {
     fail "matrix add --json: missing cd_path"
 }
-if ($matrix_add | str contains 'quote\\slash') {
-    pass "matrix add --json: escaped path preserved"
+let matrix_add_path = (($matrix_add | from json).cd_path)
+let expected_matrix_path = (^find ($matrix_root | path join ".worktrees") -maxdepth 1 -type d -name "matrix-json--*" -print | str trim)
+if $matrix_add_path == $expected_matrix_path {
+    pass "matrix add --json: parsed escaped path preserved"
 } else {
-    fail "matrix add --json: escaped path was lost"
+    fail "matrix add --json: parsed path did not match Git path"
 }
 if ($env.PWD | path expand) == $matrix_root {
     pass "matrix add --json: cwd unchanged"
@@ -149,6 +154,7 @@ if (open $nu_stderr | str contains "pnpm install --prefer-offline --frozen-lockf
 wt remove matrix-diagnostics | ignore
 
 wt add matrix-remove | ignore
+let expected_matrix_remove_path = (^find ($matrix_root | path join ".worktrees") -maxdepth 1 -type d -name "matrix-remove--*" -print | str trim)
 let matrix_remove_file = ($work | path join "nu-remove.json")
 wt remove matrix-remove --json | save --force $matrix_remove_file
 let matrix_remove = (open --raw $matrix_remove_file | decode utf-8)
@@ -157,10 +163,11 @@ if ($matrix_remove | str contains '"removed_path"') {
 } else {
     fail "matrix remove --json: missing removed_path"
 }
-if ($matrix_remove | str contains 'quote\\slash') {
-    pass "matrix remove --json: escaped path preserved"
+let parsed_removed_path = (($matrix_remove | from json).removed_path)
+if $parsed_removed_path == $expected_matrix_remove_path {
+    pass "matrix remove --json: parsed escaped path preserved"
 } else {
-    fail "matrix remove --json: escaped path was lost"
+    fail "matrix remove --json: parsed path did not match Git path"
 }
 if ($env.PWD | path expand) == $matrix_root {
     pass "matrix remove --json: cwd reset to repository root"
@@ -184,6 +191,26 @@ if ($env.PWD | path expand) == $matrix_root {
     pass "matrix merge --json: cwd reset to repository root"
 } else {
     fail "matrix merge --json: cwd was not reset"
+}
+
+# A failed JSON command must still fail when invoked from a child Nu script.
+# The binding re-raises wt-core's external-command error after its stderr has
+# already been rendered, rather than returning success from a catch block.
+let failure_repo = ($work | path join "repo")
+let remove_failure_script = $"source ($binding_path); wt remove missing --json --repo ($failure_repo)"
+let remove_failure = (^nu -c $remove_failure_script | complete)
+if $remove_failure.exit_code != 0 and ($remove_failure.stderr | str contains "no worktree found") {
+    pass "wt remove --json: failure script preserves status and diagnostics"
+} else {
+    fail $"wt remove --json: expected non-zero status and diagnostics, got ($remove_failure.exit_code)"
+}
+
+let merge_failure_script = $"source ($binding_path); wt merge missing --json --repo ($failure_repo)"
+let merge_failure = (^nu -c $merge_failure_script | complete)
+if $merge_failure.exit_code != 0 and ($merge_failure.stderr | str contains "no worktree found") {
+    pass "wt merge --json: failure script preserves status and diagnostics"
+} else {
+    fail $"wt merge --json: expected non-zero status and diagnostics, got ($merge_failure.exit_code)"
 }
 
 cd /tmp

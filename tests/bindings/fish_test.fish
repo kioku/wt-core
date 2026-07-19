@@ -156,10 +156,19 @@ if string match -q '*"cd_path"*' "$json_add"
 else
     fail "matrix add --json: missing cd_path"
 end
-if string match -q '*quote\\slash*' "$json_add"
-    pass "matrix add --json: escaped path preserved"
+# Parse the JSON value and compare it with the path Git created. This checks
+# the decoded quote/backslash rather than counting JSON escape characters.
+set matrix_add_path (printf '%s\n' "$json_add" | jq -er '.cd_path | strings')
+set parse_rc $status
+set expected_matrix_path (realpath "$MATRIX_ROOT/.worktrees"/matrix-json--*)
+set expected_rc $status
+if test $parse_rc -ne 0 -o $expected_rc -ne 0
+    fail "matrix add --json: could not parse or locate worktree path"
+end
+if test "$matrix_add_path" = "$expected_matrix_path"
+    pass "matrix add --json: parsed escaped path preserved"
 else
-    fail "matrix add --json: escaped path was lost"
+    fail "matrix add --json: parsed path did not match Git path"
 end
 if test (pwd -P) = "$MATRIX_ROOT"
     pass "matrix add --json: cwd unchanged"
@@ -178,8 +187,46 @@ if string match -q '*"event":"switch"*' "$json_go"
 else
     fail "matrix go --json: missing switch event"
 end
+# Reproduce the sibling-prefix navigation case: the cwd begins with the
+# removed path text but is not inside that worktree. The wrapper must not cd.
+set sibling_path "$expected_matrix_path-copy"
+mkdir -p "$sibling_path"
+cd "$sibling_path"
+set json_remove_file "$WORK/fish-remove.json"
+wt remove matrix-json --json --repo "$MATRIX_ROOT" >"$json_remove_file"
+set remove_rc $status
+set json_remove (cat "$json_remove_file")
+if test $remove_rc -ne 0
+    fail "matrix remove --json: sibling-path removal failed"
+end
+if test (count $json_remove) -eq 1
+    pass "matrix remove --json: one raw stdout document"
+else
+    fail "matrix remove --json: expected one stdout line"
+end
+if string match -q '*"removed_path"*' "$json_remove"
+    pass "matrix remove --json: command fields preserved"
+else
+    fail "matrix remove --json: missing removed_path"
+end
+set parsed_removed_path (printf '%s\n' "$json_remove" | jq -er '.removed_path | strings')
+set parse_rc $status
+if test $parse_rc -eq 0
+    if test "$parsed_removed_path" = "$expected_matrix_path"
+        pass "matrix remove --json: parsed escaped path preserved"
+    else
+        fail "matrix remove --json: parsed path did not match Git path"
+    end
+else
+    fail "matrix remove --json: invalid JSON"
+end
+if test (pwd -P) = "$sibling_path"
+    pass "matrix remove --json: sibling cwd was not reset"
+else
+    fail "matrix remove --json: sibling cwd was reset unexpectedly"
+end
 cd "$MATRIX_ROOT"
-wt remove matrix-json >/dev/null 2>&1
+rm -rf -- "$sibling_path"
 
 set legacy_stderr "$WORK/fish-add.stderr"
 wt add matrix-diagnostics >/dev/null 2>"$legacy_stderr"
@@ -191,6 +238,7 @@ end
 wt remove matrix-diagnostics >/dev/null 2>&1
 
 wt add matrix-remove >/dev/null 2>&1
+set expected_matrix_remove_path (realpath "$MATRIX_ROOT/.worktrees"/matrix-remove--*)
 set json_remove_file "$WORK/fish-remove.json"
 wt remove matrix-remove --json >"$json_remove_file"
 set json_remove (cat "$json_remove_file")
@@ -204,10 +252,16 @@ if string match -q '*"removed_path"*' "$json_remove"
 else
     fail "matrix remove --json: missing removed_path"
 end
-if string match -q '*quote\\slash*' "$json_remove"
-    pass "matrix remove --json: escaped path preserved"
+set parsed_removed_path (printf '%s\n' "$json_remove" | jq -er '.removed_path | strings')
+set parse_rc $status
+if test $parse_rc -eq 0
+    if test "$parsed_removed_path" = "$expected_matrix_remove_path"
+        pass "matrix remove --json: parsed escaped path preserved"
+    else
+        fail "matrix remove --json: parsed path did not match Git path"
+    end
 else
-    fail "matrix remove --json: escaped path was lost"
+    fail "matrix remove --json: invalid JSON"
 end
 if test (pwd -P) = "$MATRIX_ROOT"
     pass "matrix remove --json: cwd reset to repository root"
