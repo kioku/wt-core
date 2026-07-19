@@ -37,8 +37,8 @@ these conventions upfront makes everything else predictable.
 - **Three output modes everywhere.** Every command supports human-readable
   output (default), `--json` for machine consumption, and a
   `--print-cd-path` / `--print-paths` mode for shell wrappers. `exec --json`
-  is the exception: it writes metadata to stderr so the child owns stdout
-  unchanged.
+  is the exception: it writes resolution metadata to stderr so the child owns
+  stdout unchanged; child diagnostics may follow on that stderr stream.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -97,8 +97,32 @@ wt exec feature/auth -- cargo test
 wt exec feature/auth -- make preview
 ```
 
-Use `--json` to emit one compact metadata object on stderr before the child
-starts. This keeps child stdout suitable for command output and pipelines.
+Use `--json` to emit one compact `exec_resolved` metadata object on stderr
+before the child starts. The first line is resolution metadata, not a command
+result (`resolved: true` means only that the worktree was resolved). Child
+stdout and stderr remain inherited; child stderr follows on the same mixed
+stderr stream, so the entire stream is not one parseable JSON document.
+
+The metadata schema is:
+
+```json
+{
+  "event": "exec_resolved",
+  "resolved": true,
+  "message": "resolved worktree for branch 'feature/auth'",
+  "branch": "feature/auth",
+  "repo_root": "/abs/repo",
+  "worktree_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4"
+}
+```
+
+On Unix, `wt-core` replaces itself with the resolved command, preserving
+native stdio, status, and signal behavior. On Windows, it waits for the child
+inside a kill-on-close Job Object so descendants are terminated if `wt-core`
+is terminated. If containment cannot be established, execution is stopped
+rather than leaving an uncontained child. Windows console-control behavior is
+still governed by Windows console semantics, and the short CreateProcess/job
+attachment interval is an unavoidable residual race.
 
 ### `wt list`
 
@@ -216,11 +240,13 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | Flag              | Behavior                                     |
 |-------------------|----------------------------------------------|
 | *(default)*       | Human-readable text                          |
-| `--json`          | Single-line JSON envelope on stdout          |
+| `--json`          | Single-line JSON envelope on stdout (except `exec`, which emits resolution metadata on stderr) |
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
 | `--print-paths`   | Multi-line key values on stdout (for wrappers) |
 
-`--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
+For commands other than `exec`, `--json` emits one compact JSON object per
+line on stdout. `exec --json` emits only its first resolution line as JSON on
+stderr; the rest of stderr is the inherited child diagnostic stream.
 
 JSON envelope example (`add`, `go`, `remove`):
 

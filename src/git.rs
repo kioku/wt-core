@@ -17,6 +17,14 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_PREFIX",
 ];
 
+/// Remove inherited Git context that could redirect a command to another
+/// repository (common when invoked from Git hooks).
+pub(crate) fn sanitize_git_environment(cmd: &mut Cmd) {
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+}
+
 /// Run a git command and return stdout on success.
 ///
 /// Clears inherited `GIT_*` environment variables that could redirect
@@ -24,10 +32,7 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
 fn git(args: &[&str], cwd: &Path) -> Result<String> {
     let mut cmd = Cmd::new("git");
     cmd.args(args).current_dir(cwd);
-
-    for var in GIT_ENV_OVERRIDES {
-        cmd.env_remove(var);
-    }
+    sanitize_git_environment(&mut cmd);
 
     let output = cmd
         .output()
@@ -226,10 +231,7 @@ pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Resul
 fn git_success(args: &[&str], cwd: &Path) -> bool {
     let mut cmd = Cmd::new("git");
     cmd.args(args).current_dir(cwd);
-
-    for var in GIT_ENV_OVERRIDES {
-        cmd.env_remove(var);
-    }
+    sanitize_git_environment(&mut cmd);
 
     cmd.output().map(|o| o.status.success()).unwrap_or(false)
 }
@@ -537,10 +539,7 @@ fn parse_available_difftools(output: &str) -> HashSet<String> {
 fn git_config_get(path: &Path, key: &str) -> Result<Option<String>> {
     let mut cmd = Cmd::new("git");
     cmd.arg("-C").arg(path).arg("config").arg("--get").arg(key);
-
-    for var in GIT_ENV_OVERRIDES {
-        cmd.env_remove(var);
-    }
+    sanitize_git_environment(&mut cmd);
 
     let output = cmd
         .output()
@@ -557,10 +556,7 @@ fn git_config_get(path: &Path, key: &str) -> Result<Option<String>> {
 fn git_tool_help(path: &Path) -> Result<String> {
     let mut cmd = Cmd::new("git");
     cmd.arg("-C").arg(path).arg("difftool").arg("--tool-help");
-
-    for var in GIT_ENV_OVERRIDES {
-        cmd.env_remove(var);
-    }
+    sanitize_git_environment(&mut cmd);
 
     let output = cmd
         .output()
@@ -623,9 +619,7 @@ fn base_difftool(path: &Path, tool: Option<&str>) -> Cmd {
 }
 
 fn run_difftool(mut cmd: Cmd) -> Result<()> {
-    for var in GIT_ENV_OVERRIDES {
-        cmd.env_remove(var);
-    }
+    sanitize_git_environment(&mut cmd);
 
     let status = cmd
         .status()

@@ -92,7 +92,8 @@ pub enum Command {
         #[arg(long)]
         repo: Option<PathBuf>,
 
-        /// Emit resolved worktree metadata as JSON on stderr
+        /// Emit one resolved-worktree metadata line on stderr
+        /// (child stderr follows on the same stream)
         #[arg(long)]
         json: bool,
 
