@@ -174,6 +174,17 @@ wt() {
                 esac
             done
 
+            # Status, continue, and abort are lifecycle reports, not the
+            # legacy navigation protocol or path-only output protocol.
+            for arg in "$@"; do
+                case "$arg" in
+                    --status|--continue|--abort)
+                        wt-core merge "$@"
+                        return $?
+                        ;;
+                esac
+            done
+
             # Detect if the caller explicitly asked for --json
             local want_json=false
             for arg in "$@"; do

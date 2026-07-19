@@ -464,6 +464,41 @@ fn is_false(value: &bool) -> bool {
     !value
 }
 
+/// Durable state and pending actions for a managed merge operation.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeOperation {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_path: Option<String>,
+    pub unresolved_paths: Vec<String>,
+    pub push: bool,
+    pub cleanup: bool,
+    pub keep_branch: bool,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
+    pub push_done: bool,
+    pub pending_actions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<String>,
+}
+
+/// JSON response for `merge --status`, `--continue`, and `--abort` errors.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeOperationResponse {
+    pub ok: bool,
+    pub message: String,
+    #[serde(flatten)]
+    pub operation: JsonMergeOperation,
+}
+
 /// JSON response for the merge command.
 #[derive(Debug, Serialize)]
 pub struct JsonMergeResponse {
@@ -477,6 +512,7 @@ pub struct JsonMergeResponse {
     pub destination_path: String,
     pub repo_root: String,
     pub cleaned_up: bool,
+    pub branch_deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_path: Option<String>,
     pub pushed: bool,
@@ -487,6 +523,8 @@ pub struct JsonMergeResponse {
     pub preflight: Option<JsonMergePreflight>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refusal: Option<JsonMergeRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<JsonMergeOperation>,
     /// True when this response came from `merge --inspect`.
     #[serde(skip_serializing_if = "is_false")]
     pub inspect: bool,

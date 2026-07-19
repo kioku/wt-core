@@ -885,7 +885,7 @@ fn registered_worktree_admin(common_dir: &Path, worktree: &Path) -> Result<PathB
 /// `<common-dir>/worktrees`. The path is captured before a merge and compared
 /// later; path, branch, and common-directory checks alone cannot distinguish a
 /// replacement worktree registered during a hook.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum WorktreeIdentity {
     Main { admin_dir: PathBuf },
     Linked { admin_dir: PathBuf },
@@ -1130,6 +1130,33 @@ pub fn has_unmerged_entries(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Return each path that still has unmerged index stages, once.
+pub fn unmerged_paths(path: &Path) -> Result<Vec<String>> {
+    let mut cmd = Cmd::new("git");
+    cmd.args(["ls-files", "--unmerged", "-z"]).current_dir(path);
+    sanitize_git_environment(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|error| AppError::git(format!("failed to run git ls-files: {error}")))?;
+    if !output.status.success() {
+        return Err(classify_git_error(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+
+    let mut paths = Vec::new();
+    for record in output.stdout.split(|byte| *byte == 0) {
+        let record = String::from_utf8_lossy(record);
+        let Some((_, path)) = record.split_once('\t') else {
+            continue;
+        };
+        if !paths.iter().any(|existing| existing == path) {
+            paths.push(path.to_string());
+        }
+    }
+    Ok(paths)
+}
+
 /// Check if a remote-tracking branch exists for `origin/<branch>`.
 pub fn remote_branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
     let refspec = format!("refs/remotes/origin/{}", branch.as_str());
@@ -1146,6 +1173,72 @@ pub fn set_upstream(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
         repo.as_ref(),
     )?;
     Ok(())
+}
+
+/// Return the full commit currently checked out in a worktree.
+pub fn head_commit(path: &Path) -> Result<String> {
+    git(&["rev-parse", "--verify", "HEAD^{commit}"], path)
+}
+
+/// Return the parent commits of a commit, in Git's recorded order.
+pub fn commit_parents(path: &Path, revision: &str) -> Result<Vec<String>> {
+    let output = git(&["rev-list", "--parents", "-n", "1", revision], path)?;
+    Ok(output
+        .split_whitespace()
+        .skip(1)
+        .map(str::to_string)
+        .collect())
+}
+
+/// Identify the merge commit created from the captured destination/source
+/// heads. If a hook or concurrent writer advanced the destination once more,
+/// return the merge commit as the expected result so callers can refuse the
+/// newer HEAD rather than silently treating it as the merge result.
+pub fn merge_result_head(
+    path: &Path,
+    destination_head: &str,
+    source_head: &str,
+) -> Result<Option<String>> {
+    let current = head_commit(path)?;
+    let parents = commit_parents(path, &current)?;
+    if parents.len() == 2 && parents[0] == destination_head && parents[1] == source_head {
+        return Ok(Some(current));
+    }
+    let Some(first_parent) = parents.first() else {
+        return Ok(None);
+    };
+    let first_parents = commit_parents(path, first_parent)?;
+    if first_parents.len() == 2
+        && first_parents[0] == destination_head
+        && first_parents[1] == source_head
+    {
+        return Ok(Some(first_parent.clone()));
+    }
+    Ok(None)
+}
+
+/// Read the authoritative remote branch head without changing local refs.
+pub fn remote_branch_head(repo: &RepoRoot, branch: &str) -> Result<Option<String>> {
+    let reference = format!("refs/heads/{branch}");
+    let output = git(&["ls-remote", "origin", &reference], repo.as_ref())?;
+    Ok(output.split_whitespace().next().map(str::to_string))
+}
+
+/// Return the source commit recorded by Git for an in-progress merge.
+pub fn merge_head(path: &Path) -> Result<Option<String>> {
+    let marker = git_path(path, "MERGE_HEAD")?;
+    match fs::read_to_string(marker) {
+        Ok(value) => Ok(value
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(AppError::conflict(format!(
+            "cannot read merge state: {error}"
+        ))),
+    }
 }
 
 /// Merge a branch into the current branch using `--no-ff`.
@@ -1167,12 +1260,50 @@ pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
     Ok(())
 }
 
+/// Continue an in-progress merge through Git's normal commit and hook path.
+pub fn merge_continue(path: &Path) -> Result<()> {
+    let mut cmd = Cmd::new("git");
+    cmd.args(["merge", "--continue"]).current_dir(path);
+    if std::env::var_os("GIT_EDITOR").is_none() {
+        // The merge message was created by the initial merge. Avoid opening
+        // an editor in non-interactive callers without changing Git's commit
+        // or hook behavior.
+        cmd.env("GIT_EDITOR", "true");
+    }
+    sanitize_git_environment(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|error| AppError::git(format!("failed to run git merge --continue: {error}")))?;
+    if !output.status.success() {
+        return Err(classify_git_error(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Abort an in-progress merge and report failures to managed callers.
+pub fn merge_abort_checked(path: &Path) -> Result<()> {
+    git(&["merge", "--abort"], path)?;
+    Ok(())
+}
+
 /// Abort an in-progress merge in the destination worktree.
 ///
 /// Best-effort: if there is no merge to abort, git returns an error that
 /// we silently ignore.
 pub fn merge_abort(path: &Path) {
-    let _ = git(&["merge", "--abort"], path);
+    let _ = merge_abort_checked(path);
+}
+
+/// Location of wt-core's repository-local managed merge state.
+pub fn merge_operation_path(repo: &RepoRoot) -> Result<PathBuf> {
+    git_path(repo.as_ref(), "wt-core/merge-operation.json")
+}
+
+/// Location of the OS-backed owner lock for mutating merge lifecycles.
+pub fn merge_operation_lock_path(repo: &RepoRoot) -> Result<PathBuf> {
+    git_path(repo.as_ref(), "wt-core/merge-operation.lock")
 }
 
 /// Verify Git has a usable difftool before launching an interactive diff.
