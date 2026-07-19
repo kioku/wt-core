@@ -4,6 +4,9 @@
 
 source ../../bindings/nu/wt.nu
 
+let repo_root = (pwd | path expand)
+let binding_path = ($repo_root | path join "bindings/nu/wt.nu")
+
 def pass [msg: string] { print $"  ✓ ($msg)" }
 def fail [msg: string] { print $"  ✗ ($msg)"; exit 1 }
 
@@ -41,6 +44,21 @@ if ($env.PWD | str contains ".worktrees") and ($env.PWD | str contains "feat-one
 }
 
 let wt_path = $env.PWD
+
+# ── JSON output selection ────────────────────────────────────────────
+cd $"($work)/repo"
+let json_add = (wt add feat-json --json)
+if ($json_add | str contains '"cd_path"') {
+    pass "wt add --json: returns raw JSON stdout"
+} else {
+    fail "wt add --json: expected raw JSON with cd_path"
+}
+if $env.PWD == ($"($work)/repo" | path expand) {
+    pass "wt add --json: cwd unchanged"
+} else {
+    fail "wt add --json: cwd changed unexpectedly"
+}
+wt remove feat-json | ignore
 
 # ── wt list ──────────────────────────────────────────────────────────
 let output = (wt list | str join "\n")
@@ -125,7 +143,7 @@ wt add feat-into
 "into content" | save into.txt
 ^git add into.txt
 ^git commit -m "into content"
-let into_result = (wt merge feat-into --into release/nu-into --no-cleanup --json)
+let into_result = (wt merge feat-into --into release/nu-into --no-cleanup --json | from json)
 if $into_result.mainline == "release/nu-into" {
     pass "wt merge --into: forwards destination branch"
 } else {
@@ -133,6 +151,119 @@ if $into_result.mainline == "release/nu-into" {
 }
 wt remove feat-into --force
 ^git worktree remove --force $into_destination
+
+# ── JSON/navigation matrix ───────────────────────────────────────────
+# Use a repository path containing JSON-significant characters.
+let matrix_repo = ($work | path join 'repo"quote\slash')
+^git init $matrix_repo o+e>| ignore
+cd $matrix_repo
+let matrix_root = ($env.PWD | path expand)
+if not (path-is-within ($matrix_root | path join ".worktrees/app-copy") ($matrix_root | path join ".worktrees/app")) {
+    pass "matrix containment: sibling prefix is not a descendant"
+} else {
+    fail "matrix containment: sibling prefix was treated as a descendant"
+}
+^git config user.name "test"
+^git config user.email "test@test.com"
+^git commit --allow-empty -m "initial" o+e>| ignore
+^touch ($matrix_repo | path join "pnpm-workspace.yaml")
+
+let matrix_add = (wt add matrix-json --json)
+if ($matrix_add | str contains '"cd_path"') {
+    pass "matrix add --json: raw JSON stdout"
+} else {
+    fail "matrix add --json: missing cd_path"
+}
+let matrix_add_path = (($matrix_add | from json).cd_path)
+let expected_matrix_path = (^find ($matrix_root | path join ".worktrees") -maxdepth 1 -type d -name "matrix-json--*" -print | str trim)
+if $matrix_add_path == $expected_matrix_path {
+    pass "matrix add --json: parsed escaped path preserved"
+} else {
+    fail "matrix add --json: parsed path did not match Git path"
+}
+if ($env.PWD | path expand) == $matrix_root {
+    pass "matrix add --json: cwd unchanged"
+} else {
+    fail "matrix add --json: cwd changed"
+}
+
+let matrix_go = (wt go matrix-json --json)
+if ($matrix_go | str contains '"event":"switch"') {
+    pass "matrix go --json: command fields preserved"
+} else {
+    fail "matrix go --json: missing switch event"
+}
+cd $matrix_root
+wt remove matrix-json | ignore
+
+let nu_stderr = ($work | path join "nu-add.stderr")
+let _ = (wt add matrix-diagnostics err> $nu_stderr)
+if (open $nu_stderr | str contains "pnpm install --prefer-offline --frozen-lockfile") {
+    pass "matrix add: successful stderr diagnostics preserved"
+} else {
+    fail "matrix add: stderr diagnostics were discarded"
+}
+wt remove matrix-diagnostics | ignore
+
+wt add matrix-remove | ignore
+let expected_matrix_remove_path = (^find ($matrix_root | path join ".worktrees") -maxdepth 1 -type d -name "matrix-remove--*" -print | str trim)
+let matrix_remove_file = ($work | path join "nu-remove.json")
+wt remove matrix-remove --json | save --force $matrix_remove_file
+let matrix_remove = (open --raw $matrix_remove_file | decode utf-8)
+if ($matrix_remove | str contains '"removed_path"') {
+    pass "matrix remove --json: command fields preserved"
+} else {
+    fail "matrix remove --json: missing removed_path"
+}
+let parsed_removed_path = (($matrix_remove | from json).removed_path)
+if $parsed_removed_path == $expected_matrix_remove_path {
+    pass "matrix remove --json: parsed escaped path preserved"
+} else {
+    fail "matrix remove --json: parsed path did not match Git path"
+}
+if ($env.PWD | path expand) == $matrix_root {
+    pass "matrix remove --json: cwd reset to repository root"
+} else {
+    fail "matrix remove --json: cwd was not reset"
+}
+
+wt add matrix-merge | ignore
+"merge" | save --force merge.txt
+^git add merge.txt
+^git commit -m "merge" o+e>| ignore
+let matrix_merge_file = ($work | path join "nu-merge.json")
+wt merge matrix-merge --json | save --force $matrix_merge_file
+let matrix_merge = (open --raw $matrix_merge_file | decode utf-8)
+if ($matrix_merge | str contains '"cleaned_up":true') {
+    pass "matrix merge --json: command fields preserved"
+} else {
+    fail "matrix merge --json: missing cleanup field"
+}
+if ($env.PWD | path expand) == $matrix_root {
+    pass "matrix merge --json: cwd reset to repository root"
+} else {
+    fail "matrix merge --json: cwd was not reset"
+}
+
+# A failed JSON command must still fail when invoked from a child Nu script.
+# The binding re-raises wt-core's external-command error after its stderr has
+# already been rendered, rather than returning success from a catch block.
+let failure_repo = ($work | path join "repo")
+let remove_failure_script = $"source ($binding_path); wt remove missing --json --repo ($failure_repo)"
+let remove_failure = (^nu -c $remove_failure_script | complete)
+if $remove_failure.exit_code != 0 and ($remove_failure.stderr | str contains "no worktree found") {
+    pass "wt remove --json: failure script preserves status and diagnostics"
+} else {
+    fail $"wt remove --json: expected non-zero status and diagnostics, got ($remove_failure.exit_code)"
+}
+
+let merge_failure_script = $"source ($binding_path); wt merge missing --json --repo ($failure_repo)"
+let merge_failure = (^nu -c $merge_failure_script | complete)
+if $merge_failure.exit_code != 0 and ($merge_failure.stderr | str contains "no worktree found") {
+    pass "wt merge --json: failure script preserves status and diagnostics"
+} else {
+    fail $"wt merge --json: expected non-zero status and diagnostics, got ($merge_failure.exit_code)"
+}
 
 cd /tmp
 ^rm -rf $work

@@ -159,6 +159,33 @@ fn add_print_cd_path_returns_bare_path() {
 }
 
 #[test]
+fn add_json_takes_precedence_over_print_cd_path() {
+    let repo = fixtures::TestRepo::new();
+
+    let output = wt_core()
+        .args([
+            "add",
+            "feature/json-precedence",
+            "--repo",
+            &repo.path().display().to_string(),
+            "--print-cd-path",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert_eq!(stdout.lines().count(), 1, "expected one JSON document");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "feature/json-precedence");
+    assert!(json["cd_path"].as_str().is_some());
+}
+
+#[test]
 fn add_fails_when_branch_exists() {
     let repo = fixtures::TestRepo::new();
 
@@ -496,6 +523,42 @@ fn remove_keep_branch_print_paths_preserves_legacy_protocol() {
 }
 
 #[test]
+fn remove_json_writes_nul_delimited_navigation_metadata() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "navigation-protocol", "--repo", &repo_str])
+        .assert()
+        .success();
+    let removed_path = fixtures::find_worktree_dir(&repo.path(), "navigation-protocol");
+    let navigation_file = tempfile::NamedTempFile::new().expect("navigation file");
+
+    wt_core()
+        .args([
+            "remove",
+            "navigation-protocol",
+            "--repo",
+            &repo_str,
+            "--json",
+            "--navigation-file",
+            &navigation_file.path().display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let expected = format!(
+        "reset\0{}\0{}\0",
+        removed_path.display(),
+        repo.path().display()
+    );
+    assert_eq!(
+        std::fs::read(navigation_file.path()).expect("read navigation file"),
+        expected.as_bytes()
+    );
+}
+
+#[test]
 fn remove_print_paths_returns_three_lines() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -549,24 +612,36 @@ fn remove_print_paths_returns_three_lines() {
 }
 
 #[test]
-fn remove_print_paths_conflicts_with_json() {
+fn remove_json_takes_precedence_over_print_paths() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
     wt_core()
+        .args(["add", "json-precedence-rm", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
         .args([
             "remove",
-            "any-branch",
+            "json-precedence-rm",
             "--repo",
             &repo_str,
             "--print-paths",
             "--json",
         ])
         .assert()
-        .failure()
-        .stderr(predicates::prelude::predicate::str::contains(
-            "cannot be used with",
-        ));
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert_eq!(stdout.lines().count(), 1, "expected one JSON document");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "json-precedence-rm");
+    assert!(json["removed_path"].as_str().is_some());
 }
 
 // ── Interactive picker fallback tests ───────────────────────────────

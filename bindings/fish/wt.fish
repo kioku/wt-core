@@ -1,6 +1,26 @@
 # wt — Git worktree manager (Fish binding)
 # Source this file or place in ~/.config/fish/conf.d/wt.fish
 
+# Match complete path components without treating path characters as a glob.
+# Call this directly in conditions so Fish preserves its exit status.
+function wt__path_is_within
+    set -l child $argv[1]
+    set -l parent $argv[2]
+    if test "$child" = "$parent"
+        return 0
+    end
+    set -l prefix "$parent/"
+    test (string sub -s 1 -l (string length -- "$prefix") -- "$child") = "$prefix"
+end
+
+function wt__navigation_file
+    set -l tmpdir /tmp
+    if set -q TMPDIR
+        set tmpdir $TMPDIR
+    end
+    mktemp "$tmpdir/wt-core-nav.XXXXXX"
+end
+
 function wt --description "Git worktree manager"
     set -l cmd $argv[1]
 
@@ -16,12 +36,35 @@ function wt --description "Git worktree manager"
                 end
             end
 
-            set -l target (wt-core add $argv --print-cd-path 2>/dev/null)
-            if test $status -eq 0 -a -n "$target"
-                cd "$target"
-            else
+            # JSON is a caller-selected machine format. Do not append a
+            # path-only flag, which would otherwise change the JSON stream.
+            set -l want_json false
+            for arg in $argv
+                if test "$arg" = "--json"
+                    set want_json true
+                end
+            end
+            if test "$want_json" = true
                 wt-core add $argv
                 return $status
+            end
+
+            # Keep stdout private for the path while leaving stderr inherited so
+            # setup recommendations and warnings remain visible on success.
+            # Run wt-core as a simple command: Fish command substitutions do
+            # not inherit a caller's stderr redirection.
+            set -l path_file (wt__navigation_file)
+            if test $status -ne 0
+                return 1
+            end
+            wt-core add $argv --print-cd-path >"$path_file"
+            set -l rc $status
+            set -l target (cat "$path_file")
+            rm -f -- "$path_file"
+            if test $rc -eq 0 -a -n "$target"
+                cd "$target"
+            else
+                return $rc
             end
 
         case go
@@ -50,8 +93,15 @@ function wt --description "Git worktree manager"
 
             # --print-cd-path works with the interactive picker:
             # the picker UI renders on stderr/tty, the path goes to stdout.
-            set -l target (wt-core go $argv --print-cd-path)
+            # Run wt-core as a simple command for caller stderr redirections.
+            set -l path_file (wt__navigation_file)
+            if test $status -ne 0
+                return 1
+            end
+            wt-core go $argv --print-cd-path >"$path_file"
             set -l rc $status
+            set -l target (cat "$path_file")
+            rm -f -- "$path_file"
             if test $rc -eq 0 -a -n "$target"
                 cd "$target"
             else
@@ -79,18 +129,23 @@ function wt --description "Git worktree manager"
 
             if test "$want_json" = true
                 set -l cwd_before (pwd)
-                set -l output (wt-core remove $argv)
+                set -l nav_file (wt__navigation_file)
+                if test $status -ne 0
+                    return 1
+                end
+                set -l output (wt-core remove $argv --navigation-file "$nav_file")
                 set -l rc $status
                 if test $rc -eq 0
-                    # Extract paths from JSON for cd-out-of-removed-worktree logic
-                    set -l removed_path (printf '%s\n' $output | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
-                    set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                    if test -n "$removed_path" -a -n "$repo_root"
-                        if string match -q "$removed_path*" "$cwd_before"
-                            cd "$repo_root"; or true
+                    set -l navigation (string split0 < "$nav_file")
+                    if test "$navigation[1]" = reset \
+                        -a -n "$navigation[2]" \
+                        -a -n "$navigation[3]"
+                        if wt__path_is_within "$cwd_before" "$navigation[2]"
+                            cd "$navigation[3]"; or true
                         end
                     end
                 end
+                rm -f -- "$nav_file"
                 printf '%s\n' $output
                 return $rc
             end
@@ -113,8 +168,8 @@ function wt --description "Git worktree manager"
                 set -l removed_path $lines[1]
                 set -l repo_root $lines[2]
                 set -l branch $lines[3]
-                # Check if cwd is under the removed worktree path
-                if string match -q "$removed_path*" "$cwd_before"
+                # Check if cwd is under the removed worktree path.
+                if wt__path_is_within "$cwd_before" "$removed_path"
                     cd "$repo_root"; or true
                 end
                 if test "$keep_branch" = true
@@ -147,17 +202,23 @@ function wt --description "Git worktree manager"
 
             if test "$want_json" = true
                 set -l cwd_before (pwd)
-                set -l output (wt-core merge $argv)
+                set -l nav_file (wt__navigation_file)
+                if test $status -ne 0
+                    return 1
+                end
+                set -l output (wt-core merge $argv --navigation-file "$nav_file")
                 set -l rc $status
                 if test $rc -eq 0
-                    set -l removed_path (printf '%s\n' $output | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
-                    if test -n "$removed_path"
-                        if string match -q "$removed_path*" "$cwd_before"
-                            set -l repo_root (printf '%s\n' $output | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                            cd "$repo_root"; or true
+                    set -l navigation (string split0 < "$nav_file")
+                    if test "$navigation[1]" = reset \
+                        -a -n "$navigation[2]" \
+                        -a -n "$navigation[3]"
+                        if wt__path_is_within "$cwd_before" "$navigation[2]"
+                            cd "$navigation[3]"; or true
                         end
                     end
                 end
+                rm -f -- "$nav_file"
                 printf '%s\n' $output
                 return $rc
             end
@@ -176,7 +237,7 @@ function wt --description "Git worktree manager"
                 set -l pushed $lines[6]
                 set -l destination_path $lines[7]
                 if test "$cleaned_up" = "true" -a -n "$removed_path"
-                    if string match -q "$removed_path*" "$cwd_before"
+                    if wt__path_is_within "$cwd_before" "$removed_path"
                         cd "$repo_root"; or true
                     end
                 end

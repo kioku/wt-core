@@ -35,12 +35,13 @@ these conventions upfront makes everything else predictable.
 - **Dry-run first.** Destructive batch operations (`prune`) default to dry-run
   and require `--execute` to take action.
 
-- **Three output modes everywhere.** Every command supports human-readable
-  output (default), `--json` for machine consumption, and
-  `--print-cd-path` / versioned `--print-paths` modes for shell wrappers.
-  `exec --json` is the exception: it writes resolution metadata to stderr so
-  the child owns stdout unchanged; child diagnostics may follow on that stderr
-  stream.
+- **One output contract for navigation.** `add`, `go`, `remove`, and `merge`
+  use human-readable output by default and `--json` as their canonical machine
+  format. The legacy `--print-cd-path` / `--print-paths` flags remain
+  available for existing shell scripts; if a legacy path flag is combined
+  with `--json`, JSON takes precedence. `exec --json` is the exception: it
+  writes resolution metadata to stderr so the child owns stdout unchanged;
+  child diagnostics may follow on that stderr stream.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -249,32 +250,33 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 
 ## Output Modes
 
-| Flag              | Behavior                                     |
-|-------------------|----------------------------------------------|
-| *(default)*       | Human-readable text                          |
-| `--json`          | Single-line JSON envelope on stdout (except `exec`, which emits resolution metadata on stderr) |
-| `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
-| `--print-paths`   | Version 1 merge metadata on stdout (for wrappers) |
-| `--print-paths-v2` | Version 2 merge metadata, including destination path (for wrappers) |
+| Flag                | Behavior                                                               |
+|---------------------|------------------------------------------------------------------------|
+| *(default)*         | Human-readable text                                                    |
+| `--json`            | Single-line JSON on stdout (except `exec`, which emits metadata on stderr) |
+| `--print-cd-path`   | Bare absolute path on stdout for `add` and `go`                       |
+| `--print-paths`     | Legacy multi-line fields for `remove` and `merge`                    |
+| `--print-paths-v2`  | Merge fields plus `destination_path` as line seven                    |
+
+For `add`, `go`, `remove`, and `merge`, `--json` is authoritative when it is
+combined with either legacy path flag. This lets a wrapper safely append its
+legacy selector while a caller requests JSON, without producing competing
+stdout formats. JSON is exactly one document on stdout; warnings and errors
+remain on stderr.
 
 For `remove --print-paths`, the exact legacy protocol is three lines:
-`removed_path`, `repo_root`, and `branch`. This format is intentionally stable
-for already-installed shell bindings. Use `--json` when lifecycle status is
+`removed_path`, `repo_root`, and `branch`. Use `--json` when lifecycle status is
 needed: `worktree_removed` and `branch_deleted` explicitly report each action.
+The merge `--print-paths` protocol remains six lines; `--print-paths-v2` adds
+`destination_path` as line seven for linked-worktree destinations.
+
 Prune dry-runs report `worktree_present` and `branch_will_be_deleted`; execute
-results report `worktree_removed` and `branch_deleted`. A preserved branch has
-a null prune `path` because no worktree remains.
-
-The merge `--print-paths` protocol is version 1 and emits six lines:
-`repo_root`, `branch`, `mainline`, `cleaned_up`, `removed_path`, and
-`pushed`. It remains unchanged for existing consumers. Bindings use the
-explicitly versioned `--print-paths-v2` protocol, which emits those same six
-lines followed by `destination_path` as line seven.
-
-For commands other than `exec`, `--json` emits one compact JSON object per
-line on stdout. `exec --json` emits only its first resolution line as JSON on
-stderr; post-metadata stderr may contain inherited child diagnostics or a
-`wt-core` launch error if the command cannot be started.
+results report `worktree_removed` and `branch_deleted`. A preserved branch has a
+null prune `path` because no worktree remains. For commands other than `exec`,
+`--json` emits one compact JSON object on stdout. `exec --json` emits only its
+first resolution line as JSON on stderr; post-metadata stderr may contain
+inherited child diagnostics or a `wt-core` launch error if the command cannot
+be started.
 
 JSON envelope example (`add`, `go`, `remove`):
 
@@ -328,7 +330,14 @@ JSON envelope example (`merge`):
 
 ## Shell Integration
 
-Each binding wraps the binary and handles `cd` in the parent shell.
+The direct `wt-core` CLI never changes its caller's cwd. Each binding wraps the
+binary and may `cd` in the parent shell: normal `add`/`go` use the legacy path
+output to enter a worktree, while normal `remove`/`merge` return to the
+repository root when cleanup removes the current worktree. With `--json`,
+`add` and `go` leave cwd unchanged; JSON `remove` and `merge` still perform that
+safe reset when needed. The JSON document remains raw on stdout (including in
+Nushell); pipe it through Nushell's `from json` explicitly when structured
+values are desired. Warnings and diagnostics remain on stderr.
 
 You can either source files from `bindings/` directly, or generate them with
 `wt-core init <shell>`.

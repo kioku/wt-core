@@ -56,8 +56,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print only the worktree path (for shell wrappers)
-        #[arg(long, conflicts_with = "json")]
+        /// Print only the worktree path (legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_cd_path: bool,
     },
 
@@ -78,8 +80,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print only the worktree path (for shell wrappers)
-        #[arg(long, conflicts_with = "json")]
+        /// Print only the worktree path (legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_cd_path: bool,
     },
 
@@ -123,9 +127,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print the legacy three-line removed_path, repo_root, branch protocol for shell wrappers
-        #[arg(long, conflicts_with = "json")]
+        /// Print removed_path, repo_root, and branch (one per line; legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths: bool,
+
+        /// Write wrapper navigation metadata to a private side channel.
+        #[arg(long, hide = true, value_name = "PATH")]
+        navigation_file: Option<PathBuf>,
     },
 
     /// Merge a worktree's branch into a checked-out target and clean up
@@ -153,13 +163,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line) for shell wrappers
-        #[arg(long, conflicts_with_all = ["json", "print_paths_v2"])]
+        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line; legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths: bool,
 
         /// Print version 2 merge info, including destination_path, for shell wrappers
-        #[arg(long, conflicts_with_all = ["json", "print_paths"])]
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths_v2: bool,
+
+        /// Write wrapper navigation metadata to a private side channel.
+        #[arg(long, hide = true, value_name = "PATH")]
+        navigation_file: Option<PathBuf>,
     },
 
     /// Materialize an explicit detached checkout at a workspace path
