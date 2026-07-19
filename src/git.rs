@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 use std::process::Stdio;
@@ -277,6 +278,21 @@ pub fn cherry(repo: &RepoRoot, mainline: &str, branch: &str) -> bool {
     }
 }
 
+/// Return whether the source and destination have equivalent content.
+///
+/// `git cherry` detects rebased and cherry-picked integrations, while an
+/// exact tree comparison covers a squash merge whose combined commit is not
+/// equivalent to any one source commit. This is deliberately conservative:
+/// it never treats a branch as integrated merely because a commit message or
+/// object name appears in the destination log.
+pub fn patch_equivalent(repo: &RepoRoot, destination: &str, source: &str) -> bool {
+    cherry(repo, destination, source)
+        || git_success(
+            &["diff", "--quiet", destination, source, "--"],
+            repo.as_ref(),
+        )
+}
+
 /// Try to resolve `refs/remotes/origin/HEAD` to a usable branch name.
 ///
 /// Returns the local branch name if it exists, otherwise the full remote
@@ -394,13 +410,70 @@ pub fn upstream_counts(path: &Path, upstream: &str, branch: &str) -> Result<Opti
     Ok(Some((ahead, behind)))
 }
 
+/// Compute a stable patch id for a revision range.
+///
+/// The caller can reverse the range endpoints when it needs to compare an
+/// inverse patch. An empty diff has no patch id because it cannot prove that
+/// any content was reverted.
+fn diff_patch_id(path: &Path, from: &str, to: &str) -> Option<String> {
+    let mut diff = Cmd::new("git");
+    diff.args(["diff", "--binary", "--no-ext-diff", from, to, "--"])
+        .current_dir(path)
+        .stdout(Stdio::piped());
+    for var in GIT_ENV_OVERRIDES {
+        diff.env_remove(var);
+    }
+    let diff_output = diff.output().ok()?;
+    if !diff_output.status.success() || diff_output.stdout.is_empty() {
+        return None;
+    }
+
+    let mut patch_id = Cmd::new("git");
+    patch_id.args(["patch-id", "--stable"]).current_dir(path);
+    for var in GIT_ENV_OVERRIDES {
+        patch_id.env_remove(var);
+    }
+    let mut child = patch_id
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&diff_output.stdout).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    output
+        .stdout
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+}
+
+/// Confirm that a revert commit actually reverses the referenced commit.
+///
+/// Git's standard revert message is user-controlled, so the message alone is
+/// not evidence. Compare the referenced commit's forward patch with the
+/// revert commit's reverse patch; an empty or unrelated commit is rejected.
+fn revert_reverses_commit(path: &Path, revert_commit: &str, reverted: &str) -> bool {
+    let reverted_parent = format!("{reverted}^1");
+    let revert_parent = format!("{revert_commit}^1");
+    diff_patch_id(path, &reverted_parent, reverted).is_some_and(|original| {
+        diff_patch_id(path, revert_commit, &revert_parent)
+            .is_some_and(|inverse| original == inverse)
+    })
+}
+
 /// Find a standard Git revert commit that refers to source history.
 ///
 /// Git records the reverted object in the body as `This reverts commit ...`.
 /// A marker alone is not enough: the reverted object must be in the
-/// destination history, and either the object itself or (for a reverted merge)
-/// its second parent must be reachable from `source`. This avoids warning for
-/// a revert message that merely names an unrelated object.
+/// destination history, the revert commit must actually reverse the object's
+/// tree diff, and either the object itself or (for a reverted merge) its second
+/// parent must be reachable from `source`. This avoids warning for a revert
+/// message that merely names an unrelated object.
 pub fn reverted_source_commit(
     path: &Path,
     source: &str,
@@ -413,7 +486,7 @@ pub fn reverted_source_commit(
 
     for record in log.split('\x1e') {
         let mut fields = record.splitn(3, '\0');
-        let Some(_revert_commit) = fields.next() else {
+        let Some(revert_commit) = fields.next() else {
             continue;
         };
         let Some(_revert_parents) = fields.next() else {
@@ -437,7 +510,8 @@ pub fn reverted_source_commit(
         if !git_success(
             &["merge-base", "--is-ancestor", reverted, destination],
             path,
-        ) {
+        ) || !revert_reverses_commit(path, revert_commit, reverted)
+        {
             continue;
         }
 
@@ -581,6 +655,23 @@ pub fn operation_state(path: &Path) -> Result<Option<&'static str>> {
 pub fn merge_in_progress(path: &Path) -> bool {
     git_path(path, "MERGE_HEAD")
         .map(|marker| marker.exists())
+        .unwrap_or(false)
+}
+
+/// Return whether a path is a usable Git worktree.
+pub fn worktree_is_valid(path: &Path) -> bool {
+    git_success(&["rev-parse", "--is-inside-work-tree"], path)
+}
+
+/// Return whether Git left unmerged index entries in a worktree.
+///
+/// A failed hook can leave `MERGE_HEAD` and a staged merge without any
+/// unmerged entries, so the index is the authoritative signal for a content
+/// conflict. This keeps hook and other Git failures out of the
+/// `content_conflict` JSON category.
+pub fn has_unmerged_entries(path: &Path) -> bool {
+    git(&["ls-files", "--unmerged"], path)
+        .map(|output| !output.is_empty())
         .unwrap_or(false)
 }
 

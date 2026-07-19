@@ -763,10 +763,12 @@ fn pick_worktree(_worktrees: &[domain::Worktree]) -> Result<BranchName> {
 ///
 /// `is_json` — whether the output format is machine-only (JSON).
 /// `action`  — verb shown in picker prompt and error messages (e.g. "remove", "merge").
+/// `readonly` — avoid pruning worktree metadata for inspection.
 fn resolve_action_branch(
     repo: &domain::RepoRoot,
     is_json: bool,
     action: &str,
+    readonly: bool,
 ) -> Result<Option<BranchName>> {
     if is_json {
         return Ok(None);
@@ -776,7 +778,11 @@ fn resolve_action_branch(
         return Ok(None);
     }
 
-    let worktrees = git::list_worktrees(repo)?;
+    let worktrees = if readonly {
+        git::list_worktrees_readonly(repo)?
+    } else {
+        git::list_worktrees(repo)?
+    };
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
@@ -1064,9 +1070,10 @@ fn cmd_merge(
 
     let resolved_branch = match branch {
         Some(branch) => Some(branch),
-        None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge")?,
+        None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge", inspect)?,
     };
-    let preflight = worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref())?;
+    let preflight =
+        worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), inspect)?;
 
     if inspect {
         return print_merge_inspection(&repo, &preflight, fmt);
@@ -1084,18 +1091,26 @@ fn cmd_merge(
     let preflight_for_error = preflight.clone();
     let result = match worktree::merge_with_preflight(&repo, preflight, push, no_cleanup) {
         Ok(result) => result,
-        Err(error) => {
+        Err(failure) => {
+            let refusal = match failure.kind {
+                worktree::MergeFailureKind::ContentConflict => JsonMergeRefusal {
+                    kind: "content".to_string(),
+                    reason: "content_conflict".to_string(),
+                    message: Some("destination content conflicts with the source".to_string()),
+                },
+                worktree::MergeFailureKind::GitFailure => JsonMergeRefusal {
+                    kind: "git".to_string(),
+                    reason: "git_error".to_string(),
+                    message: Some(failure.error.message.clone()),
+                },
+            };
             return report_merge_failure(
                 &repo,
                 &preflight_for_error,
                 fmt,
-                error,
-                Some(JsonMergeRefusal {
-                    kind: "content".to_string(),
-                    reason: "content_conflict".to_string(),
-                    message: Some("destination content conflicts with the source".to_string()),
-                }),
-            )
+                failure.error,
+                Some(refusal),
+            );
         }
     };
 
@@ -1338,7 +1353,7 @@ fn cmd_remove(
 
     let resolved_branch = match branch {
         Some(b) => Some(b),
-        None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove")?,
+        None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove", false)?,
     };
 
     let result = worktree::remove(&repo, resolved_branch.as_ref(), force)?;

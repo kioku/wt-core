@@ -678,6 +678,20 @@ pub struct MergeResult {
     pub warnings: Vec<String>,
 }
 
+/// Category for a Git failure while attempting the content merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeFailureKind {
+    ContentConflict,
+    GitFailure,
+}
+
+/// A merge attempt failure with enough context for human and JSON output.
+#[derive(Debug)]
+pub struct MergeFailure {
+    pub kind: MergeFailureKind,
+    pub error: AppError,
+}
+
 #[derive(Debug)]
 struct MergeDestination {
     branch: String,
@@ -800,13 +814,37 @@ fn topology_refusal(
     }
 }
 
+/// Validate a worktree record before using it for a merge.
+///
+/// Normal merges prune stale Git metadata before this check. Keeping the
+/// explicit validation here also handles locked or otherwise unusable records
+/// without falling through to a low-level "No such file" Git error.
+fn validate_merge_worktree(wt: &Worktree, role: &str) -> Result<()> {
+    if !git::worktree_is_valid(&wt.path) {
+        let branch = wt.branch.as_deref().unwrap_or("(detached)");
+        return Err(AppError::conflict(format!(
+            "stale {role} worktree metadata for branch '{branch}' at {}; run `git worktree prune`",
+            wt.path.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Inspect the merge topology without changing repository state.
+///
+/// `readonly` is true for `--inspect`. Normal merges deliberately prune
+/// stale worktree metadata before selecting either side of the merge.
 pub fn merge_preflight(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
     into: Option<&str>,
+    readonly: bool,
 ) -> Result<MergePreflight> {
-    let worktrees = git::list_worktrees_readonly(repo)?;
+    let worktrees = if readonly {
+        git::list_worktrees_readonly(repo)?
+    } else {
+        git::list_worktrees(repo)?
+    };
 
     let target_branch = match branch {
         Some(branch) => branch.clone(),
@@ -824,8 +862,19 @@ pub fn merge_preflight(
             "refusing to merge the main worktree".to_string(),
         ));
     }
+    validate_merge_worktree(source_wt, "source")?;
 
     let destination = resolve_merge_destination(repo, &worktrees, into)?;
+    let destination_wt = worktrees
+        .iter()
+        .find(|wt| wt.path == destination.path)
+        .ok_or_else(|| {
+            AppError::invariant(format!(
+                "destination worktree '{}' disappeared during merge preflight",
+                destination.path.display()
+            ))
+        })?;
+    validate_merge_worktree(destination_wt, "destination")?;
     if target_branch.as_str() == destination.branch {
         return Err(AppError::invariant(
             "refusing to merge a branch into itself".to_string(),
@@ -844,6 +893,8 @@ pub fn merge_preflight(
     };
     let topology = topology(upstream.as_deref(), ahead, behind);
     let source_was_merged = git::is_ancestor(repo, target_branch.as_str(), &destination.branch);
+    let source_patch_equivalent =
+        git::patch_equivalent(repo, &destination.branch, target_branch.as_str());
     let reverted_commit = git::reverted_source_commit(
         &destination.path,
         target_branch.as_str(),
@@ -852,7 +903,10 @@ pub fn merge_preflight(
     let source_was_reverted = reverted_commit.is_some();
     let source_history = if source_was_reverted {
         SourceHistory::MergedThenReverted
-    } else if source_was_merged {
+    } else if source_was_merged || source_patch_equivalent {
+        // Keep the existing `already_merged` output for both ancestry and a
+        // proven equivalent tree/patch. Do not report a known squash or rebase
+        // integration as `not_merged` merely because commit IDs differ.
         SourceHistory::AlreadyMerged
     } else {
         SourceHistory::NotMerged
@@ -900,15 +954,40 @@ fn abort_created_merge(path: &Path) {
     }
 }
 
+fn classify_merge_failure(
+    path: &Path,
+    target_branch: &BranchName,
+    error: AppError,
+) -> MergeFailure {
+    let kind = match git::has_unmerged_entries(path) {
+        true => MergeFailureKind::ContentConflict,
+        false => MergeFailureKind::GitFailure,
+    };
+    let error = match kind {
+        MergeFailureKind::ContentConflict => AppError::conflict(format!(
+            "content merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{error}",
+            target_branch
+        )),
+        MergeFailureKind::GitFailure => AppError {
+            code: error.code,
+            message: format!("merge of '{}' failed and was aborted\n{error}", target_branch),
+        },
+    };
+    MergeFailure { kind, error }
+}
+
 /// Run a merge using an already collected preflight.
 pub fn merge_with_preflight(
     repo: &RepoRoot,
     preflight: MergePreflight,
     push: bool,
     no_cleanup: bool,
-) -> Result<MergeResult> {
+) -> std::result::Result<MergeResult, MergeFailure> {
     if let Some(refusal) = &preflight.refusal {
-        return Err(AppError::conflict(refusal.message.clone()));
+        return Err(MergeFailure {
+            kind: MergeFailureKind::GitFailure,
+            error: AppError::conflict(refusal.message.clone()),
+        });
     }
 
     let destination_path = preflight.destination_path.clone();
@@ -918,12 +997,11 @@ pub fn merge_with_preflight(
     // Attempt the merge from the selected destination worktree's context.
     if let Err(error) = git::merge_no_ff(&destination_path, target_branch.as_str()) {
         // The preflight established that any merge state now belongs to this
-        // invocation. Do not abort unrelated failures that created no state.
+        // invocation. Abort it after classifying the failure so a hook or
+        // other Git failure is not mislabeled as a content conflict.
+        let failure = classify_merge_failure(&destination_path, &target_branch, error);
         abort_created_merge(&destination_path);
-        return Err(AppError::conflict(format!(
-            "content merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{error}",
-            target_branch
-        )));
+        return Err(failure);
     }
 
     let mut warnings = Vec::new();
