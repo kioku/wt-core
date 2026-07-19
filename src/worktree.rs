@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::domain::{BranchName, RepoRoot, Worktree};
@@ -79,6 +80,8 @@ pub struct RemoveResult {
     pub removed_path: PathBuf,
     pub branch: BranchName,
     pub repo_root: PathBuf,
+    /// Whether the local branch was deleted by this operation.
+    pub branch_deleted: bool,
     /// Non-fatal warning (e.g. branch deletion failed after worktree removal).
     pub warning: Option<String>,
 }
@@ -291,6 +294,16 @@ pub fn go(repo: &RepoRoot, branch: &BranchName) -> Result<GoResult> {
 
 /// Remove a worktree and delete its local branch.
 pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Result<RemoveResult> {
+    remove_with_keep_branch(repo, branch, force, false)
+}
+
+/// Remove a worktree, optionally preserving its local branch.
+pub fn remove_with_keep_branch(
+    repo: &RepoRoot,
+    branch: Option<&BranchName>,
+    force: bool,
+    keep_branch: bool,
+) -> Result<RemoveResult> {
     let worktrees = git::list_worktrees(repo)?;
 
     // Resolve which branch to remove.
@@ -316,17 +329,39 @@ pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Resu
 
     let removed_path = wt.path.clone();
 
-    // Remove worktree first, then branch.
-    git::remove_worktree(repo, &removed_path, force)?;
-    // Branch deletion: best-effort — bubble warning instead of blocking.
-    let warning = git::delete_branch(repo, &target_branch, force)
-        .err()
-        .map(|e| format!("worktree removed but branch deletion failed: {e}"));
+    // Record preservation before removal so a successful worktree removal
+    // cannot lose the branch's later prune eligibility.
+    if keep_branch {
+        git::mark_preserved_branch(repo, &target_branch)?;
+    }
+
+    // Remove worktree first, then optionally delete the branch. A failed
+    // worktree removal prevents branch cleanup and preserves the old safety
+    // ordering. Roll back the marker too, so a failed keep operation does not
+    // leave stale lifecycle state behind.
+    if let Err(error) = git::remove_worktree(repo, &removed_path, force) {
+        let _ = keep_branch.then(|| git::clear_preserved_branch(repo, &target_branch));
+        return Err(error);
+    }
+    let (branch_deleted, warning) = if keep_branch {
+        (false, None)
+    } else {
+        // Branch deletion is best-effort: the worktree is already gone, so
+        // report a warning while accurately retaining the branch state.
+        match git::delete_branch(repo, &target_branch, force) {
+            Ok(()) => (true, None),
+            Err(e) => (
+                false,
+                Some(format!("worktree removed but branch deletion failed: {e}")),
+            ),
+        }
+    };
 
     Ok(RemoveResult {
         removed_path,
         branch: target_branch,
         repo_root: repo.to_path_buf(),
+        branch_deleted,
         warning,
     })
 }
@@ -356,7 +391,8 @@ pub enum IntegrationStatus {
 #[derive(Debug)]
 pub struct WorktreePruneEntry {
     pub branch: Option<String>,
-    pub path: std::path::PathBuf,
+    /// `None` means the branch was preserved after its worktree was removed.
+    pub path: Option<std::path::PathBuf>,
     pub status: IntegrationStatus,
 }
 
@@ -371,14 +407,17 @@ pub struct PruneDryRun {
 #[derive(Debug)]
 pub struct PrunedEntry {
     pub branch: String,
-    pub path: std::path::PathBuf,
+    /// `None` means this entry only deleted a preserved branch.
+    pub path: Option<std::path::PathBuf>,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
 }
 
 /// An entry that was skipped during pruning.
 #[derive(Debug)]
 pub struct SkippedEntry {
     pub branch: Option<String>,
-    pub path: std::path::PathBuf,
+    pub path: Option<std::path::PathBuf>,
     pub reason: String,
 }
 
@@ -406,7 +445,7 @@ fn classify_integration(repo: &RepoRoot, branch: &str, mainline: &str) -> Integr
     IntegrationStatus::NotIntegrated
 }
 
-/// Dry-run: scan worktrees and report integration status without removing anything.
+/// Dry-run: scan worktrees and preserved local branches without removing anything.
 pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result<PruneDryRun> {
     let mainline = match mainline_override {
         Some(m) => {
@@ -421,10 +460,14 @@ pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result
     };
 
     let worktrees = git::list_worktrees(repo)?;
+    let worktree_branches: HashSet<String> = worktrees
+        .iter()
+        .filter_map(|wt| wt.branch.clone())
+        .collect();
     let mut entries = Vec::new();
 
     for wt in &worktrees {
-        if wt.is_main {
+        if wt.is_main || wt.branch.as_deref() == Some(mainline.as_str()) {
             continue;
         }
 
@@ -435,8 +478,24 @@ pub fn prune_dry_run(repo: &RepoRoot, mainline_override: Option<&str>) -> Result
 
         entries.push(WorktreePruneEntry {
             branch: wt.branch.clone(),
-            path: wt.path.clone(),
+            path: Some(wt.path.clone()),
             status,
+        });
+    }
+
+    // A worktree removed with --keep-branch no longer appears in `git
+    // worktree list`. Its private lifecycle marker lets a later prune delete
+    // the preserved branch once its commits reach the selected target,
+    // without treating every unrelated local branch as pruneable.
+    for branch in git::list_preserved_branches(repo)? {
+        if branch == mainline || worktree_branches.contains(&branch) {
+            continue;
+        }
+
+        entries.push(WorktreePruneEntry {
+            status: classify_integration(repo, &branch, &mainline),
+            branch: Some(branch),
+            path: None,
         });
     }
 
@@ -450,47 +509,79 @@ struct PruneAccumulator {
     warnings: Vec<String>,
 }
 
-/// Try to remove an integrated worktree and its branch.
+/// Try to remove an integrated worktree and delete its branch.
 ///
 /// When the branch was integrated via rebase (patch-id match), Git's own
 /// ancestry check (`git branch -d`) would refuse deletion because the
-/// original commits are not ancestors of mainline.  We auto-escalate to
-/// `-D` in that case since the cherry check already confirmed integration.
+/// original commits are not ancestors of mainline. We auto-escalate to `-D`
+/// in that case since the cherry check already confirmed integration.
 fn prune_integrated_entry(
     repo: &RepoRoot,
     entry: WorktreePruneEntry,
     force: bool,
     acc: &mut PruneAccumulator,
 ) {
-    let branch_name = entry.branch.clone().expect("integrated implies branch");
+    let Some(branch_name) = entry.branch.clone() else {
+        acc.skipped.push(SkippedEntry {
+            branch: None,
+            path: entry.path,
+            reason: "no_branch".to_string(),
+        });
+        return;
+    };
 
     let force_branch = force
         || matches!(
-            entry.status,
+            &entry.status,
             IntegrationStatus::Integrated(IntegrationMethod::Rebase)
         );
 
-    if let Err(e) = git::remove_worktree(repo, &entry.path, force) {
-        acc.warnings.push(format!(
-            "failed to remove worktree for '{branch_name}': {e}"
-        ));
-        acc.skipped.push(SkippedEntry {
-            branch: Some(branch_name),
-            path: entry.path,
-            reason: "removal_failed".to_string(),
-        });
-        return;
-    }
+    let worktree_removed = match entry.path.as_ref() {
+        Some(path) => match git::remove_worktree(repo, path, force) {
+            Ok(()) => true,
+            Err(e) => {
+                acc.warnings.push(format!(
+                    "failed to remove worktree for '{branch_name}': {e}"
+                ));
+                acc.skipped.push(SkippedEntry {
+                    branch: Some(branch_name),
+                    path: entry.path,
+                    reason: "removal_failed".to_string(),
+                });
+                return;
+            }
+        },
+        None => false,
+    };
 
     let bn = BranchName::new(&branch_name);
-    if let Err(e) = git::delete_branch(repo, &bn, force_branch) {
-        acc.warnings.push(format!(
-            "worktree removed but branch deletion failed for '{branch_name}': {e}"
-        ));
-    }
+    let branch_deleted = match git::delete_branch(repo, &bn, force_branch) {
+        Ok(()) => {
+            if let Err(e) = git::clear_preserved_branch(repo, &bn) {
+                acc.warnings.push(format!(
+                    "branch '{branch_name}' deleted but lifecycle marker cleanup failed: {e}"
+                ));
+            }
+            true
+        }
+        Err(e) => {
+            let subject = if worktree_removed {
+                "worktree removed"
+            } else {
+                "no worktree removed"
+            };
+            acc.warnings.push(format!(
+                "{subject} but branch deletion failed for '{branch_name}': {e}"
+            ));
+            false
+        }
+    };
+
     acc.pruned.push(PrunedEntry {
         branch: branch_name,
         path: entry.path,
+        worktree_removed,
+        branch_deleted,
     });
 }
 

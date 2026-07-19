@@ -50,12 +50,14 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Remove {
             branch,
             force,
+            keep_branch,
             repo,
             json,
             print_paths,
         } => cmd_remove(
             branch.as_deref().map(BranchName::new),
             force,
+            keep_branch,
             repo,
             remove_fmt(json, print_paths),
         ),
@@ -119,10 +121,16 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::Prune {
             execute,
             force,
-            mainline,
+            integrated_into,
             repo,
             json,
-        } => cmd_prune(execute, force, mainline.as_deref(), repo, prune_fmt(json)),
+        } => cmd_prune(
+            execute,
+            force,
+            integrated_into.as_deref(),
+            repo,
+            prune_fmt(json),
+        ),
         Command::Setup { repo, json } => cmd_setup(repo, status_fmt(json)),
         Command::Init { shell } => cmd_init(shell),
         Command::Doctor { repo, json } => cmd_doctor(repo, status_fmt(json)),
@@ -1126,6 +1134,7 @@ fn cmd_merge(
 fn cmd_remove(
     branch: Option<BranchName>,
     force: bool,
+    keep_branch: bool,
     repo: Option<PathBuf>,
     fmt: RemoveFormat,
 ) -> Result<()> {
@@ -1136,7 +1145,8 @@ fn cmd_remove(
         None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove")?,
     };
 
-    let result = worktree::remove(&repo, resolved_branch.as_ref(), force)?;
+    let result =
+        worktree::remove_with_keep_branch(&repo, resolved_branch.as_ref(), force, keep_branch)?;
 
     let removed_str = result.removed_path.display().to_string();
     let root_str = result.repo_root.display().to_string();
@@ -1147,18 +1157,28 @@ fn cmd_remove(
             println!("{removed_str}");
             println!("{root_str}");
             println!("{branch_name}");
+            println!("{}", result.branch_deleted);
         }
         RemoveFormat::Json => {
-            let resp =
-                JsonResponse::success(format!("removed worktree for branch '{branch_name}'"))
-                    .with_event("reset")
-                    .with_repo_root(&root_str)
-                    .with_removed_path(&removed_str)
-                    .with_branch(branch_name.as_str());
+            let resp = JsonResponse::success(if result.branch_deleted {
+                format!("removed worktree for branch '{branch_name}'")
+            } else {
+                format!("removed worktree and kept branch '{branch_name}'")
+            })
+            .with_event("reset")
+            .with_repo_root(&root_str)
+            .with_removed_path(&removed_str)
+            .with_branch(branch_name.as_str())
+            .with_worktree_removed(true)
+            .with_branch_deleted(result.branch_deleted);
             print_json(&resp)?;
         }
         RemoveFormat::Human => {
-            println!("Removed worktree and branch '{branch_name}' ({removed_str})");
+            if result.branch_deleted {
+                println!("Removed worktree and branch '{branch_name}' ({removed_str})");
+            } else {
+                println!("Removed worktree and kept branch '{branch_name}' ({removed_str})");
+            }
         }
     }
     if let Some(w) = &result.warning {
@@ -1198,6 +1218,12 @@ fn format_prune_entry(entry: &worktree::WorktreePruneEntry) -> (String, Option<S
 }
 
 fn print_prune_entry_human(entry: &worktree::WorktreePruneEntry) {
+    let location = if entry.path.is_some() {
+        ""
+    } else {
+        " (branch only)"
+    };
+
     match &entry.status {
         worktree::IntegrationStatus::Integrated(method) => {
             let method_str = match method {
@@ -1205,15 +1231,29 @@ fn print_prune_entry_human(entry: &worktree::WorktreePruneEntry) {
                 worktree::IntegrationMethod::Rebase => "rebase",
             };
             let branch = entry.branch.as_deref().unwrap_or("(unknown)");
-            println!("  ✓ {branch:<20} integrated ({method_str})");
+            println!("  ✓ {branch:<20} integrated ({method_str}){location}");
         }
         worktree::IntegrationStatus::NotIntegrated => {
             let branch = entry.branch.as_deref().unwrap_or("(unknown)");
-            println!("  ✗ {branch:<20} not integrated");
+            println!("  ✗ {branch:<20} not integrated{location}");
         }
         worktree::IntegrationStatus::NoBranch => {
             println!("  ⚠ {:<20} no branch (detached HEAD)", "(detached)");
         }
+    }
+}
+
+fn print_prune_dry_run_summary(entries: &[worktree::WorktreePruneEntry], prunable: usize) {
+    let has_branch_only = entries.iter().any(|entry| entry.path.is_none());
+    match (entries.is_empty(), prunable, has_branch_only) {
+        (true, _, _) => println!("\nNo worktrees to prune."),
+        (false, 0, true) => println!("\nNo integrated worktrees or branches found."),
+        (false, 0, false) => println!("\nNo integrated worktrees found."),
+        (false, _, _) => println!(
+            "\n{prunable} integrated worktree{} or branch{} can be pruned. Run with --execute to remove worktrees and delete branches.",
+            if prunable == 1 { "" } else { "s" },
+            if prunable == 1 { "" } else { "es" }
+        ),
     }
 }
 
@@ -1241,7 +1281,12 @@ fn cmd_prune_dry_run(
                         branch: e.branch.clone(),
                         status,
                         method,
-                        path: e.path.display().to_string(),
+                        path: e.path.as_ref().map(|p| p.display().to_string()),
+                        worktree_present: e.path.is_some(),
+                        branch_will_be_deleted: matches!(
+                            &e.status,
+                            worktree::IntegrationStatus::Integrated(_)
+                        ),
                     }
                 })
                 .collect();
@@ -1258,16 +1303,7 @@ fn cmd_prune_dry_run(
             for entry in &result.entries {
                 print_prune_entry_human(entry);
             }
-            if result.entries.is_empty() {
-                println!("\nNo worktrees to prune.");
-            } else if prunable == 0 {
-                println!("\nNo integrated worktrees found.");
-            } else {
-                println!(
-                    "\n{prunable} integrated worktree{} can be pruned. Run with --execute to remove.",
-                    if prunable == 1 { "" } else { "s" }
-                );
-            }
+            print_prune_dry_run_summary(&result.entries, prunable);
         }
     }
     Ok(())
@@ -1288,7 +1324,9 @@ fn cmd_prune_execute(
                 .iter()
                 .map(|e| JsonPrunedEntry {
                     branch: e.branch.clone(),
-                    path: e.path.display().to_string(),
+                    path: e.path.as_ref().map(|p| p.display().to_string()),
+                    worktree_removed: e.worktree_removed,
+                    branch_deleted: e.branch_deleted,
                 })
                 .collect();
 
@@ -1298,7 +1336,7 @@ fn cmd_prune_execute(
                 .map(|e| JsonSkippedEntry {
                     branch: e.branch.clone(),
                     reason: e.reason.clone(),
-                    path: e.path.display().to_string(),
+                    path: e.path.as_ref().map(|p| p.display().to_string()),
                 })
                 .collect();
 
@@ -1313,7 +1351,20 @@ fn cmd_prune_execute(
         PruneFormat::Human => {
             println!("Mainline: {}", result.mainline);
             for entry in &result.pruned {
-                println!("  Removed {}", entry.branch);
+                match (entry.worktree_removed, entry.branch_deleted) {
+                    (true, true) => {
+                        println!("  Removed {} worktree and branch", entry.branch);
+                    }
+                    (true, false) => {
+                        println!("  Removed {} worktree; kept branch", entry.branch);
+                    }
+                    (false, true) => {
+                        println!("  Deleted {} branch (no worktree)", entry.branch);
+                    }
+                    (false, false) => {
+                        println!("  Kept {} branch (no worktree)", entry.branch);
+                    }
+                }
             }
             for entry in &result.skipped {
                 let label = entry.branch.as_deref().unwrap_or("(detached)");
@@ -1328,13 +1379,30 @@ fn cmd_prune_execute(
             for w in &result.warnings {
                 eprintln!("warning: {w}");
             }
-            let count = result.pruned.len();
-            if count == 0 {
+            let worktrees_removed = result
+                .pruned
+                .iter()
+                .filter(|entry| entry.worktree_removed)
+                .count();
+            let branches_deleted = result
+                .pruned
+                .iter()
+                .filter(|entry| entry.branch_deleted)
+                .count();
+            if worktrees_removed == 0 && branches_deleted == 0 {
                 println!("\nNo worktrees pruned.");
+            } else if result.pruned.len() == worktrees_removed
+                && branches_deleted == result.pruned.len()
+            {
+                println!(
+                    "\nPruned {worktrees_removed} worktree{}.",
+                    if worktrees_removed == 1 { "" } else { "s" }
+                );
             } else {
                 println!(
-                    "\nPruned {count} worktree{}.",
-                    if count == 1 { "" } else { "s" }
+                    "\nPruned {worktrees_removed} worktree{} and deleted {branches_deleted} branch{}.",
+                    if worktrees_removed == 1 { "" } else { "s" },
+                    if branches_deleted == 1 { "" } else { "es" }
                 );
             }
         }

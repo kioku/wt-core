@@ -1,10 +1,62 @@
 mod fixtures;
 
+use std::process::Command as StdCommand;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
+}
+
+const GIT_ENV_OVERRIDES: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PREFIX",
+];
+
+fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+    let mut command = StdCommand::new("git");
+    command
+        .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        command.env_remove(var);
+    }
+    command
+        .output()
+        .expect("git show-ref failed")
+        .status
+        .success()
+}
+
+fn assert_branch_exists(repo: &std::path::Path, branch: &str) {
+    assert!(branch_exists(repo, branch), "branch should exist: {branch}");
+}
+
+fn assert_branch_deleted(repo: &std::path::Path, branch: &str) {
+    assert!(
+        !branch_exists(repo, branch),
+        "branch should be deleted: {branch}"
+    );
+}
+
+fn find_worktree_dir_optional(
+    repo: &std::path::Path,
+    slug_prefix: &str,
+) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(repo.join(".worktrees"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(slug_prefix))
+        })
 }
 
 #[test]
@@ -178,6 +230,8 @@ fn remove_deletes_worktree_and_branch() {
         .assert()
         .success();
 
+    assert_branch_deleted(&repo.path(), "to-remove");
+
     // Verify worktree is gone
     let entries: Vec<_> = std::fs::read_dir(repo.path().join(".worktrees"))
         .unwrap_or_else(|_| std::fs::read_dir(repo.path()).expect("repo gone"))
@@ -237,10 +291,122 @@ fn remove_json_includes_removed_path() {
     assert_eq!(json["event"], "reset");
     assert!(json["removed_path"].as_str().is_some());
     assert!(json["repo_root"].as_str().is_some());
+    assert_eq!(json["worktree_removed"], true);
+    assert_eq!(json["branch_deleted"], true);
 }
 
 #[test]
-fn remove_print_paths_returns_three_lines() {
+fn remove_keep_branch_preserves_branch_and_reports_separate_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "staged/source", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "staged/source",
+            "--keep-branch",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["worktree_removed"], true);
+    assert_eq!(json["branch_deleted"], false);
+    assert_eq!(
+        json["message"],
+        "removed worktree and kept branch 'staged/source'"
+    );
+    assert_branch_exists(&repo.path(), "staged/source");
+    assert!(find_worktree_dir_optional(&repo.path(), "staged-source").is_none());
+}
+
+#[test]
+fn remove_keep_branch_preserves_dirty_safety() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "staged/dirty", "--repo", &repo_str])
+        .assert()
+        .success();
+    let wt_dir = fixtures::find_worktree_dir(&repo.path(), "staged-dirty");
+    std::fs::write(wt_dir.join("uncommitted.txt"), "dirty").expect("write failed");
+
+    wt_core()
+        .args([
+            "remove",
+            "staged/dirty",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(5);
+    assert_branch_exists(&repo.path(), "staged/dirty");
+    assert!(wt_dir.exists());
+
+    wt_core()
+        .args([
+            "remove",
+            "staged/dirty",
+            "--keep-branch",
+            "--force",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    assert_branch_exists(&repo.path(), "staged/dirty");
+    assert!(!wt_dir.exists());
+}
+
+#[test]
+fn remove_keep_branch_print_paths_reports_branch_retained() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "staged/paths", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "staged/paths",
+            "--keep-branch",
+            "--print-paths",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 4, "expected exactly 4 lines: {stdout}");
+    assert_eq!(lines[2], "staged/paths");
+    assert_eq!(lines[3], "false");
+    assert_branch_exists(&repo.path(), "staged/paths");
+}
+
+#[test]
+fn remove_print_paths_returns_four_lines() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
@@ -266,7 +432,7 @@ fn remove_print_paths_returns_three_lines() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout}");
+    assert_eq!(lines.len(), 4, "expected exactly 4 lines: {stdout}");
 
     // Line 1: removed worktree path (under .worktrees/)
     assert!(
@@ -287,6 +453,9 @@ fn remove_print_paths_returns_three_lines() {
         lines[2], "feature/paths-rm",
         "line 3 should be the real branch name, not the slug"
     );
+
+    // Line 4: branch was deleted by the default cleanup.
+    assert_eq!(lines[3], "true");
 
     // No line should be JSON
     assert!(!lines[0].starts_with('{'));
@@ -435,8 +604,9 @@ fn remove_no_branch_print_paths_uses_cwd_inference() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 4);
     assert_eq!(lines[2], "paths-infer");
+    assert_eq!(lines[3], "true");
 }
 
 #[test]
@@ -477,8 +647,9 @@ fn remove_no_branch_print_paths_from_nested_dir_uses_cwd_inference() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 3);
+    assert_eq!(lines.len(), 4);
     assert_eq!(lines[2], "paths-infer-nested");
+    assert_eq!(lines[3], "true");
 }
 
 #[test]

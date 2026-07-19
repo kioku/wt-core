@@ -219,6 +219,39 @@ pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Resul
     Ok(())
 }
 
+/// Record that a branch should survive worktree removal until a later prune.
+///
+/// The marker is a private ref rather than a file in the repository, so the
+/// state follows clones only when explicitly copied and does not alter branch
+/// names or worktree directories.
+pub fn mark_preserved_branch(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
+    let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
+    let branch_ref = format!("refs/heads/{}", branch.as_str());
+    git(&["update-ref", &marker, &branch_ref], repo.as_ref())?;
+    Ok(())
+}
+
+/// List branches explicitly preserved by `remove --keep-branch`.
+pub fn list_preserved_branches(repo: &RepoRoot) -> Result<Vec<String>> {
+    let output = git(
+        &[
+            "for-each-ref",
+            "--format=%(refname:strip=3)",
+            "refs/wt-core/preserved/",
+        ],
+        repo.as_ref(),
+    )?;
+
+    Ok(output.lines().map(str::to_string).collect())
+}
+
+/// Remove the lifecycle marker for a preserved branch.
+pub fn clear_preserved_branch(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
+    let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
+    git(&["update-ref", "-d", &marker], repo.as_ref())?;
+    Ok(())
+}
+
 /// Run a git command and return true if it exits successfully.
 ///
 /// Used for commands like `merge-base --is-ancestor` that communicate

@@ -232,6 +232,139 @@ fn prune_execute_no_integrated_worktrees() {
 // ── Mainline tests ──────────────────────────────────────────────────
 
 #[test]
+fn prune_integrated_into_removes_preserved_branch_without_worktree() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/staged", "--repo", &repo_str])
+        .assert()
+        .success();
+    let staged_dir = find_worktree_dir(&repo.path(), "feature-staged");
+    commit_file(&staged_dir, "staged.txt", "staged", "staged feature");
+
+    run_git(&["branch", "integration/release"], &repo.path());
+    run_git(&["checkout", "integration/release"], &repo.path());
+    run_git(&["merge", "feature/staged"], &repo.path());
+
+    // The source worktree is no longer needed, but the branch must survive
+    // until the integration target has landed.
+    wt_core()
+        .args([
+            "remove",
+            "feature/staged",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    assert_branch_exists(&repo.path(), "feature/staged");
+
+    let output = wt_core()
+        .args([
+            "prune",
+            "--integrated-into",
+            "integration/release",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["mainline"], "integration/release");
+    assert_eq!(json["prunable"], 1);
+    let candidates = json["worktrees"].as_array().expect("worktrees array");
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0]["branch"], "feature/staged");
+    assert_eq!(candidates[0]["path"], serde_json::Value::Null);
+    assert_eq!(candidates[0]["worktree_present"], false);
+    assert_eq!(candidates[0]["branch_will_be_deleted"], true);
+
+    let output = wt_core()
+        .args([
+            "prune",
+            "--integrated-into",
+            "integration/release",
+            "--execute",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let pruned = json["pruned"].as_array().expect("pruned array");
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0]["worktree_removed"], false);
+    assert_eq!(pruned[0]["branch_deleted"], true);
+    assert_eq!(pruned[0]["path"], serde_json::Value::Null);
+    assert_branch_deleted(&repo.path(), "feature/staged");
+}
+
+#[test]
+fn prune_later_mainline_cleanup_deletes_preserved_branch() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/eventual", "--repo", &repo_str])
+        .assert()
+        .success();
+    let staged_dir = find_worktree_dir(&repo.path(), "feature-eventual");
+    commit_file(&staged_dir, "eventual.txt", "eventual", "eventual feature");
+
+    run_git(&["branch", "integration/release"], &repo.path());
+    run_git(&["checkout", "integration/release"], &repo.path());
+    run_git(&["merge", "feature/eventual"], &repo.path());
+    wt_core()
+        .args([
+            "remove",
+            "feature/eventual",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+
+    // The staged target has the feature, but main does not yet. The branch
+    // must remain preserved during this first prune.
+    run_git(&["checkout", "main"], &repo.path());
+    wt_core()
+        .args(["prune", "--execute", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No worktrees pruned."));
+    assert_branch_exists(&repo.path(), "feature/eventual");
+
+    // Once the integration target lands on main, the next mainline prune can
+    // delete the preserved branch even though its worktree is already gone.
+    run_git(&["merge", "integration/release"], &repo.path());
+    let output = wt_core()
+        .args(["prune", "--execute", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    let pruned = json["pruned"].as_array().expect("pruned array");
+    assert_eq!(pruned.len(), 1);
+    assert_eq!(pruned[0]["branch"], "feature/eventual");
+    assert_eq!(pruned[0]["worktree_removed"], false);
+    assert_eq!(pruned[0]["branch_deleted"], true);
+    assert_branch_deleted(&repo.path(), "feature/eventual");
+}
+
+#[test]
 fn prune_mainline_auto_detects_main() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -536,6 +669,20 @@ fn git_log_hash(repo: &std::path::Path, branch: &str) -> String {
     }
     let output = cmd.output().expect("git log failed");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// Assert that a branch exists in the repo.
+fn assert_branch_exists(repo: &std::path::Path, branch: &str) {
+    let mut cmd = StdCommand::new("git");
+    cmd.args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+    assert!(
+        cmd.output().expect("git show-ref failed").status.success(),
+        "branch should exist: {branch}"
+    );
 }
 
 /// Assert that a branch does not exist in the repo.

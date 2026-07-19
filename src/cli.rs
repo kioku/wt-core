@@ -87,9 +87,13 @@ pub enum Command {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,
 
-        /// Force removal even if dirty; use -D for branch deletion
+        /// Force removal even if dirty; use -D for branch deletion unless the branch is kept
         #[arg(long)]
         force: bool,
+
+        /// Remove the worktree but preserve its local branch
+        #[arg(long)]
+        keep_branch: bool,
 
         /// Repository path (defaults to current directory)
         #[arg(long)]
@@ -99,7 +103,7 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print removed_path, repo_root, and branch (one per line) for shell wrappers
+        /// Print removed_path, repo_root, branch, and branch_deleted (one per line) for shell wrappers
         #[arg(long, conflicts_with = "json")]
         print_paths: bool,
     },
@@ -220,9 +224,9 @@ pub enum Command {
         repo: Option<PathBuf>,
     },
 
-    /// Remove worktrees whose branches are fully integrated into mainline
+    /// Remove worktrees and branches fully integrated into a target revision
     Prune {
-        /// Actually remove integrated worktrees (default is dry-run)
+        /// Actually remove integrated worktrees and branches (default is dry-run)
         #[arg(long)]
         execute: bool,
 
@@ -230,9 +234,9 @@ pub enum Command {
         #[arg(long, requires = "execute")]
         force: bool,
 
-        /// Override mainline branch (default: auto-detect)
-        #[arg(long)]
-        mainline: Option<String>,
+        /// Revision to evaluate integration against (default: auto-detect)
+        #[arg(long = "integrated-into", visible_alias = "mainline")]
+        integrated_into: Option<String>,
 
         /// Repository path (defaults to current directory)
         #[arg(long)]

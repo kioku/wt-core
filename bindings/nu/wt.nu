@@ -80,10 +80,11 @@ export def --env "wt go" [
     }
 }
 
-# Remove a worktree and its local branch
+# Remove a worktree, optionally preserving its local branch
 export def --env "wt remove" [
     branch?: string  # Branch name (defaults to current worktree)
     --force          # Force removal even if dirty
+    --keep-branch    # Preserve the local branch after removing its worktree
     --repo: path     # Repository path (defaults to cwd)
     --json           # Output as JSON
 ] {
@@ -92,6 +93,7 @@ export def --env "wt remove" [
     mut args = ["remove"]
     if $branch != null { $args = ($args | append $branch) }
     if $force { $args = ($args | append "--force") }
+    if $keep_branch { $args = ($args | append "--keep-branch") }
 
     if $json {
         # --json: machine output, no interactive picker.
@@ -120,12 +122,17 @@ export def --env "wt remove" [
         let removed_path = ($lines | get 0)
         let repo_root = ($lines | get 1)
         let branch_name = ($lines | get 2)
+        let branch_deleted = ($lines | get 3)
 
         if ($cwd_before | str starts-with $removed_path) {
             cd $repo_root
         }
 
-        print $"Removed worktree and branch '($branch_name)'"
+        if $branch_deleted == "true" {
+            print $"Removed worktree and branch '($branch_name)'"
+        } else {
+            print $"Removed worktree and kept branch '($branch_name)'"
+        }
     }
 }
 
