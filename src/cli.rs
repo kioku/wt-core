@@ -150,9 +150,68 @@ pub enum Command {
         /// Inspect merge topology without merging, cleaning up, or pushing
         #[arg(
             long,
-            conflicts_with_all = ["push", "no_cleanup", "print_paths", "print_paths_v2"]
+            conflicts_with_all = [
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "status",
+                "continue_merge",
+                "abort"
+            ]
         )]
         inspect: bool,
+
+        /// Show the managed conflicted-merge operation
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "branch",
+                "into",
+                "inspect",
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "continue_merge",
+                "abort"
+            ]
+        )]
+        status: bool,
+
+        /// Continue the managed merge after resolving all conflicts
+        #[arg(
+            long = "continue",
+            conflicts_with_all = [
+                "branch",
+                "into",
+                "inspect",
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "status",
+                "abort"
+            ]
+        )]
+        continue_merge: bool,
+
+        /// Abort the managed merge and restore the destination
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "branch",
+                "into",
+                "inspect",
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "status",
+                "continue_merge"
+            ]
+        )]
+        abort: bool,
 
         /// Push the target branch to origin after successful merge
         #[arg(long)]

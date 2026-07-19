@@ -97,7 +97,7 @@ fn merge_no_cleanup_keeps_worktree_and_branch() {
 // ── Conflict tests ──────────────────────────────────────────────────
 
 #[test]
-fn merge_conflict_aborts_and_leaves_everything_untouched() {
+fn merge_conflict_preserves_destination_and_managed_state() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
@@ -111,30 +111,340 @@ fn merge_conflict_aborts_and_leaves_everything_untouched() {
     commit_file(&wt_dir, "shared.txt", "feature version", "feature change");
     commit_file(&repo.path(), "shared.txt", "main version", "main change");
 
-    // Merge should fail with conflict details from git.
+    // Merge should fail with conflict details but preserve Git's merge state.
     wt_core()
         .args(["merge", "feature/conflict", "--repo", &repo_str])
         .assert()
         .failure()
         .stderr(predicate::str::contains("merge conflicts"))
-        .stderr(predicate::str::contains("merge aborted"));
+        .stderr(predicate::str::contains("wt merge --continue"))
+        .stderr(predicate::str::contains("merge aborted").not());
 
-    // Worktree should still exist
+    // Worktree and branch remain available for the eventual continuation.
     let wt_dir = find_worktree_dir(&repo.path(), "feature-conflict");
     assert!(
         wt_dir.exists(),
         "worktree should still exist after conflict"
     );
-
-    // Branch should still exist
     assert_branch_exists(&repo.path(), "feature/conflict");
 
-    // Main worktree should be clean (merge was aborted)
     let status = git_status(&repo.path());
     assert!(
-        status.is_empty(),
-        "main worktree should be clean after abort: {status}"
+        status.contains("AA shared.txt"),
+        "main worktree should preserve the conflict: {status}"
     );
+    assert!(
+        repo.path()
+            .join(".git/wt-core/merge-operation.json")
+            .is_file(),
+        "managed merge state should be durable"
+    );
+}
+
+#[test]
+fn merge_status_and_continue_report_and_finish_conflict() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue");
+
+    let status = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run");
+    assert!(status.status.success());
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(status_json["ok"], true);
+    assert_eq!(status_json["state"], "conflicted");
+    assert_eq!(
+        status_json["unresolved_paths"],
+        serde_json::json!(["shared.txt"])
+    );
+    assert!(status_json["pending_actions"]
+        .as_array()
+        .is_some_and(|actions| actions.iter().any(|action| action
+            .as_str()
+            .is_some_and(|action| action.contains("resolve")))));
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unresolved paths remain"));
+
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    wt_core()
+        .args(["merge", "--continue", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cleaned_up\":true"))
+        .stdout(predicate::str::contains("Merge branch 'feature/continue'").not());
+
+    assert!(
+        !source.exists(),
+        "continue should apply the original cleanup policy"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue");
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+}
+
+#[test]
+fn merge_linked_destination_conflict_continue_preserves_common_state_and_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/conflict");
+
+    wt_core()
+        .args(["add", "feature/linked-conflict", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-linked-conflict");
+    commit_file(&source, "shared.txt", "source", "source conflict");
+    commit_file(
+        &destination,
+        "shared.txt",
+        "destination",
+        "destination conflict",
+    );
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/linked-conflict",
+            "--into",
+            "release/conflict",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("wt merge --continue"));
+    let status_path = repo.path().join(".git/wt-core/merge-operation.json");
+    assert!(
+        status_path.is_file(),
+        "linked merge state should use common Git dir"
+    );
+
+    std::fs::write(destination.join("shared.txt"), "resolved\n").expect("resolve linked conflict");
+    run_git(&["add", "shared.txt"], &destination);
+    wt_core()
+        .args(["merge", "--continue", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"mainline\":\"release/conflict\"",
+        ))
+        .stdout(predicate::str::contains("\"cleaned_up\":true"));
+
+    assert!(
+        !source.exists(),
+        "linked destination continuation cleans source"
+    );
+    assert_branch_deleted(&repo.path(), "feature/linked-conflict");
+    assert!(!status_path.exists());
+}
+
+#[test]
+fn merge_abort_restores_destination_and_clears_matching_state() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/abort");
+    let original_head = git_rev_parse(&repo.path(), "HEAD");
+
+    wt_core()
+        .args(["merge", "--abort", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"state\":\"aborted\""));
+
+    assert_eq!(git_rev_parse(&repo.path(), "HEAD"), original_head);
+    assert!(
+        git_status(&repo.path()).is_empty(),
+        "abort should restore a clean destination"
+    );
+    assert!(
+        source.exists(),
+        "abort must not clean up the source worktree"
+    );
+    assert_branch_exists(&repo.path(), "feature/abort");
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+}
+
+#[test]
+fn merge_continue_keeps_source_when_original_merge_skipped_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge_with_options(&repo, "feature/keep-conflict", true);
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"cleaned_up\":false"));
+
+    assert!(source.exists(), "--no-cleanup must survive continuation");
+    assert_branch_exists(&repo.path(), "feature/keep-conflict");
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_hook_failure_preserves_merge_for_retry() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    create_conflicted_merge(&repo, "feature/continue-hook");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    install_hook(
+        &repo,
+        "pre-commit",
+        "#!/bin/sh\necho continue hook failed >&2\nexit 42\n",
+    );
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("continuation failed"));
+    assert!(repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .is_file());
+    assert!(git_path(&repo.path(), "MERGE_HEAD").exists());
+
+    std::fs::remove_file(repo.path().join(".git/hooks/pre-commit")).expect("remove hook");
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+}
+
+#[test]
+fn merge_continue_failed_push_preserves_committed_operation_for_retry() {
+    let remote = fixtures::ClonedTestRepo::new();
+    let repo = remote.path();
+    let repo_str = repo.display().to_string();
+    create_conflicted_merge_at(&repo, "feature/push-retry", false, true);
+    // The helper above needs only the repository fixture API; remove origin to
+    // force the original push intent to fail after the merge commit.
+    run_git(&["remote", "remove", "origin"], &repo);
+
+    std::fs::write(repo.join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo);
+    wt_core()
+        .args(["merge", "--continue", "--json", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("push failed"));
+    assert!(repo.join(".git/wt-core/merge-operation.json").is_file());
+
+    let origin = remote.origin_path();
+    let origin_str = origin.display().to_string();
+    run_git(&["remote", "add", "origin", &origin_str], &repo);
+    run_git(&["push", "origin", "main"], &repo);
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!repo.join(".git/wt-core/merge-operation.json").exists());
+}
+
+#[test]
+fn merge_status_guides_recovery_for_stale_interrupted_and_corrupt_state() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/recovery");
+    commit_file(
+        &source,
+        "after-conflict.txt",
+        "changed",
+        "change while paused",
+    );
+
+    let stale = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run");
+    assert!(!stale.status.success());
+    let stale_json: serde_json::Value = serde_json::from_slice(&stale.stdout).expect("stale JSON");
+    assert_eq!(stale_json["state"], "stale");
+    assert!(stale_json["recovery"]
+        .as_str()
+        .is_some_and(|message| message.contains("source branch HEAD changed")));
+    run_git(&["reset", "--hard", "HEAD^"], &source);
+
+    run_git(&["merge", "--abort"], &repo.path());
+
+    let interrupted = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run");
+    assert!(!interrupted.status.success());
+    let interrupted_json: serde_json::Value =
+        serde_json::from_slice(&interrupted.stdout).expect("interrupted JSON");
+    assert_eq!(interrupted_json["state"], "interrupted");
+    assert!(interrupted_json["recovery"]
+        .as_str()
+        .is_some_and(|message| message.contains("Git no longer has the merge")));
+
+    let state_path = repo.path().join(".git/wt-core/merge-operation.json");
+    std::fs::write(&state_path, "{not-json").expect("corrupt state");
+    let corrupt = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run");
+    assert!(!corrupt.status.success());
+    let corrupt_json: serde_json::Value =
+        serde_json::from_slice(&corrupt.stdout).expect("corrupt JSON");
+    assert_eq!(corrupt_json["state"], "corrupt");
+    assert!(corrupt_json["recovery"]
+        .as_str()
+        .is_some_and(|message| message.contains("preserve")));
+}
+
+#[test]
+fn merge_status_rejects_a_changed_recorded_admin_identity() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    create_conflicted_merge(&repo, "feature/identity-status");
+    let state_path = repo.path().join(".git/wt-core/merge-operation.json");
+    let mut state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&state_path).expect("read state"))
+            .expect("state JSON");
+    state["source_identity"]["Linked"]["admin_dir"] = serde_json::json!("/replacement/admin");
+    std::fs::write(
+        &state_path,
+        serde_json::to_vec_pretty(&state).expect("encode state"),
+    )
+    .expect("write state");
+
+    let output = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run");
+    assert!(!output.status.success());
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(json["state"], "stale");
+    assert!(json["recovery"]
+        .as_str()
+        .is_some_and(|message| message.contains("identity changed")));
+    assert!(git_path(&repo.path(), "MERGE_HEAD").exists());
 }
 
 // ── Dirty worktree tests ────────────────────────────────────────────
@@ -1291,6 +1601,14 @@ fn merge_json_distinguishes_content_conflict_from_topology_refusal() {
     assert_eq!(json["preflight"]["topology"], "no_upstream");
     assert_eq!(json["refusal"]["kind"], "content");
     assert_eq!(json["refusal"]["reason"], "content_conflict");
+    assert_eq!(json["operation"]["state"], "conflicted");
+    assert_eq!(
+        json["operation"]["unresolved_paths"],
+        serde_json::json!(["shared.txt"])
+    );
+    assert!(json["operation"]["state_path"]
+        .as_str()
+        .is_some_and(|path| path.ends_with(".git/wt-core/merge-operation.json")));
     assert_eq!(git_rev_parse(&repo.path(), "HEAD"), destination_before);
     assert!(source.exists(), "content conflict must preserve the source");
 }
@@ -2191,6 +2509,46 @@ fn merge_linked_destination_identity_control_keeps_push_with_non_replacing_hook(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
+
+fn create_conflicted_merge(repo: &fixtures::TestRepo, branch: &str) -> std::path::PathBuf {
+    create_conflicted_merge_at(&repo.path(), branch, false, false)
+}
+
+fn create_conflicted_merge_with_options(
+    repo: &fixtures::TestRepo,
+    branch: &str,
+    no_cleanup: bool,
+) -> std::path::PathBuf {
+    create_conflicted_merge_at(&repo.path(), branch, no_cleanup, false)
+}
+
+fn create_conflicted_merge_at(
+    repo: &std::path::Path,
+    branch: &str,
+    no_cleanup: bool,
+    push: bool,
+) -> std::path::PathBuf {
+    let repo_str = repo.display().to_string();
+    wt_core()
+        .args(["add", branch, "--repo", &repo_str])
+        .assert()
+        .success();
+    let prefix = branch.replace('/', "-");
+    let source = find_worktree_dir(repo, &prefix);
+    commit_file(&source, "shared.txt", "feature version", "feature change");
+    commit_file(repo, "shared.txt", "main version", "main change");
+
+    let mut merge = wt_core();
+    merge.args(["merge", branch, "--repo", &repo_str]);
+    if no_cleanup {
+        merge.arg("--no-cleanup");
+    }
+    if push {
+        merge.arg("--push");
+    }
+    merge.assert().failure();
+    source
+}
 
 #[cfg(unix)]
 fn install_hook(repo: &fixtures::TestRepo, name: &str, script: &str) {

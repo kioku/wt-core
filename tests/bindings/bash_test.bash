@@ -200,6 +200,38 @@ echo "$json_merge" | grep -q '"cleaned_up":true' \
     && pass "matrix merge --json: cwd reset to repository root" \
     || fail "matrix merge --json: cwd was not reset"
 
+# ── resumable merge lifecycle ───────────────────────────────────────
+cd "$MATRIX_ROOT"
+wt add matrix-conflict >/dev/null 2>&1
+conflict_source="$PWD"
+printf 'source\n' > binding-conflict.txt
+git add binding-conflict.txt
+git commit -m "source conflict" >/dev/null 2>&1
+cd "$MATRIX_ROOT"
+printf 'destination\n' > binding-conflict.txt
+git add binding-conflict.txt
+git commit -m "destination conflict" >/dev/null 2>&1
+set +e
+wt merge matrix-conflict >"$WORK/bash-conflict.out" 2>&1
+conflict_rc=$?
+set -e
+[[ $conflict_rc -ne 0 ]] \
+    && pass "wt merge: conflict remains resumable" \
+    || fail "wt merge: conflict unexpectedly succeeded"
+status_json=$(wt merge --status --json)
+echo "$status_json" | grep -q '"state":"conflicted"' \
+    && pass "wt merge --status: reports conflicted operation" \
+    || fail "wt merge --status: missing conflicted state"
+printf 'resolved\n' > binding-conflict.txt
+git add binding-conflict.txt
+continue_json=$(wt merge --continue --json)
+echo "$continue_json" | grep -q '"cleaned_up":true' \
+    && pass "wt merge --continue: completes and cleans up" \
+    || fail "wt merge --continue: missing cleanup result"
+[[ ! -e "$conflict_source" ]] \
+    && pass "wt merge --continue: source worktree removed" \
+    || fail "wt merge --continue: source worktree remains"
+
 cd /tmp
 
 echo "All bash binding tests passed."

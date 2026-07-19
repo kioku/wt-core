@@ -232,6 +232,9 @@ export def --env "wt merge" [
     branch?: string  # Branch name (defaults to current worktree)
     --into: string   # Merge into a branch checked out in any worktree
     --inspect        # Inspect topology without mutating the repository
+    --status         # Show the managed conflicted-merge operation
+    --continue      # Continue after resolving conflicts
+    --abort          # Abort and restore the managed merge
     --push           # Push mainline to origin after merge
     --no-cleanup     # Keep worktree and branch after merge
     --repo: path     # Repository path (defaults to cwd)
@@ -243,10 +246,22 @@ export def --env "wt merge" [
     if $branch != null { $args = ($args | append $branch) }
     if $into != null { $args = ($args | append ["--into" $into]) }
     if $inspect { $args = ($args | append "--inspect") }
+    if $status { $args = ($args | append "--status") }
+    if $continue { $args = ($args | append "--continue") }
+    if $abort { $args = ($args | append "--abort") }
     if $push { $args = ($args | append "--push") }
     if $no_cleanup { $args = ($args | append "--no-cleanup") }
 
-    if $inspect {
+    if $status or $abort {
+        # Lifecycle reports have no navigation or path-only protocol. Keep
+        # stdout JSON-native when requested and preserve the core exit status.
+        let full_args = (build-args $args $repo $json false)
+        if $json {
+            run-core $full_args
+        } else {
+            ^wt-core ...$full_args
+        }
+    } else if $inspect {
         # Inspection is a read-only protocol. Do not add navigation metadata or
         # move cwd; the core command never prunes or mutates in this mode.
         let full_args = (build-args $args $repo $json false)
@@ -267,7 +282,7 @@ export def --env "wt merge" [
                 | path dirname
             } catch { |err| error make $err }
         }
-        if $branch == null {
+        if $branch == null and not $continue {
             let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
             if $inferred_branch != "" {
                 $args = ($args | append $inferred_branch)
@@ -312,7 +327,7 @@ export def --env "wt merge" [
                 | path dirname
             } catch { |err| error make $err }
         }
-        if $branch == null {
+        if $branch == null and not $continue {
             let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
             if $inferred_branch != "" {
                 $args = ($args | append $inferred_branch)

@@ -1,5 +1,8 @@
 use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::domain::{BranchName, RepoRoot, Worktree};
 use crate::error::{AppError, Result};
@@ -928,7 +931,7 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
 }
 
 /// How the destination branch relates to its configured upstream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MergeTopology {
     NoUpstream,
@@ -940,12 +943,570 @@ pub enum MergeTopology {
 }
 
 /// History relationship between the source branch and destination history.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SourceHistory {
     NotMerged,
     AlreadyMerged,
     MergedThenReverted,
+}
+
+/// The repository-local record that binds a conflicted Git merge to its
+/// original source and destination worktree registrations.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MergeOperationState {
+    schema: u32,
+    phase: String,
+    source: String,
+    destination: String,
+    source_path: PathBuf,
+    destination_path: PathBuf,
+    source_identity: git::WorktreeIdentity,
+    destination_identity: git::WorktreeIdentity,
+    source_head: String,
+    destination_head: String,
+    merge_head: Option<String>,
+    completed_destination_head: Option<String>,
+    upstream: Option<String>,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+    topology: MergeTopology,
+    source_history: SourceHistory,
+    source_was_merged: bool,
+    source_was_reverted: bool,
+    reverted_commit: Option<String>,
+    push: bool,
+    cleanup: bool,
+    keep_branch: bool,
+    worktree_removed: bool,
+    branch_deleted: bool,
+    push_done: bool,
+}
+
+const MERGE_OPERATION_SCHEMA: u32 = 1;
+
+/// Read-only status of the managed merge operation.
+#[derive(Debug, Clone)]
+pub struct MergeOperationReport {
+    pub state: String,
+    pub source: Option<String>,
+    pub destination: Option<String>,
+    pub source_path: Option<PathBuf>,
+    pub destination_path: Option<PathBuf>,
+    pub unresolved_paths: Vec<String>,
+    pub push: bool,
+    pub cleanup: bool,
+    pub keep_branch: bool,
+    pub pending_actions: Vec<String>,
+    pub recovery: Option<String>,
+    pub state_path: PathBuf,
+}
+
+enum MergeOperationFile {
+    Missing,
+    Valid(Box<MergeOperationState>),
+    Corrupt { path: PathBuf, reason: String },
+}
+
+fn merge_operation_file(repo: &RepoRoot) -> Result<MergeOperationFile> {
+    let path = git::merge_operation_path(repo)?;
+    let contents = match fs::read_to_string(&path) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(MergeOperationFile::Missing);
+        }
+        Err(error) => {
+            return Ok(MergeOperationFile::Corrupt {
+                path,
+                reason: format!("cannot read state file: {error}"),
+            });
+        }
+    };
+
+    match serde_json::from_str::<MergeOperationState>(&contents) {
+        Ok(state) if state.schema == MERGE_OPERATION_SCHEMA => {
+            if valid_operation_phase(&state.phase) {
+                Ok(MergeOperationFile::Valid(Box::new(state)))
+            } else {
+                Ok(MergeOperationFile::Corrupt {
+                    path,
+                    reason: format!("unsupported operation phase '{}'", state.phase),
+                })
+            }
+        }
+        Ok(state) => Ok(MergeOperationFile::Corrupt {
+            path,
+            reason: format!("unsupported state schema {}", state.schema),
+        }),
+        Err(error) => Ok(MergeOperationFile::Corrupt {
+            path,
+            reason: format!("invalid JSON: {error}"),
+        }),
+    }
+}
+
+fn valid_operation_phase(phase: &str) -> bool {
+    matches!(phase, "starting" | "conflicted" | "committed")
+}
+
+fn operation_report_base(state: &MergeOperationState, state_path: PathBuf) -> MergeOperationReport {
+    MergeOperationReport {
+        state: state.phase.clone(),
+        source: Some(state.source.clone()),
+        destination: Some(state.destination.clone()),
+        source_path: Some(state.source_path.clone()),
+        destination_path: Some(state.destination_path.clone()),
+        unresolved_paths: Vec::new(),
+        push: state.push,
+        cleanup: state.cleanup,
+        keep_branch: state.keep_branch,
+        pending_actions: Vec::new(),
+        recovery: None,
+        state_path,
+    }
+}
+
+fn no_operation_report(state_path: PathBuf) -> MergeOperationReport {
+    MergeOperationReport {
+        state: "none".to_string(),
+        source: None,
+        destination: None,
+        source_path: None,
+        destination_path: None,
+        unresolved_paths: Vec::new(),
+        push: false,
+        cleanup: false,
+        keep_branch: false,
+        pending_actions: Vec::new(),
+        recovery: None,
+        state_path,
+    }
+}
+
+fn corrupt_operation_report(path: PathBuf, reason: String) -> MergeOperationReport {
+    MergeOperationReport {
+        state: "corrupt".to_string(),
+        source: None,
+        destination: None,
+        source_path: None,
+        destination_path: None,
+        unresolved_paths: Vec::new(),
+        push: false,
+        cleanup: false,
+        keep_branch: false,
+        pending_actions: Vec::new(),
+        recovery: Some(format!(
+            "managed merge state is corrupt ({reason}); preserve '{}', inspect the destination, and repair or remove the state only after recovery",
+            path.display()
+        )),
+        state_path: path,
+    }
+}
+
+fn pending_operation_actions(
+    state: &MergeOperationState,
+    phase: &str,
+    unresolved: &[String],
+) -> Vec<String> {
+    let mut actions = Vec::new();
+    let merge_action = match (
+        matches!(phase, "starting" | "conflicted"),
+        unresolved.is_empty(),
+    ) {
+        (true, true) => Some("run `wt merge --continue` to create the merge commit"),
+        (true, false) => Some("resolve the listed paths, then run `wt merge --continue`"),
+        _ => None,
+    };
+    if let Some(action) = merge_action {
+        actions.push(action.to_string());
+    }
+    let cleanup_action = match (state.cleanup, state.worktree_removed, state.branch_deleted) {
+        (true, true, false) => Some("remove the source branch"),
+        (true, false, _) => Some("remove the source worktree and branch"),
+        _ => None,
+    };
+    if let Some(action) = cleanup_action {
+        actions.push(action.to_string());
+    }
+    if state.push && !state.push_done {
+        actions.push(format!("push {} to origin", state.destination));
+    }
+    actions
+}
+
+fn stale_operation_report(
+    state: &MergeOperationState,
+    state_path: PathBuf,
+    reason: impl Into<String>,
+) -> MergeOperationReport {
+    let mut report = operation_report_base(state, state_path.clone());
+    report.state = "stale".to_string();
+    report.recovery = Some(format!(
+        "managed merge state is stale ({}) and was not changed; inspect '{}' and the destination, then finish or abort the Git operation manually before removing the state",
+        reason.into(),
+        state_path.display()
+    ));
+    report
+}
+
+fn interrupted_operation_report(
+    state: &MergeOperationState,
+    state_path: PathBuf,
+) -> MergeOperationReport {
+    let mut report = operation_report_base(state, state_path.clone());
+    report.state = "interrupted".to_string();
+    report.recovery = Some(format!(
+        "Git no longer has the merge recorded for this state; inspect '{}' and the destination before manually completing or restoring it, then clear the state",
+        state_path.display()
+    ));
+    report
+}
+
+fn operation_preflight(state: &MergeOperationState) -> MergePreflight {
+    MergePreflight {
+        source: state.source.clone(),
+        source_path: state.source_path.clone(),
+        source_identity: state.source_identity.clone(),
+        destination: state.destination.clone(),
+        destination_path: state.destination_path.clone(),
+        destination_identity: state.destination_identity.clone(),
+        upstream: state.upstream.clone(),
+        ahead: state.ahead,
+        behind: state.behind,
+        topology: state.topology,
+        source_history: state.source_history,
+        source_was_merged: state.source_was_merged,
+        source_was_reverted: state.source_was_reverted,
+        reverted_commit: state.reverted_commit.clone(),
+        allowed: true,
+        refusal: None,
+    }
+}
+
+#[cfg(unix)]
+fn sync_operation_parent(parent: &Path) -> Result<()> {
+    fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| {
+            AppError::git(format!(
+                "cannot flush managed merge state directory: {error}"
+            ))
+        })
+}
+
+#[cfg(not(unix))]
+fn sync_operation_parent(_parent: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn write_operation_state_inner(
+    repo: &RepoRoot,
+    state: &MergeOperationState,
+    create_only: bool,
+) -> Result<()> {
+    let path = git::merge_operation_path(repo)?;
+    let parent = path.parent().ok_or_else(|| {
+        AppError::invariant(format!(
+            "managed merge state path '{}' has no parent",
+            path.display()
+        ))
+    })?;
+    fs::create_dir_all(parent).map_err(|error| {
+        AppError::git(format!(
+            "cannot create managed merge state directory: {error}"
+        ))
+    })?;
+    let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
+        AppError::invariant(format!("cannot encode managed merge state: {error}"))
+    })?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let temp = path.with_file_name(format!(
+        ".merge-operation.json.tmp.{}.{}",
+        std::process::id(),
+        nonce
+    ));
+    let mut file = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&temp)
+        .map_err(|error| AppError::git(format!("cannot write managed merge state: {error}")))?;
+    file.write_all(&bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|error| AppError::git(format!("cannot flush managed merge state: {error}")))?;
+    match create_only {
+        true => match fs::hard_link(&temp, &path) {
+            Ok(()) => {
+                fs::remove_file(&temp).map_err(|error| {
+                    AppError::git(format!(
+                        "cannot remove temporary managed merge state: {error}"
+                    ))
+                })?;
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temp);
+                return Err(AppError::conflict(format!(
+                    "cannot claim managed merge state: {error}"
+                )));
+            }
+        },
+        false => {
+            fs::rename(&temp, &path).map_err(|error| {
+                AppError::git(format!("cannot install managed merge state: {error}"))
+            })?;
+        }
+    }
+    sync_operation_parent(parent)?;
+    Ok(())
+}
+
+fn write_operation_state(repo: &RepoRoot, state: &MergeOperationState) -> Result<()> {
+    write_operation_state_inner(repo, state, false)
+}
+
+fn create_operation_state(repo: &RepoRoot, state: &MergeOperationState) -> Result<()> {
+    write_operation_state_inner(repo, state, true)
+}
+
+/// Remove the operation record only after atomically detaching and verifying
+/// the exact bytes that were expected. If another writer installs a
+/// replacement between the read and rename, that replacement stays at the
+/// canonical path and the expected record is retained as recovery evidence.
+fn clear_operation_state(repo: &RepoRoot, expected: &MergeOperationState) -> Result<()> {
+    let path = git::merge_operation_path(repo)?;
+    let parent = path.parent().ok_or_else(|| {
+        AppError::invariant(format!(
+            "managed merge state path '{}' has no parent",
+            path.display()
+        ))
+    })?;
+    let tombstone = path.with_file_name(format!(
+        ".merge-operation.json.removing.{}.{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+
+    if !path.exists() {
+        return Ok(());
+    }
+    fs::rename(&path, &tombstone).map_err(|error| {
+        AppError::conflict(format!(
+            "cannot detach managed merge state before clearing it: {error}"
+        ))
+    })?;
+
+    let contents = fs::read_to_string(&tombstone);
+    let current = contents
+        .as_deref()
+        .ok()
+        .and_then(|value| serde_json::from_str::<MergeOperationState>(value).ok());
+    if current.as_ref() != Some(expected) {
+        let _ = (!path.exists()).then(|| fs::rename(&tombstone, &path));
+        return Err(AppError::conflict(
+            "managed merge state changed while the operation was running; refusing to clear the replacement".to_string(),
+        ));
+    }
+
+    fs::remove_file(&tombstone)
+        .map_err(|error| AppError::git(format!("cannot clear managed merge state: {error}")))?;
+    sync_operation_parent(parent)?;
+    Ok(())
+}
+
+fn state_worktree<'a>(
+    worktrees: &'a [Worktree],
+    path: &Path,
+    branch: &str,
+) -> Option<&'a Worktree> {
+    worktrees
+        .iter()
+        .find(|wt| wt.path == path && wt.branch.as_deref() == Some(branch))
+}
+
+fn validate_operation_worktree(
+    repo: &RepoRoot,
+    worktree: &Worktree,
+    role: &str,
+    expected: &git::WorktreeIdentity,
+) -> Result<()> {
+    let actual = validate_merge_worktree(repo, worktree, role)?;
+    if actual != *expected {
+        return Err(identity_changed(
+            role,
+            worktree.branch.as_deref().unwrap_or("(detached)"),
+            &worktree.path,
+            expected,
+            &actual,
+        ));
+    }
+    Ok(())
+}
+
+fn finish_committed_report(
+    mut report: MergeOperationReport,
+    state: &MergeOperationState,
+) -> MergeOperationReport {
+    report.pending_actions = pending_operation_actions(state, "committed", &[]);
+    report.state = if report.pending_actions.is_empty() {
+        "complete".to_string()
+    } else {
+        "committed".to_string()
+    };
+    report
+}
+
+fn inspect_committed_operation(
+    repo: &RepoRoot,
+    state: &MergeOperationState,
+    state_path: PathBuf,
+    worktrees: &[Worktree],
+    report: MergeOperationReport,
+) -> Result<MergeOperationReport> {
+    let Some(expected_head) = &state.completed_destination_head else {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "completed destination HEAD is missing",
+        ));
+    };
+    let actual_head = git::head_commit(&state.destination_path)?;
+    if &actual_head != expected_head {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "destination HEAD changed after the merge commit",
+        ));
+    }
+    if state.worktree_removed {
+        return Ok(finish_committed_report(report, state));
+    }
+
+    let Some(source) = state_worktree(worktrees, &state.source_path, &state.source) else {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "source worktree disappeared before cleanup completed",
+        ));
+    };
+    if let Err(error) = validate_operation_worktree(repo, source, "source", &state.source_identity)
+    {
+        return Ok(stale_operation_report(state, state_path, error.message));
+    }
+    if git::head_commit(&state.source_path)? != state.source_head {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "source branch HEAD changed after the merge began",
+        ));
+    }
+    Ok(finish_committed_report(report, state))
+}
+
+fn inspect_operation_state(
+    repo: &RepoRoot,
+    state: &MergeOperationState,
+    state_path: PathBuf,
+) -> Result<MergeOperationReport> {
+    let mut report = operation_report_base(state, state_path.clone());
+    let worktrees = git::list_worktrees_readonly(repo)?;
+    let destination = match state_worktree(&worktrees, &state.destination_path, &state.destination)
+    {
+        Some(destination) => destination,
+        None => {
+            return Ok(stale_operation_report(
+                state,
+                state_path,
+                "destination path or branch no longer matches",
+            ))
+        }
+    };
+    if let Err(error) = validate_operation_worktree(
+        repo,
+        destination,
+        "destination",
+        &state.destination_identity,
+    ) {
+        return Ok(stale_operation_report(state, state_path, error.message));
+    }
+
+    if state.phase == "committed" {
+        return inspect_committed_operation(repo, state, state_path, &worktrees, report);
+    }
+
+    let Some(source) = state_worktree(&worktrees, &state.source_path, &state.source) else {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "source path or branch no longer matches",
+        ));
+    };
+    if let Err(error) = validate_operation_worktree(repo, source, "source", &state.source_identity)
+    {
+        return Ok(stale_operation_report(state, state_path, error.message));
+    }
+    if git::head_commit(&state.source_path)? != state.source_head {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "source branch HEAD changed while the merge was paused",
+        ));
+    }
+    if git::head_commit(&state.destination_path)? != state.destination_head {
+        return Ok(stale_operation_report(
+            state,
+            state_path,
+            "destination HEAD changed while the merge was paused",
+        ));
+    }
+
+    match git::operation_state(&state.destination_path)? {
+        Some("merge") => {
+            if git::merge_head(&state.destination_path)? != state.merge_head {
+                return Ok(stale_operation_report(
+                    state,
+                    state_path,
+                    "MERGE_HEAD does not match the recorded source",
+                ));
+            }
+            report.unresolved_paths = git::unmerged_paths(&state.destination_path)?;
+            report.state = if report.unresolved_paths.is_empty() {
+                "ready".to_string()
+            } else {
+                "conflicted".to_string()
+            };
+            report.pending_actions =
+                pending_operation_actions(state, &report.state, &report.unresolved_paths);
+            Ok(report)
+        }
+        Some(other) => Ok(stale_operation_report(
+            state,
+            state_path,
+            format!("destination has a different {other} operation in progress"),
+        )),
+        None => Ok(interrupted_operation_report(state, state_path)),
+    }
+}
+
+/// Return the current managed merge status without pruning worktree metadata.
+pub fn merge_operation_status(repo: &RepoRoot) -> Result<MergeOperationReport> {
+    let path = git::merge_operation_path(repo)?;
+    match merge_operation_file(repo)? {
+        MergeOperationFile::Missing => Ok(no_operation_report(path)),
+        MergeOperationFile::Corrupt { path, reason } => Ok(corrupt_operation_report(path, reason)),
+        MergeOperationFile::Valid(state) => inspect_operation_state(repo, &state, path),
+    }
+}
+
+/// Return a report for an operation file after a merge failure, if one exists.
+pub fn merge_operation_report_if_present(repo: &RepoRoot) -> Option<MergeOperationReport> {
+    merge_operation_status(repo)
+        .ok()
+        .filter(|report| report.state != "none")
 }
 
 /// A refusal identified before Git's content merge starts.
@@ -1407,7 +1968,7 @@ fn classify_merge_failure(
     };
     let error = match kind {
         MergeFailureKind::ContentConflict => AppError::conflict(format!(
-            "content merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{error}",
+            "content merge conflicts with '{}' — resolve the listed paths, then run `wt merge --continue`; use `wt merge --abort` to restore the destination\n{error}",
             target_branch
         )),
         MergeFailureKind::GitFailure => AppError {
@@ -1425,6 +1986,345 @@ fn partial_success_warning(action: &str, replacement_action: &str, error: &AppEr
         )
     } else {
         format!("merge succeeded but {action} failed: {error}")
+    }
+}
+
+fn merge_state_from_preflight(
+    preflight: &MergePreflight,
+    source_head: String,
+    destination_head: String,
+    push: bool,
+    no_cleanup: bool,
+) -> MergeOperationState {
+    MergeOperationState {
+        schema: MERGE_OPERATION_SCHEMA,
+        phase: "starting".to_string(),
+        source: preflight.source.clone(),
+        destination: preflight.destination.clone(),
+        source_path: preflight.source_path.clone(),
+        destination_path: preflight.destination_path.clone(),
+        source_identity: preflight.source_identity.clone(),
+        destination_identity: preflight.destination_identity.clone(),
+        source_head,
+        destination_head,
+        merge_head: None,
+        completed_destination_head: None,
+        upstream: preflight.upstream.clone(),
+        ahead: preflight.ahead,
+        behind: preflight.behind,
+        topology: preflight.topology,
+        source_history: preflight.source_history,
+        source_was_merged: preflight.source_was_merged,
+        source_was_reverted: preflight.source_was_reverted,
+        reverted_commit: preflight.reverted_commit.clone(),
+        push,
+        cleanup: !no_cleanup,
+        keep_branch: no_cleanup,
+        // These flags describe completed cleanup actions, not the policy. A
+        // no-cleanup operation still needs its source identity revalidated
+        // while it is paused.
+        worktree_removed: false,
+        branch_deleted: false,
+        push_done: !push,
+    }
+}
+
+fn load_valid_merge_state(repo: &RepoRoot) -> Result<(PathBuf, MergeOperationState)> {
+    let path = git::merge_operation_path(repo)?;
+    match merge_operation_file(repo)? {
+        MergeOperationFile::Valid(state) => Ok((path, *state)),
+        MergeOperationFile::Missing => Err(AppError::conflict(
+            "no managed merge operation is recorded; start or inspect the merge manually, then use `wt merge --status`"
+                .to_string(),
+        )),
+        MergeOperationFile::Corrupt { path, reason } => Err(AppError::conflict(format!(
+            "managed merge state is corrupt ({reason}); preserve '{}', recover the destination manually, and do not retry until it is repaired",
+            path.display()
+        ))),
+    }
+}
+
+fn operation_recovery_error(report: &MergeOperationReport) -> AppError {
+    AppError::conflict(
+        report
+            .recovery
+            .clone()
+            .unwrap_or_else(|| format!("managed merge operation is in '{}' state", report.state)),
+    )
+}
+
+fn cleanup_merge_operation(
+    repo: &RepoRoot,
+    state: &mut MergeOperationState,
+    preflight: &MergePreflight,
+    warnings: &mut Vec<String>,
+) -> Result<Option<PathBuf>> {
+    if !state.cleanup {
+        return Ok(None);
+    }
+
+    let removed_path = if state.worktree_removed {
+        Some(state.source_path.clone())
+    } else {
+        let (source, _) = validate_preflight_worktrees(repo, preflight, "source", "destination")?;
+        if git::head_commit(&source.path)? != state.source_head {
+            return Err(AppError::conflict(
+                "source branch HEAD changed before cleanup; refusing to remove the newer worktree"
+                    .to_string(),
+            ));
+        }
+        let path = source.path.clone();
+        git::remove_worktree(repo, &path, false)?;
+        state.worktree_removed = true;
+        write_operation_state(repo, state)?;
+        Some(path)
+    };
+
+    if state.branch_deleted {
+        return Ok(removed_path);
+    }
+
+    let destination = validate_preflight_destination(repo, preflight, "destination")?;
+    let branch = BranchName::new(&state.source);
+    match git::delete_branch_at(&destination.path, &branch, false) {
+        Ok(()) => {
+            state.branch_deleted = true;
+            let marker_warning = git::clear_preserved_branch(repo, &branch)
+                .err()
+                .map(|error| {
+                    format!(
+                        "branch '{}' deleted but lifecycle marker cleanup failed: {error}",
+                        state.source
+                    )
+                });
+            if let Some(warning) = marker_warning {
+                warnings.push(warning);
+            }
+            write_operation_state(repo, state)?;
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "worktree removed but branch deletion failed: {error}"
+            ));
+        }
+    }
+
+    Ok(removed_path)
+}
+
+fn merge_result_from_operation(
+    repo: &RepoRoot,
+    state: &MergeOperationState,
+    preflight: MergePreflight,
+    removed_path: Option<PathBuf>,
+    warnings: Vec<String>,
+) -> MergeResult {
+    MergeResult {
+        branch: BranchName::new(&state.source),
+        mainline: state.destination.clone(),
+        destination_path: state.destination_path.clone(),
+        repo_root: repo.to_path_buf(),
+        cleaned_up: state.worktree_removed,
+        removed_path,
+        pushed: state.push && state.push_done,
+        preflight,
+        warnings,
+    }
+}
+
+fn continue_merge_commit(
+    repo: &RepoRoot,
+    state: &mut MergeOperationState,
+    preflight: &MergePreflight,
+    report: &MergeOperationReport,
+) -> Result<()> {
+    if !matches!(report.state.as_str(), "ready") {
+        return Err(AppError::conflict(format!(
+            "cannot continue while unresolved paths remain: {}; resolve them and run `wt merge --continue`",
+            report.unresolved_paths.join(", ")
+        )));
+    }
+    validate_preflight_worktrees(repo, preflight, "source", "destination")?;
+    if git::merge_head(&state.destination_path)? != state.merge_head {
+        return Err(AppError::conflict(
+            "destination MERGE_HEAD changed before continuation; managed state was preserved for recovery".to_string(),
+        ));
+    }
+    git::merge_continue(&state.destination_path).map_err(|error| AppError {
+        code: error.code,
+        message: format!(
+            "managed merge continuation failed; state was preserved — resolve hook or Git errors and retry `wt merge --continue`\n{error}"
+        ),
+    })?;
+    state.phase = "committed".to_string();
+    // Read the branch ref rather than trusting a path after hooks have
+    // run. A hook may replace a linked worktree; cleanup and push will
+    // still revalidate the captured registration identity below.
+    state.completed_destination_head = Some(git::branch_head(repo, &state.destination)?);
+    write_operation_state(repo, state)
+}
+
+fn clear_completed_operation(
+    repo: &RepoRoot,
+    state: &MergeOperationState,
+    warnings: &mut Vec<String>,
+) {
+    let complete = !state.cleanup || (state.worktree_removed && state.branch_deleted);
+    let complete = complete && (!state.push || state.push_done);
+    if !complete {
+        return;
+    }
+    if let Err(error) = clear_operation_state(repo, state) {
+        warnings.push(format!(
+            "merge completed but managed state could not be cleared: {error}"
+        ));
+    }
+}
+
+/// Continue a managed merge after its conflicts have been resolved.
+pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
+    let (_, mut state) = load_valid_merge_state(repo)?;
+    let report = merge_operation_status(repo)?;
+    if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
+        return Err(operation_recovery_error(&report));
+    }
+    if report.state == "none" {
+        return Err(AppError::conflict(
+            "no managed merge operation is recorded; nothing to continue".to_string(),
+        ));
+    }
+
+    let preflight = operation_preflight(&state);
+    if state.phase != "committed" {
+        continue_merge_commit(repo, &mut state, &preflight, &report)?;
+    }
+
+    let mut warnings = Vec::new();
+    let removed_path = match cleanup_merge_operation(repo, &mut state, &preflight, &mut warnings) {
+        Ok(path) => path,
+        Err(error) => {
+            warnings.push(partial_success_warning("cleanup", "removed", &error));
+            None
+        }
+    };
+
+    if state.push && !state.push_done {
+        match validate_preflight_destination(repo, &preflight, "destination") {
+            Ok(_) => match git::push(&state.destination_path, &state.destination) {
+                Ok(()) => {
+                    state.push_done = true;
+                    write_operation_state(repo, &state)?;
+                }
+                Err(error) => warnings.push(format!("merge succeeded but push failed: {error}")),
+            },
+            Err(error) => warnings.push(partial_success_warning(
+                "destination push",
+                "pushed",
+                &error,
+            )),
+        }
+    }
+
+    clear_completed_operation(repo, &state, &mut warnings);
+
+    Ok(merge_result_from_operation(
+        repo,
+        &state,
+        preflight,
+        removed_path.or_else(|| state.worktree_removed.then(|| state.source_path.clone())),
+        warnings,
+    ))
+}
+
+/// Abort a managed merge and clear only the matching operation record.
+pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
+    let (_, state) = load_valid_merge_state(repo)?;
+    let report = merge_operation_status(repo)?;
+    if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
+        return Err(operation_recovery_error(&report));
+    }
+    if state.phase == "committed" {
+        return Err(AppError::conflict(
+            "the managed merge is already committed; it cannot be aborted — finish pending push or cleanup actions instead".to_string(),
+        ));
+    }
+    if report.state == "none" {
+        return Err(AppError::conflict(
+            "no managed merge operation is recorded; nothing to abort".to_string(),
+        ));
+    }
+    validate_preflight_worktrees(repo, &operation_preflight(&state), "source", "destination")?;
+    if git::merge_head(&state.destination_path)? != state.merge_head {
+        return Err(AppError::conflict(
+            "destination MERGE_HEAD no longer matches the managed operation; state was preserved for manual recovery".to_string(),
+        ));
+    }
+
+    git::merge_abort_checked(&state.destination_path).map_err(|error| AppError {
+        code: error.code,
+        message: format!("managed merge abort failed; state was preserved\n{error}"),
+    })?;
+    if git::merge_in_progress(&state.destination_path)
+        || git::head_commit(&state.destination_path)? != state.destination_head
+    {
+        return Err(AppError::conflict(
+            "Git did not restore the original destination; managed state was preserved for recovery".to_string(),
+        ));
+    }
+    validate_preflight_worktrees(repo, &operation_preflight(&state), "source", "destination")?;
+    clear_operation_state(repo, &state)?;
+    let mut aborted = report;
+    aborted.state = "aborted".to_string();
+    aborted.unresolved_paths.clear();
+    aborted.pending_actions.clear();
+    aborted.recovery = None;
+    Ok(aborted)
+}
+
+fn record_conflicted_merge_state(
+    repo: &RepoRoot,
+    destination_path: &Path,
+    operation: &mut MergeOperationState,
+) -> Result<bool> {
+    operation.phase = "conflicted".to_string();
+    operation.merge_head = git::merge_head(destination_path)?;
+    let Some(_) = operation.merge_head else {
+        return Ok(false);
+    };
+    write_operation_state(repo, operation)?;
+    Ok(true)
+}
+
+fn handle_merge_failure(
+    repo: &RepoRoot,
+    destination_path: &Path,
+    target_branch: &BranchName,
+    operation: &mut MergeOperationState,
+    error: AppError,
+) -> MergeFailure {
+    let failure = classify_merge_failure(destination_path, target_branch, error);
+    if failure.kind != MergeFailureKind::ContentConflict {
+        abort_created_merge(destination_path);
+        let _ = clear_operation_state(repo, operation);
+        return failure;
+    }
+
+    match record_conflicted_merge_state(repo, destination_path, operation) {
+        Ok(true) => failure,
+        Ok(false) => {
+            abort_created_merge(destination_path);
+            let _ = clear_operation_state(repo, operation);
+            failure
+        }
+        Err(state_error) => {
+            abort_created_merge(destination_path);
+            MergeFailure {
+                kind: MergeFailureKind::GitFailure,
+                error: AppError::conflict(format!(
+                    "content merge conflict could not be recorded safely; merge was aborted: {state_error}"
+                )),
+            }
+        }
     }
 }
 
@@ -1454,18 +2354,73 @@ pub fn merge_with_preflight(
     let destination_path = preflight.destination_path.clone();
     let target_branch = BranchName::new(&preflight.source);
     let destination_branch = preflight.destination.clone();
+    let source_head = match git::head_commit(&preflight.source_path) {
+        Ok(head) => head,
+        Err(error) => {
+            return Err(MergeFailure {
+                kind: MergeFailureKind::GitFailure,
+                error,
+            });
+        }
+    };
+    let destination_head = match git::head_commit(&destination_path) {
+        Ok(head) => head,
+        Err(error) => {
+            return Err(MergeFailure {
+                kind: MergeFailureKind::GitFailure,
+                error,
+            });
+        }
+    };
+    let mut operation =
+        merge_state_from_preflight(&preflight, source_head, destination_head, push, no_cleanup);
+
+    // Never overwrite an operation that may require recovery. This also
+    // keeps a stale or corrupt record from being silently detached from the
+    // Git merge it describes.
+    match merge_operation_file(repo) {
+        Ok(MergeOperationFile::Missing) => {}
+        Ok(MergeOperationFile::Valid(_)) | Ok(MergeOperationFile::Corrupt { .. }) => {
+            return Err(MergeFailure {
+                kind: MergeFailureKind::GitFailure,
+                error: AppError::conflict(
+                    "a managed merge operation already exists; inspect it with `wt merge --status` and recover it before starting another merge".to_string(),
+                ),
+            });
+        }
+        Err(error) => {
+            return Err(MergeFailure {
+                kind: MergeFailureKind::GitFailure,
+                error,
+            });
+        }
+    }
+    if let Err(error) = create_operation_state(repo, &operation) {
+        return Err(MergeFailure {
+            kind: MergeFailureKind::GitFailure,
+            error,
+        });
+    }
 
     // Attempt the merge from the selected destination worktree's context.
     if let Err(error) = git::merge_no_ff(&destination_path, target_branch.as_str()) {
-        // The preflight established that any merge state now belongs to this
-        // invocation. Abort it after classifying the failure so a hook or
-        // other Git failure is not mislabeled as a content conflict.
-        let failure = classify_merge_failure(&destination_path, &target_branch, error);
-        abort_created_merge(&destination_path);
-        return Err(failure);
+        return Err(handle_merge_failure(
+            repo,
+            &destination_path,
+            &target_branch,
+            &mut operation,
+            error,
+        ));
     }
 
+    // A clean merge has no resumable operation. Clearing this record before
+    // cleanup preserves the established non-conflict lifecycle and output.
     let mut warnings = Vec::new();
+    if let Err(error) = clear_operation_state(repo, &operation) {
+        warnings.push(format!(
+            "merge succeeded but managed state could not be cleared: {error}"
+        ));
+    }
 
     // Cleanup: remove the source worktree and branch (default behaviour).
     // Downgraded to a warning because the merge has already been committed;

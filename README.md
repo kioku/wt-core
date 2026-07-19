@@ -58,6 +58,9 @@ wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
                                       [--keep-branch] preserves the branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
+wt merge --status                     Show a paused managed merge
+wt merge --continue                   Finish a resolved managed merge
+wt merge --abort                      Abort a managed merge safely
 wt merge [<branch>] --inspect         Inspect merge topology without mutation
 wt diff [<branch>] [--dry-run]         Open difftool for branch or dirty changes
 wt materialize --sha <sha> ...         Create an explicit detached checkout
@@ -166,8 +169,9 @@ wt remove feature/auth --keep-branch  # remove worktree, preserve local branch
 Merges a worktree's branch into the auto-detected mainline using
 `--no-ff`, then removes the source worktree and branch by default. Use
 `--into` to merge into a different branch that is already checked out in the
-main or a linked worktree. The merge and conflict abort run in the destination
-worktree, and conflicts cause an automatic `merge --abort` to keep it clean.
+main or a linked worktree. The merge and conflict lifecycle runs in the
+destination worktree; conflicts remain there for resolution or an explicit
+`wt merge --abort`.
 
 ```
 wt merge                         # merge current worktree's branch
@@ -193,6 +197,34 @@ worktree metadata, merges, pushes, or cleans up. With `--json`, the
 `preflight` object contains `upstream`, `ahead`, `behind`, `topology`, source
 history, and any structured refusal reason. Topology refusals are distinct
 from `content_conflict` refusals.
+
+A content conflict is intentionally left in the destination worktree. The
+source worktree and branch are not cleaned up, and wt-core records the
+operation under Git's common directory at
+`git rev-parse --git-path wt-core/merge-operation.json`. The record is written
+atomically and includes the schema version, exact source/destination worktree
+registrations, merge commit identity, push intent, and cleanup policy. Resolve
+and stage every path, then continue through Git's normal merge commit and hook
+path:
+
+```bash
+wt merge --status              # unresolved paths and pending actions
+wt merge --continue            # commit, then perform the original push/cleanup
+wt merge --abort               # git merge --abort, then clear matching state
+```
+
+`--status --json` reports `state`, `unresolved_paths`, `pending_actions`, and
+`recovery` (when state is stale, interrupted, or corrupt). A continuation hook
+failure preserves the merge and state for retry. Cleanup and push failures are
+reported as warnings and leave committed operation state so `--continue` can
+retry them; pushes never force-update a remote. If worktree registration
+identity, branch heads, or Git's merge marker no longer match the record,
+wt-core refuses mutation and prints recovery guidance rather than selecting a
+replacement by branch name.
+
+The Bash, Zsh, Fish, and Nushell bindings pass `--status` and `--abort`
+through without applying legacy navigation parsing. `--continue` retains the
+normal merge navigation behavior, including JSON output.
 
 ### `wt diff`
 

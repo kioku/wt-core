@@ -13,10 +13,10 @@ use crate::git;
 use crate::output::{
     find_current_worktree, print_json, print_json_stderr, write_navigation_file,
     JsonDoctorResponse, JsonExecResponse, JsonListResponse, JsonMaterializeResponse,
-    JsonMaterializeTimings, JsonMergePreflight, JsonMergeRefusal, JsonMergeResponse,
-    JsonPruneDryRunEntry, JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry,
-    JsonResponse, JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat,
-    StatusFormat,
+    JsonMaterializeTimings, JsonMergeOperation, JsonMergeOperationResponse, JsonMergePreflight,
+    JsonMergeRefusal, JsonMergeResponse, JsonPruneDryRunEntry, JsonPruneDryRunResponse,
+    JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse, JsonSkippedEntry, MergeFormat,
+    NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
 };
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
@@ -177,6 +177,9 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
             branch,
             into,
             inspect,
+            status,
+            continue_merge,
+            abort,
             push,
             no_cleanup,
             repo,
@@ -188,6 +191,9 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
             branch: branch.as_deref().map(BranchName::new),
             into,
             inspect,
+            status,
+            continue_merge,
+            abort,
             push,
             no_cleanup,
             repo,
@@ -1288,6 +1294,9 @@ struct MergeCommandOptions {
     branch: Option<BranchName>,
     into: Option<String>,
     inspect: bool,
+    status: bool,
+    continue_merge: bool,
+    abort: bool,
     push: bool,
     no_cleanup: bool,
     repo: Option<PathBuf>,
@@ -1300,6 +1309,9 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
         branch,
         into,
         inspect,
+        status,
+        continue_merge,
+        abort,
         push,
         no_cleanup,
         repo: repo_path,
@@ -1307,6 +1319,16 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
         navigation_file,
     } = options;
     let repo = resolve_repo(repo_path)?;
+
+    if status {
+        return cmd_merge_status(&repo, fmt);
+    }
+    if abort {
+        return cmd_merge_abort(&repo, fmt);
+    }
+    if continue_merge {
+        return cmd_merge_continue(&repo, fmt, navigation_file.as_deref());
+    }
 
     let resolved_branch = match branch {
         Some(branch) => Some(branch),
@@ -1354,6 +1376,15 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
         }
     };
 
+    print_merge_result(&repo, result, fmt, navigation_file.as_deref())
+}
+
+fn print_merge_result(
+    repo: &domain::RepoRoot,
+    result: worktree::MergeResult,
+    fmt: MergeFormat,
+    navigation_file: Option<&std::path::Path>,
+) -> Result<()> {
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;
     let removed_str = result
@@ -1362,7 +1393,7 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
         .map(|path| path.display().to_string())
         .unwrap_or_default();
 
-    if let Some(Err(error)) = navigation_file.as_ref().map(|path| {
+    if let Some(Err(error)) = navigation_file.map(|path| {
         write_navigation_file(
             path,
             result.cleaned_up,
@@ -1415,8 +1446,10 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
                 warnings: result.warnings.clone(),
                 preflight: Some(JsonMergePreflight::from_preflight(&result.preflight)),
                 refusal: None,
+                operation: worktree::merge_operation_report_if_present(repo)
+                    .map(|report| json_merge_operation(&report)),
                 inspect: false,
-            })?;
+            })?
         }
         MergeFormat::Human => {
             println!("Merged '{}' into {}", branch_name, result.mainline);
@@ -1436,6 +1469,164 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
         eprintln!("warning: {warning}");
     }
     Ok(())
+}
+
+fn json_merge_operation(report: &worktree::MergeOperationReport) -> JsonMergeOperation {
+    JsonMergeOperation {
+        state: report.state.clone(),
+        source: report.source.clone(),
+        destination: report.destination.clone(),
+        source_path: report
+            .source_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        destination_path: report
+            .destination_path
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        unresolved_paths: report.unresolved_paths.clone(),
+        push: report.push,
+        cleanup: report.cleanup,
+        keep_branch: report.keep_branch,
+        pending_actions: report.pending_actions.clone(),
+        recovery: report.recovery.clone(),
+        state_path: Some(report.state_path.display().to_string()),
+    }
+}
+
+fn empty_merge_operation(message: &str) -> JsonMergeOperation {
+    JsonMergeOperation {
+        state: "unknown".to_string(),
+        source: None,
+        destination: None,
+        source_path: None,
+        destination_path: None,
+        unresolved_paths: Vec::new(),
+        push: false,
+        cleanup: false,
+        keep_branch: false,
+        pending_actions: Vec::new(),
+        recovery: Some(message.to_string()),
+        state_path: None,
+    }
+}
+
+fn print_operation_error(
+    repo: &domain::RepoRoot,
+    fmt: MergeFormat,
+    error: &AppError,
+) -> Result<()> {
+    if fmt == MergeFormat::Json {
+        let operation = worktree::merge_operation_status(repo)
+            .ok()
+            .map(|report| json_merge_operation(&report))
+            .unwrap_or_else(|| empty_merge_operation(&error.message));
+        print_json(&JsonMergeOperationResponse {
+            ok: false,
+            message: error.message.clone(),
+            operation,
+        })?;
+    }
+    Err(AppError {
+        code: error.code,
+        message: error.message.clone(),
+    })
+}
+
+fn print_operation_human(report: &worktree::MergeOperationReport) {
+    println!("Managed merge operation: {}", report.state);
+    if let (Some(source), Some(destination)) = (&report.source, &report.destination) {
+        println!("  Source: {source}");
+        println!("  Destination: {destination}");
+    }
+    if let Some(path) = &report.destination_path {
+        println!("  Destination worktree: {}", path.display());
+    }
+    if report.unresolved_paths.is_empty() {
+        println!("  Unresolved paths: none");
+    } else {
+        println!("  Unresolved paths:");
+        for path in &report.unresolved_paths {
+            println!("    {path}");
+        }
+    }
+    println!("  Pending actions:");
+    if report.pending_actions.is_empty() {
+        println!("    none");
+    } else {
+        for action in &report.pending_actions {
+            println!("    {action}");
+        }
+    }
+    if let Some(recovery) = &report.recovery {
+        println!("  Recovery: {recovery}");
+    }
+}
+
+fn cmd_merge_status(repo: &domain::RepoRoot, fmt: MergeFormat) -> Result<()> {
+    if matches!(fmt, MergeFormat::PrintPaths | MergeFormat::PrintPathsV2) {
+        return Err(AppError::usage(
+            "--status cannot be used with path output formats".to_string(),
+        ));
+    }
+    let report = worktree::merge_operation_status(repo)?;
+    match fmt {
+        MergeFormat::Json => print_json(&JsonMergeOperationResponse {
+            ok: !matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt"),
+            message: format!("managed merge operation is {}", report.state),
+            operation: json_merge_operation(&report),
+        })?,
+        MergeFormat::Human => print_operation_human(&report),
+        MergeFormat::PrintPaths | MergeFormat::PrintPathsV2 => unreachable!(),
+    }
+    if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
+        return Err(AppError::conflict(report.recovery.unwrap_or_else(|| {
+            "managed merge state requires manual recovery".to_string()
+        })));
+    }
+    Ok(())
+}
+
+fn cmd_merge_abort(repo: &domain::RepoRoot, fmt: MergeFormat) -> Result<()> {
+    if matches!(fmt, MergeFormat::PrintPaths | MergeFormat::PrintPathsV2) {
+        return Err(AppError::usage(
+            "--abort cannot be used with path output formats".to_string(),
+        ));
+    }
+    let report = match worktree::merge_abort_operation(repo) {
+        Ok(report) => report,
+        Err(error) => return print_operation_error(repo, fmt, &error),
+    };
+    let message = format!(
+        "aborted managed merge of '{}' into {}",
+        report.source.as_deref().unwrap_or("(unknown)"),
+        report.destination.as_deref().unwrap_or("(unknown)")
+    );
+    match fmt {
+        MergeFormat::Json => print_json(&JsonMergeOperationResponse {
+            ok: true,
+            message,
+            operation: json_merge_operation(&report),
+        })?,
+        MergeFormat::Human => {
+            println!("{message}");
+            print_operation_human(&report);
+        }
+        MergeFormat::PrintPaths | MergeFormat::PrintPathsV2 => unreachable!(),
+    }
+    Ok(())
+}
+
+fn cmd_merge_continue(
+    repo: &domain::RepoRoot,
+    fmt: MergeFormat,
+    navigation_file: Option<&std::path::Path>,
+) -> Result<()> {
+    let result = match worktree::merge_continue(repo) {
+        Ok(result) => result,
+        Err(error) => return print_operation_error(repo, fmt, &error),
+    };
+    print_merge_result(repo, result, fmt, navigation_file)
 }
 
 fn print_merge_preflight(preflight: &worktree::MergePreflight) {
@@ -1543,6 +1734,7 @@ fn print_merge_inspection(
                 reason: refusal.reason.clone(),
                 message: Some(refusal.message.clone()),
             }),
+            operation: None,
             inspect: true,
         }),
         MergeFormat::Human => {
@@ -1591,6 +1783,8 @@ fn report_merge_failure(
             warnings: Vec::new(),
             preflight: Some(JsonMergePreflight::from_preflight(preflight)),
             refusal: json_refusal,
+            operation: worktree::merge_operation_report_if_present(repo)
+                .map(|report| json_merge_operation(&report)),
             inspect: false,
         })?;
     }

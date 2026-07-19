@@ -174,6 +174,17 @@ wt() {
                 esac
             done
 
+            # Status and abort are lifecycle reports, not the legacy
+            # navigation protocol. --continue uses the normal merge protocol.
+            for arg in "$@"; do
+                case "$arg" in
+                    --status|--abort)
+                        wt-core merge "$@"
+                        return $?
+                        ;;
+                esac
+            done
+
             # Detect if the caller explicitly asked for --json
             local want_json=false
             for arg in "$@"; do
