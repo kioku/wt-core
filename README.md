@@ -100,8 +100,9 @@ wt exec feature/auth -- make preview
 Use `--json` to emit one compact `exec_resolved` metadata object on stderr
 before the child starts. The first line is resolution metadata, not a command
 result (`resolved: true` means only that the worktree was resolved). Child
-stdout and stderr remain inherited; child stderr follows on the same mixed
-stderr stream, so the entire stream is not one parseable JSON document.
+stdout and stderr remain inherited. After the metadata line, stderr may contain
+inherited child diagnostics or a `wt-core` launch error if the command cannot
+be started, so the entire stream is not one parseable JSON document.
 
 The metadata schema is:
 
@@ -246,7 +247,8 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 
 For commands other than `exec`, `--json` emits one compact JSON object per
 line on stdout. `exec --json` emits only its first resolution line as JSON on
-stderr; the rest of stderr is the inherited child diagnostic stream.
+stderr; post-metadata stderr may contain inherited child diagnostics or a
+`wt-core` launch error if the command cannot be started.
 
 JSON envelope example (`add`, `go`, `remove`):
 
