@@ -329,6 +329,15 @@ pub fn remove_with_keep_branch(
 
     let removed_path = wt.path.clone();
 
+    // Snapshot the previous marker before updating it. A repeated keep
+    // request may be retrying a branch that was already preserved, and a
+    // failed removal must not discard that valid cleanup eligibility.
+    let previous_marker = if keep_branch {
+        git::preserved_branch_oid(repo, &target_branch)?
+    } else {
+        None
+    };
+
     // Record preservation before removal so a successful worktree removal
     // cannot lose the branch's later prune eligibility.
     if keep_branch {
@@ -337,10 +346,23 @@ pub fn remove_with_keep_branch(
 
     // Remove worktree first, then optionally delete the branch. A failed
     // worktree removal prevents branch cleanup and preserves the old safety
-    // ordering. Roll back the marker too, so a failed keep operation does not
-    // leave stale lifecycle state behind.
+    // ordering. Restore a prior marker only when it still matches the branch;
+    // otherwise clear the newly-created marker instead of retaining invalid
+    // lifecycle state.
     if let Err(error) = git::remove_worktree(repo, &removed_path, force) {
-        let _ = keep_branch.then(|| git::clear_preserved_branch(repo, &target_branch));
+        match (
+            keep_branch,
+            previous_marker
+                .filter(|oid| git::branch_oid(repo, &target_branch).as_deref() == Some(oid)),
+        ) {
+            (true, Some(oid)) => {
+                let _ = git::restore_preserved_branch(repo, &target_branch, &oid);
+            }
+            (true, None) => {
+                let _ = git::clear_preserved_branch(repo, &target_branch);
+            }
+            (false, _) => {}
+        }
         return Err(error);
     }
     let (branch_deleted, warning) = if keep_branch {

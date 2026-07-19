@@ -263,6 +263,21 @@ pub fn list_preserved_branches(repo: &RepoRoot) -> Result<Vec<PreservedBranch>> 
         .collect())
 }
 
+/// Return the marker object ID for a preserved branch, if one exists.
+pub fn preserved_branch_oid(repo: &RepoRoot, branch: &BranchName) -> Result<Option<String>> {
+    Ok(list_preserved_branches(repo)?
+        .into_iter()
+        .find(|preserved| preserved.name == branch.as_str())
+        .map(|preserved| preserved.oid))
+}
+
+/// Restore a previously captured lifecycle marker object ID.
+pub fn restore_preserved_branch(repo: &RepoRoot, branch: &BranchName, oid: &str) -> Result<()> {
+    let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
+    git(&["update-ref", &marker, oid], repo.as_ref())?;
+    Ok(())
+}
+
 /// Resolve the current object ID of a local branch.
 pub fn branch_oid(repo: &RepoRoot, branch: &BranchName) -> Option<String> {
     let branch_ref = format!("refs/heads/{}^{{commit}}", branch.as_str());

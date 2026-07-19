@@ -5,6 +5,8 @@ use std::process::Command as StdCommand;
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+use fixtures::run_git;
+
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
 }
@@ -31,6 +33,21 @@ fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
         .expect("git show-ref failed")
         .status
         .success()
+}
+
+fn git_ref_hash(repo: &std::path::Path, reference: &str) -> Option<String> {
+    let mut command = StdCommand::new("git");
+    command
+        .args(["rev-parse", "--verify", reference])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        command.env_remove(var);
+    }
+    let output = command.output().expect("git rev-parse failed");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 fn assert_branch_exists(repo: &std::path::Path, branch: &str) {
@@ -356,6 +373,10 @@ fn remove_keep_branch_preserves_dirty_safety() {
         .code(5);
     assert_branch_exists(&repo.path(), "staged/dirty");
     assert!(wt_dir.exists());
+    assert!(
+        git_ref_hash(&repo.path(), "refs/wt-core/preserved/staged/dirty").is_none(),
+        "failed initial keep should not retain a new marker"
+    );
 
     wt_core()
         .args([
@@ -370,6 +391,76 @@ fn remove_keep_branch_preserves_dirty_safety() {
         .success();
     assert_branch_exists(&repo.path(), "staged/dirty");
     assert!(!wt_dir.exists());
+}
+
+#[test]
+fn remove_keep_branch_failed_retry_preserves_marker_for_later_prune() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let branch = "feature/retry-marker";
+
+    wt_core()
+        .args(["add", branch, "--repo", &repo_str])
+        .assert()
+        .success();
+    let feature_dir = fixtures::find_worktree_dir(&repo.path(), "feature-retry-marker");
+    fixtures::commit_file(&feature_dir, "feature.txt", "feature", "feature commit");
+
+    // The first removal preserves the branch and creates the valid marker
+    // that a later prune will use.
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .success();
+    let marker_ref = "refs/wt-core/preserved/feature/retry-marker";
+    let marker_oid = git_ref_hash(&repo.path(), marker_ref).expect("marker should exist");
+    assert_eq!(
+        Some(marker_oid.clone()),
+        git_ref_hash(&repo.path(), "refs/heads/feature/retry-marker")
+    );
+
+    // Reattach the preserved branch and make the worktree dirty. A failed
+    // repeated remove must keep the original marker intact.
+    let reattached = repo.path().join("retry-marker-reattached");
+    run_git(
+        &["worktree", "add", &reattached.display().to_string(), branch],
+        &repo.path(),
+    );
+    std::fs::write(reattached.join("uncommitted.txt"), "dirty")
+        .expect("failed to make reattached worktree dirty");
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5);
+    assert!(reattached.exists());
+    assert_eq!(
+        Some(marker_oid.clone()),
+        git_ref_hash(&repo.path(), marker_ref)
+    );
+
+    // Once the dirty worktree is forcibly detached and its feature is
+    // integrated, prune should still recognize the preserved branch.
+    run_git(&["checkout", "main"], &repo.path());
+    run_git(&["merge", branch], &repo.path());
+    wt_core()
+        .args([
+            "remove",
+            branch,
+            "--keep-branch",
+            "--force",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    wt_core()
+        .args(["prune", "--execute", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_branch_deleted(&repo.path(), branch);
+    assert!(git_ref_hash(&repo.path(), marker_ref).is_none());
 }
 
 #[test]
