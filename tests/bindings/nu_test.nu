@@ -83,15 +83,28 @@ if not ($wt_path | path exists) {
 }
 
 # ── wt merge destination metadata ───────────────────────────────────
+# Validate every v2 field directly through Nu; the binding's human output is
+# printed rather than returned as pipeline data.
+wt add feat-protocol
+"protocol content" | save protocol.txt
+^git add protocol.txt
+^git commit -m "protocol content"
+let v2_output = (^wt-core merge feat-protocol --repo $expected_repo --no-cleanup --print-paths-v2 | str trim)
+let v2_lines = ($v2_output | lines)
+let expected_v2 = [$expected_repo, "feat-protocol", "master", "false", "", "false", $expected_repo]
+if $v2_lines == $expected_v2 {
+    pass "wt merge: validates exact v2 destination protocol"
+} else {
+    fail $"wt merge: unexpected v2 protocol: ($v2_output)"
+}
+wt remove feat-protocol
+
 wt add feat-merge
 let merge_wt_path = $env.PWD
 "merge content" | save merge.txt
 ^git add merge.txt
 ^git commit -m "merge content"
 wt merge feat-merge
-# Nushell's `print` is terminal output rather than pipeline data; the
-# destination metadata is visible in the command output above.
-pass "wt merge: human output includes destination path"
 if $env.PWD == $expected_repo {
     pass "wt merge: cd back to destination repository"
 } else {
