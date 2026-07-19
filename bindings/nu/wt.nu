@@ -43,11 +43,44 @@ def navigation-file [] {
     ^mktemp $"($tmpdir)/wt-core-nav.XXXXXX" | str trim
 }
 
-# Nushell turns a failed external command into a ShellError. Re-raise that
-# error instead of returning, so the original stderr remains visible and the
-# caller receives wt-core's non-zero exit status.
+# Capture the complete child result so structured stdout is not discarded
+# when wt-core intentionally exits non-zero (for example, a JSON conflict
+# response). Forward both streams, then raise an error to preserve failure
+# status for the caller.
 def run-core [args: list<string>] {
-    try { ^wt-core ...$args } catch { |err| error make $err }
+    let result = (^wt-core ...$args | complete)
+    if $result.exit_code == 0 {
+        $result.stdout | str trim
+    } else {
+        forward-core-failure $result
+        error make {msg: ($result.stderr | str trim | default $"wt-core exited with ($result.exit_code)")}
+    }
+}
+
+def forward-core-failure [result: record] {
+    # External printf writes survive Nushell's error unwinding, unlike values
+    # emitted by a pipeline that is later caught by the caller.
+    if not ($result.stdout | is-empty) {
+        ^printf "%s" $result.stdout
+    }
+    if not ($result.stderr | is-empty) {
+        ^printf "%s" $result.stderr err> /dev/stderr
+    }
+}
+
+# Resolve repository and current-branch context through wt-core itself. Raw
+# inherited `git` is deliberately not used here: GIT_COMMON_DIR and related
+# hook environments must not redirect a Nushell wrapper to another repository.
+def resolve-command-context [repo: any] {
+    mut args = ["list" "--json"]
+    if $repo != null {
+        $args = ($args | append ["--repo" ($repo | into string)])
+    }
+    let listing = (run-core $args | from json)
+    let main = ($listing.worktrees | where is_main | get 0.path)
+    let current = ($listing.worktrees | where is_current)
+    let branch = if ($current | is-empty) { "" } else { ($current | get 0.branch | default "") }
+    { repo: $main, branch: $branch }
 }
 
 # List all worktrees
@@ -134,32 +167,25 @@ export def --env "wt remove" [
     if $keep_branch { $args = ($args | append "--keep-branch") }
 
     if $json {
-        # Run from the repository root so removing the current worktree does
-        # not invalidate Nushell's own cwd while it captures stdout.
-        let command_repo = if $repo != null {
-            $repo | path expand
-        } else {
-            try {
-                ^git rev-parse --path-format=absolute --git-common-dir
-                | str trim
-                | path dirname
-            } catch { |err| error make $err }
-        }
-        if $branch == null {
-            let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
-            if $inferred_branch != "" {
-                $args = ($args | append $inferred_branch)
-            }
+        # Resolve the repository and inferred branch through sanitized
+        # wt-core metadata before moving cwd.
+        let context = (resolve-command-context $repo)
+        let command_repo = $context.repo
+        if $branch == null and $context.branch != "" {
+            $args = ($args | append $context.branch)
         }
         cd $command_repo
         let effective_repo = if $repo != null { $command_repo } else { null }
         let nav_file = (navigation-file)
         let full_args = (build-args $args $effective_repo true false | append ["--navigation-file" $nav_file])
-        let output = try { run-core $full_args } catch { |err|
+        let child = (^wt-core ...$full_args | complete)
+        if $child.exit_code != 0 {
             cd $cwd_before
             ^rm -f $nav_file
-            error make $err
+            forward-core-failure $child
+            error make {msg: ($child.stderr | str trim | default $"wt-core exited with ($child.exit_code)")}
         }
+        let output = ($child.stdout | str trim)
         let navigation = if ($nav_file | path exists) {
             try { read-navigation $nav_file } catch { [] }
         } else {
@@ -188,20 +214,10 @@ export def --env "wt remove" [
         # Resolve the branch before moving to the main worktree. Running the
         # destructive operation from the repository root keeps Nushell's cwd
         # valid even when the selected worktree is removed.
-        let command_repo = if $repo != null {
-            $repo | path expand
-        } else {
-            try {
-                ^git rev-parse --path-format=absolute --git-common-dir
-                | str trim
-                | path dirname
-            } catch { |err| error make $err }
-        }
-        if $branch == null {
-            let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
-            if $inferred_branch != "" {
-                $args = ($args | append $inferred_branch)
-            }
+        let context = (resolve-command-context $repo)
+        let command_repo = $context.repo
+        if $branch == null and $context.branch != "" {
+            $args = ($args | append $context.branch)
         }
         cd $command_repo
         let effective_repo = if $repo != null { $command_repo } else { null }
@@ -283,32 +299,25 @@ export def --env "wt merge" [
             ^wt-core ...$full_args
         }
     } else if $json {
-        # Run from the repository root so cleanup cannot invalidate Nushell's
-        # cwd while it captures stdout.
-        let command_repo = if $repo != null {
-            $repo | path expand
-        } else {
-            try {
-                ^git rev-parse --path-format=absolute --git-common-dir
-                | str trim
-                | path dirname
-            } catch { |err| error make $err }
-        }
-        if $branch == null and not $continue {
-            let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
-            if $inferred_branch != "" {
-                $args = ($args | append $inferred_branch)
-            }
+        # Resolve the repository and inferred branch through sanitized
+        # wt-core metadata before moving cwd.
+        let context = (resolve-command-context $repo)
+        let command_repo = $context.repo
+        if $branch == null and not $continue and $context.branch != "" {
+            $args = ($args | append $context.branch)
         }
         cd $command_repo
         let effective_repo = if $repo != null { $command_repo } else { null }
         let nav_file = (navigation-file)
         let full_args = (build-args $args $effective_repo true false | append ["--navigation-file" $nav_file])
-        let output = try { run-core $full_args } catch { |err|
+        let child = (^wt-core ...$full_args | complete)
+        if $child.exit_code != 0 {
             cd $cwd_before
             ^rm -f $nav_file
-            error make $err
+            forward-core-failure $child
+            error make {msg: ($child.stderr | str trim | default $"wt-core exited with ($child.exit_code)")}
         }
+        let output = ($child.stdout | str trim)
         let navigation = if ($nav_file | path exists) {
             try { read-navigation $nav_file } catch { [] }
         } else {
@@ -330,20 +339,10 @@ export def --env "wt merge" [
         # Resolve the branch before moving to the main worktree. Running the
         # merge from the repository root keeps Nushell's cwd valid when cleanup
         # removes the selected worktree.
-        let command_repo = if $repo != null {
-            $repo | path expand
-        } else {
-            try {
-                ^git rev-parse --path-format=absolute --git-common-dir
-                | str trim
-                | path dirname
-            } catch { |err| error make $err }
-        }
-        if $branch == null and not $continue {
-            let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
-            if $inferred_branch != "" {
-                $args = ($args | append $inferred_branch)
-            }
+        let context = (resolve-command-context $repo)
+        let command_repo = $context.repo
+        if $branch == null and not $continue and $context.branch != "" {
+            $args = ($args | append $context.branch)
         }
         cd $command_repo
         let effective_repo = if $repo != null { $command_repo } else { null }
@@ -361,7 +360,9 @@ export def --env "wt merge" [
         let pushed = ($lines | get 5)
         let destination_path = ($lines | get 6)
 
-        if $cleaned_up == "true" and $removed_path != "" {
+        # A worktree may be gone even when branch cleanup is pending; never
+        # leave Nushell inside that deleted directory.
+        if $removed_path != "" {
             if (path-is-within $cwd_before $removed_path) {
                 cd $repo_root
             }

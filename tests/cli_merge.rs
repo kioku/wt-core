@@ -674,6 +674,12 @@ fn merge_lifecycle_lock_blocks_hook_race_but_allows_read_only_status() {
         "status should remain read-only: {}",
         String::from_utf8_lossy(&status.stderr)
     );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("busy status JSON");
+    assert_eq!(
+        status_json["state"], "busy",
+        "live owner was misreported as an interrupted operation"
+    );
 
     let continue_output = wt_core()
         .args(["merge", "--continue", "--repo", &repo_str])
@@ -801,6 +807,83 @@ fn wait_for_file(path: &std::path::Path) {
         sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_config_injection_cannot_bypass_merge_hooks() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/config-hook", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-config-hook");
+    commit_file(&source, "config-hook.txt", "source", "source");
+    install_hook(
+        &repo,
+        "pre-merge-commit",
+        "#!/bin/sh\necho config hook ran >&2\nexit 42\n",
+    );
+
+    // These are the exact dynamic and packed Git config injection vectors that
+    // a hook-inherited environment can use to set core.hooksPath=/dev/null.
+    // wt-core must remove them from every Git child before the merge starts.
+    let output = wt_core()
+        .args(["merge", "feature/config-hook", "--repo", &repo_str])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/dev/null'")
+        .output()
+        .expect("merge should run");
+    assert!(
+        !output.status.success(),
+        "hook bypass unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config hook ran"),
+        "hook was bypassed: {stderr}"
+    );
+    assert_branch_exists(&repo.path(), "feature/config-hook");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_destination_ref_lock_blocks_head_race() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-head-boundary");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    let marker = repo.path().join("continue-ref-race");
+    install_hook(
+        &repo,
+        "pre-commit",
+        &format!(
+            "#!/bin/sh\nset -eu\nold={}\nrace=$(git commit-tree \"$(git rev-parse HEAD^{{tree}})\" -p \"$old\" -m race)\nif git update-ref refs/heads/main \"$race\" \"$old\"; then printf raced > {}; else printf blocked > {}; fi\n",
+            shell_quote(&destination_head),
+            shell_quote(&marker.display().to_string()),
+            shell_quote(&marker.display().to_string()),
+        ),
+    );
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("race marker"),
+        "blocked"
+    );
+    let parents = git_rev_parse(&repo.path(), "main^@");
+    assert!(parents.starts_with(&destination_head));
+    assert!(
+        !source.exists(),
+        "successful continuation should clean source"
+    );
 }
 
 #[cfg(unix)]

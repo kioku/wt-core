@@ -260,7 +260,9 @@ function wt --description "Git worktree manager"
                 set -l removed_path $lines[5]
                 set -l pushed $lines[6]
                 set -l destination_path $lines[7]
-                if test "$cleaned_up" = "true" -a -n "$removed_path"
+                # A worktree may be gone even when branch cleanup is pending;
+                # never leave the caller inside that deleted directory.
+                if test -n "$removed_path"
                     if wt__path_is_within "$cwd_before" "$removed_path"
                         cd "$repo_root"; or true
                     end

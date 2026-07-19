@@ -8,18 +8,10 @@ use std::time::{Duration, Instant};
 
 use crate::cli::MaterializeMode;
 use crate::error::{AppError, Result};
+use crate::git;
 
 const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_LOCK_RETRY: Duration = Duration::from_millis(50);
-const GIT_ENV_OVERRIDES: &[&str] = &[
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-    "GIT_PREFIX",
-];
 
 #[derive(Debug)]
 pub struct MaterializeOptions {
@@ -638,7 +630,7 @@ fn run_git_owned(args: Vec<OsString>, cwd: Option<&Path>) -> Result<String> {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    clear_git_env(&mut command);
+    git::sanitize_git_environment(&mut command);
 
     let output = command
         .output()
@@ -657,17 +649,11 @@ fn run_git_success(args: Vec<OsString>, cwd: Option<&Path>) -> bool {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
-    clear_git_env(&mut command);
+    git::sanitize_git_environment(&mut command);
     command
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
-}
-
-fn clear_git_env(command: &mut Command) {
-    for var in GIT_ENV_OVERRIDES {
-        command.env_remove(var);
-    }
 }
 
 fn redact_credentials(message: &str) -> String {

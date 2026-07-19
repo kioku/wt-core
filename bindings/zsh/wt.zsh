@@ -252,7 +252,9 @@ wt() {
                 removed_path=$(printf '%s\n' "$result" | sed -n '5p')
                 pushed=$(printf '%s\n' "$result" | sed -n '6p')
                 destination_path=$(printf '%s\n' "$result" | sed -n '7p')
-                if [[ "$cleaned_up" == "true" ]] && [[ -n "$removed_path" ]]; then
+                # A worktree may be gone even when branch cleanup is pending;
+                # never leave the caller inside that deleted directory.
+                if [[ -n "$removed_path" ]]; then
                     if wt__path_is_within "$cwd_before" "$removed_path"; then
                         cd "$repo_root" || true
                     fi

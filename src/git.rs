@@ -18,13 +18,24 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
     "GIT_PREFIX",
+    // Git also accepts the exact spelling without a suffix for a config file.
+    "GIT_CONFIG",
 ];
 
-/// Remove inherited Git context that could redirect a command to another
-/// repository (common when invoked from Git hooks).
+/// Remove inherited Git context and configuration injection from a child.
+///
+/// Git hooks and wrapper callers can set `GIT_CONFIG_COUNT` together with
+/// `GIT_CONFIG_KEY_n`/`GIT_CONFIG_VALUE_n`, or `GIT_CONFIG_PARAMETERS`, to
+/// inject arbitrary configuration into a child. Remove the complete dynamic
+/// family rather than guessing which numbered variables are present.
 pub(crate) fn sanitize_git_environment(cmd: &mut Cmd) {
     for var in GIT_ENV_OVERRIDES {
         cmd.env_remove(var);
+    }
+    for (key, _) in std::env::vars_os() {
+        if key.to_string_lossy().starts_with("GIT_CONFIG_") {
+            cmd.env_remove(key);
+        }
     }
 }
 
@@ -227,21 +238,148 @@ pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete a local branch, using the main worktree as the merge base for
-/// Git's safe `-d` check.
-pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Result<()> {
-    delete_branch_at(repo.as_ref(), branch, force)
+/// Delete a branch only if its ref still has the planned object ID.
+///
+/// `git branch -D` and `git branch -d` resolve the ref and delete it in one
+/// command, but the force form intentionally has no old-value check. Use an
+/// explicit compare-and-swap so a branch moved after worktree removal cannot
+/// turn cleanup into deletion of a newer incarnation. The non-force ancestry
+/// check is performed against the same planned tip before the atomic ref
+/// update, preserving the ordinary remove command's safety rule.
+pub fn delete_branch_at_cas(
+    path: &Path,
+    branch: &BranchName,
+    force: bool,
+    expected_oid: &str,
+) -> Result<()> {
+    if !force && !git_success(&["merge-base", "--is-ancestor", expected_oid, "HEAD"], path) {
+        return Err(AppError::conflict(format!(
+            "branch '{}' is not fully merged into the current destination",
+            branch.as_str()
+        )));
+    }
+
+    let reference = format!("refs/heads/{}", branch.as_str());
+    let mut cmd = Cmd::new("git");
+    cmd.args(["update-ref", "-d", &reference, expected_oid])
+        .current_dir(path);
+    sanitize_git_environment(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(classify_git_error(stderr))
 }
 
-/// Delete a local branch using `path` as the current worktree context.
-///
-/// The context matters for `git branch -d`: Git checks whether the branch is
-/// merged into the currently checked-out branch. Merge cleanup uses the
-/// destination worktree so linked-target merges satisfy that check.
-pub fn delete_branch_at(path: &Path, branch: &BranchName, force: bool) -> Result<()> {
-    let flag = if force { "-D" } else { "-d" };
-    git(&["branch", flag, branch.as_str()], path)?;
-    Ok(())
+/// Atomically verify that a local branch still has `expected_oid`.
+/// Updating a ref to its current value still takes Git's ref transaction and
+/// gives removal callers an immediate CAS boundary before path cleanup.
+pub fn verify_branch_ref_cas(path: &Path, branch: &BranchName, expected_oid: &str) -> Result<()> {
+    update_branch_ref_cas(path, branch, expected_oid, expected_oid)
+}
+
+/// Update a local branch ref with an atomic old-value check.
+pub fn update_branch_ref_cas(
+    path: &Path,
+    branch: &BranchName,
+    new_oid: &str,
+    expected_oid: &str,
+) -> Result<()> {
+    let reference = format!("refs/heads/{}", branch.as_str());
+    let mut cmd = Cmd::new("git");
+    cmd.args(["update-ref", &reference, new_oid, expected_oid])
+        .current_dir(path);
+    sanitize_git_environment(&mut cmd);
+    let output = cmd
+        .output()
+        .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(classify_git_error(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
+}
+
+/// An exclusive Git ref lock held while a continuation commits on a detached
+/// worktree HEAD. The lock creates a cooperating/atomic boundary: Git and
+/// other `wt-core`/raw Git writers cannot advance the destination ref while
+/// the merge commit is being prepared, and the final ref update still uses an
+/// old-value CAS after the lock is released.
+pub struct BranchRefLock {
+    path: PathBuf,
+    file: Option<fs::File>,
+}
+
+impl BranchRefLock {
+    fn release(&mut self) {
+        self.file.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+impl Drop for BranchRefLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub fn acquire_branch_ref_lock(
+    path: &Path,
+    branch: &BranchName,
+    expected_oid: &str,
+) -> Result<BranchRefLock> {
+    let lock_name = format!("refs/heads/{}.lock", branch.as_str());
+    let lock_path = git_path(path, &lock_name)?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path).map_err(|error| {
+        AppError::conflict(format!(
+            "cannot reserve destination branch '{}': {error}",
+            branch.as_str()
+        ))
+    })?;
+
+    if branch_oid_from_path(path, branch).as_deref() != Some(expected_oid) {
+        drop(file);
+        let _ = fs::remove_file(&lock_path);
+        return Err(AppError::conflict(
+            "destination HEAD changed before continuation; managed state was preserved".to_string(),
+        ));
+    }
+
+    Ok(BranchRefLock {
+        path: lock_path,
+        file: Some(file),
+    })
+}
+
+fn branch_oid_from_path(path: &Path, branch: &BranchName) -> Option<String> {
+    let reference = format!("refs/heads/{}^{{commit}}", branch.as_str());
+    git(&["rev-parse", "--verify", &reference], path).ok()
+}
+
+/// Temporarily detach a worktree HEAD without changing its index or files.
+/// `symbolic-ref --delete HEAD` intentionally rejects deleting the current
+/// HEAD, so update the per-worktree HEAD file without dereferencing it.
+pub fn detach_head(path: &Path, expected_oid: &str) -> Result<()> {
+    git(&["update-ref", "--no-deref", "HEAD", expected_oid], path).map(|_| ())
+}
+
+/// Restore a worktree's symbolic HEAD after a detached continuation.
+pub fn restore_head(path: &Path, branch: &BranchName) -> Result<()> {
+    let reference = format!("refs/heads/{}", branch.as_str());
+    git(&["symbolic-ref", "HEAD", &reference], path).map(|_| ())
 }
 
 /// Record that a branch should survive worktree removal until a later prune.
@@ -307,6 +445,27 @@ pub fn restore_preserved_branch(repo: &RepoRoot, branch: &BranchName, oid: &str)
 pub fn branch_oid(repo: &RepoRoot, branch: &BranchName) -> Option<String> {
     let branch_ref = format!("refs/heads/{}^{{commit}}", branch.as_str());
     git(&["rev-parse", "--verify", &branch_ref], repo.as_ref()).ok()
+}
+
+/// Capture all local branch names pointing at an exact commit. Commit-only
+/// prune targets use this snapshot so a branch that later moves is still
+/// protected by name rather than being reclassified as a new candidate.
+pub fn local_branches_at_oid(repo: &RepoRoot, oid: &str) -> Result<HashSet<String>> {
+    let output = git(
+        &[
+            "for-each-ref",
+            "--format=%(refname:strip=2)\t%(objectname)",
+            "refs/heads/",
+        ],
+        repo.as_ref(),
+    )?;
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let (name, tip) = line.split_once('\t')?;
+            (tip == oid).then_some(name.to_string())
+        })
+        .collect())
 }
 
 /// Resolve a revision to its peeled commit object ID.
@@ -525,9 +684,7 @@ fn diff_patch_id(path: &Path, from: &str, to: &str) -> Option<String> {
     diff.args(["diff", "--binary", "--no-ext-diff", from, to, "--"])
         .current_dir(path)
         .stdout(Stdio::piped());
-    for var in GIT_ENV_OVERRIDES {
-        diff.env_remove(var);
-    }
+    sanitize_git_environment(&mut diff);
     let diff_output = diff.output().ok()?;
     if !diff_output.status.success() || diff_output.stdout.is_empty() {
         return None;
@@ -535,9 +692,7 @@ fn diff_patch_id(path: &Path, from: &str, to: &str) -> Option<String> {
 
     let mut patch_id = Cmd::new("git");
     patch_id.args(["patch-id", "--stable"]).current_dir(path);
-    for var in GIT_ENV_OVERRIDES {
-        patch_id.env_remove(var);
-    }
+    sanitize_git_environment(&mut patch_id);
     let mut child = patch_id
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1262,6 +1417,8 @@ pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
 }
 
 /// Continue an in-progress merge through Git's normal commit and hook path.
+/// Worktree orchestration reserves the destination ref and handles the
+/// detached-HEAD/CAS boundary around this Git invocation.
 pub fn merge_continue(path: &Path) -> Result<()> {
     let mut cmd = Cmd::new("git");
     cmd.args(["merge", "--continue"]).current_dir(path);

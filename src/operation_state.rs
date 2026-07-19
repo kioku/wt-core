@@ -61,6 +61,67 @@ impl MergeLifecycleLock {
     }
 }
 
+/// Report whether an already-created lifecycle lock is currently owned by
+/// another process, without creating the state directory or lock file.
+///
+/// Read-only status uses this probe so a live pre-merge hook is reported as
+/// `busy` rather than as an interrupted/conflicted operation. A lock that is
+/// absent is not initialized as a side effect of observation.
+pub(crate) fn lock_is_held(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(AppError::conflict(format!(
+                    "managed merge lifecycle lock '{}' is not a private regular file",
+                    path.display()
+                )));
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(AppError::git(format!(
+                "cannot inspect managed merge lifecycle lock '{}': {error}",
+                path.display()
+            )))
+        }
+    }
+
+    let file = match fs::OpenOptions::new().read(true).write(true).open(path) {
+        Ok(file) => file,
+        // On platforms that deny opening a locked file, the existing file is
+        // still authoritative evidence of a live owner.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return Ok(true),
+        Err(error) => {
+            return Err(AppError::git(format!(
+                "cannot open managed merge lifecycle lock '{}': {error}",
+                path.display()
+            )))
+        }
+    };
+    let locked = !try_lock_exclusive(&file).map_err(|error| {
+        AppError::git(format!(
+            "cannot inspect managed merge lifecycle lock '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if locked {
+        // Internal status inspection occurs while the owning command holds the
+        // same lock. Its owner record lets that code continue to inspect its
+        // own operation, while a status subprocess has a different PID and
+        // truthfully reports `busy`.
+        let owner_is_current = fs::read_to_string(path)
+            .ok()
+            .and_then(|contents| {
+                contents
+                    .lines()
+                    .find_map(|line| line.strip_prefix("pid=")?.parse::<u32>().ok())
+            })
+            .is_some_and(|pid| pid == std::process::id());
+        return Ok(!owner_is_current);
+    }
+    Ok(false)
+}
+
 /// Acquire the repository-wide mutating merge lifecycle lock.
 ///
 /// Status deliberately does not call this function. Every command that can

@@ -134,6 +134,41 @@ fn materialize_remote_with_cache_json_creates_detached_clean_workspace() {
 }
 
 #[test]
+fn materialize_sanitizes_inherited_git_config_injection() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let output = wt_core()
+        .args([
+            "materialize",
+            "--repo-slug",
+            "owner/repo",
+            "--remote-url",
+            &file_url(&repo.origin_path()),
+            "--ref",
+            "refs/heads/main",
+            "--sha",
+            &sha,
+            "--cache-root",
+            &root.path().join("cache").display().to_string(),
+            "--workspace-root",
+            &root.path().join("workspace").display().to_string(),
+            "--json",
+        ])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "protocol.file.allow")
+        .env("GIT_CONFIG_VALUE_0", "never")
+        .env("GIT_CONFIG_PARAMETERS", "'protocol.file.allow=never'")
+        .output()
+        .expect("materialize should run");
+    assert!(
+        output.status.success(),
+        "config injection leaked into materialize: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn materialize_from_object_source_without_permanent_alternates() {
     let repo = fixtures::ClonedTestRepo::new();
     let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
