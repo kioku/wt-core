@@ -792,6 +792,201 @@ fn merge_into_linked_worktree_succeeds_and_cleans_only_source() {
 }
 
 #[test]
+fn merge_rejects_replaced_linked_destination_before_mutation_or_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/stale");
+
+    wt_core()
+        .args(["add", "feature/stale", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-stale");
+    commit_file(&source, "source.txt", "source", "source");
+    let main_before = git_rev_parse(&repo.path(), "main");
+    let destination_branch_before = git_rev_parse(&repo.path(), "release/stale");
+    let admin_before = worktree_admin_snapshot(&repo.path());
+
+    let unrelated = fixtures::TestRepo::new();
+    run_git(&["checkout", "-b", "release/stale"], &unrelated.path());
+    commit_file(
+        &unrelated.path(),
+        "unrelated-release.txt",
+        "unrelated release",
+        "unrelated release",
+    );
+    run_git(&["checkout", "-b", "feature/stale"], &unrelated.path());
+    commit_file(
+        &unrelated.path(),
+        "unrelated-feature.txt",
+        "unrelated feature",
+        "unrelated feature",
+    );
+    run_git(&["checkout", "release/stale"], &unrelated.path());
+
+    std::fs::remove_dir_all(&destination).expect("remove registered destination");
+    let unrelated_path = unrelated.path();
+    std::fs::rename(&unrelated_path, &destination).expect("replace destination");
+    let unrelated_before = git_rev_parse(&destination, "HEAD");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/stale",
+            "--into",
+            "release/stale",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains(
+            "stale destination worktree metadata",
+        ))
+        .stderr(predicate::str::contains("common directory"));
+
+    assert_eq!(git_rev_parse(&repo.path(), "main"), main_before);
+    assert_eq!(
+        git_rev_parse(&repo.path(), "release/stale"),
+        destination_branch_before
+    );
+    assert_eq!(git_rev_parse(&destination, "HEAD"), unrelated_before);
+    assert_branch_exists(&repo.path(), "feature/stale");
+    assert!(source.exists(), "source must not be cleaned up");
+    assert_eq!(worktree_admin_snapshot(&repo.path()), admin_before);
+}
+
+#[test]
+fn merge_rejects_replaced_source_before_mutation_or_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/stale-source", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-stale-source");
+    commit_file(&source, "source.txt", "source", "source");
+    let main_before = git_rev_parse(&repo.path(), "main");
+    let source_branch_before = git_rev_parse(&repo.path(), "feature/stale-source");
+    let admin_before = worktree_admin_snapshot(&repo.path());
+
+    let unrelated = fixtures::TestRepo::new();
+    run_git(
+        &["checkout", "-b", "feature/stale-source"],
+        &unrelated.path(),
+    );
+    commit_file(&unrelated.path(), "unrelated.txt", "unrelated", "unrelated");
+    std::fs::remove_dir_all(&source).expect("remove registered source");
+    let unrelated_path = unrelated.path();
+    std::fs::rename(&unrelated_path, &source).expect("replace source");
+    let unrelated_before = git_rev_parse(&source, "HEAD");
+
+    wt_core()
+        .args(["merge", "feature/stale-source", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains("stale source worktree metadata"))
+        .stderr(predicate::str::contains("common directory"));
+
+    assert_eq!(git_rev_parse(&repo.path(), "main"), main_before);
+    assert_eq!(
+        git_rev_parse(&repo.path(), "feature/stale-source"),
+        source_branch_before
+    );
+    assert_eq!(git_rev_parse(&source, "HEAD"), unrelated_before);
+    assert!(source.exists(), "replacement source must not be removed");
+    assert_eq!(worktree_admin_snapshot(&repo.path()), admin_before);
+}
+
+#[test]
+fn merge_inspect_rejects_symlinked_destination_without_pruning_metadata() {
+    #[cfg(not(unix))]
+    return;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+
+        let repo = fixtures::TestRepo::new();
+        let repo_str = repo.path().display().to_string();
+        let destination = add_linked_destination(&repo, "release/symlink");
+
+        wt_core()
+            .args(["add", "feature/symlink", "--repo", &repo_str])
+            .assert()
+            .success();
+        let source = find_worktree_dir(&repo.path(), "feature-symlink");
+        commit_file(&source, "source.txt", "source", "source");
+        let admin_before = worktree_admin_snapshot(&repo.path());
+
+        let unrelated = fixtures::TestRepo::new();
+        let unrelated_path = unrelated.path();
+        std::fs::remove_dir_all(&destination).expect("remove registered destination");
+        symlink(&unrelated_path, &destination).expect("replace destination with symlink");
+
+        wt_core()
+            .args([
+                "merge",
+                "feature/symlink",
+                "--into",
+                "release/symlink",
+                "--inspect",
+                "--repo",
+                &repo_str,
+            ])
+            .assert()
+            .failure()
+            .code(5)
+            .stderr(predicate::str::contains(
+                "stale destination worktree metadata",
+            ))
+            .stderr(predicate::str::contains("symlink"));
+
+        assert!(source.exists(), "inspect must preserve the source");
+        assert!(destination.is_symlink(), "replacement symlink must remain");
+        assert_eq!(worktree_admin_snapshot(&repo.path()), admin_before);
+    }
+}
+
+#[test]
+fn merge_rejects_same_repository_branch_spoof_before_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/spoof", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-spoof");
+    commit_file(&source, "source.txt", "source", "source");
+
+    wt_core()
+        .args(["add", "feature/other", "--repo", &repo_str])
+        .assert()
+        .success();
+    let replacement = find_worktree_dir(&repo.path(), "feature-other");
+    lock_worktree_metadata(&repo.path(), &replacement);
+    let admin_before = worktree_admin_snapshot(&repo.path());
+    std::fs::remove_dir_all(&source).expect("remove registered source");
+    std::fs::rename(&replacement, &source).expect("move another worktree into source path");
+
+    wt_core()
+        .args(["merge", "feature/spoof", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains("stale source worktree metadata"))
+        .stderr(predicate::str::contains("registered admin entry"));
+
+    assert_branch_exists(&repo.path(), "feature/spoof");
+    assert!(source.exists(), "spoofed source must not be removed");
+    assert_eq!(worktree_admin_snapshot(&repo.path()), admin_before);
+}
+
+#[test]
 fn merge_into_linked_worktree_dirty_destination_fails_and_aborts_there() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();

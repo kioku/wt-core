@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
@@ -658,9 +659,328 @@ pub fn merge_in_progress(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// Return whether a path is a usable Git worktree.
-pub fn worktree_is_valid(path: &Path) -> bool {
-    git_success(&["rev-parse", "--is-inside-work-tree"], path)
+/// Resolve a path returned by `git rev-parse` relative to its command cwd.
+fn canonical_git_path(cwd: &Path, argument: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(git(&["rev-parse", argument], cwd)?);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize Git metadata path '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Reject aliases that could make a registered path resolve somewhere else.
+fn has_symlink_component(path: &Path) -> bool {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return true,
+        }
+    };
+
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve a path stored in a worktree admin file.
+fn resolve_admin_link(admin_dir: &Path, link: &str) -> PathBuf {
+    let link = PathBuf::from(link);
+    if link.is_absolute() {
+        link
+    } else {
+        admin_dir.join(link)
+    }
+}
+
+/// Find the one main-repository admin entry registered for `worktree`.
+fn registered_worktree_admin(common_dir: &Path, worktree: &Path) -> Result<PathBuf> {
+    let admin_root = common_dir.join("worktrees");
+    let canonical_admin_root = admin_root.canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize Git worktree admin directory '{}': {error}",
+            admin_root.display()
+        ))
+    })?;
+    let worktree_git = worktree.join(".git").canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize worktree Git link '{}': {error}",
+            worktree.join(".git").display()
+        ))
+    })?;
+
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&canonical_admin_root).map_err(|error| {
+        AppError::conflict(format!(
+            "cannot inspect Git worktree admin directory '{}': {error}",
+            canonical_admin_root.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            AppError::conflict(format!("cannot inspect Git worktree admin entry: {error}"))
+        })?;
+        let admin_dir = entry.path();
+        if !admin_dir.is_dir() {
+            continue;
+        }
+        let canonical_admin = admin_dir.canonicalize().map_err(|error| {
+            AppError::conflict(format!(
+                "cannot canonicalize Git worktree admin entry '{}': {error}",
+                admin_dir.display()
+            ))
+        })?;
+        if canonical_admin.parent() != Some(canonical_admin_root.as_path()) {
+            continue;
+        }
+
+        let link = match fs::read_to_string(canonical_admin.join("gitdir")) {
+            Ok(link) => link,
+            Err(_) => continue,
+        };
+        let target = resolve_admin_link(&canonical_admin, link.trim());
+        let Ok(target) = target.canonicalize() else {
+            continue;
+        };
+        if target == worktree_git {
+            matches.push(canonical_admin);
+        }
+    }
+
+    match matches.as_slice() {
+        [admin] => Ok(admin.clone()),
+        [] => Err(AppError::conflict(format!(
+            "worktree '{}' has no matching main-repository admin entry",
+            worktree.display()
+        ))),
+        _ => Err(AppError::conflict(format!(
+            "worktree '{}' has multiple matching main-repository admin entries",
+            worktree.display()
+        ))),
+    }
+}
+
+/// Verify that a listed worktree is the exact worktree registered by `repo`.
+///
+/// `git worktree list` reports branch and path metadata from the owning
+/// repository even when the directory at that path has been replaced. Before
+/// merge code uses a path, compare both Git's canonical common directory and
+/// the per-worktree admin linkage. This prevents an unrelated, nested, or
+/// symlink-aliased repository from receiving a merge or cleanup operation.
+pub fn validate_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Result<()> {
+    let path = &worktree.path;
+    if has_symlink_component(path) {
+        return Err(AppError::conflict(format!(
+            "worktree path '{}' contains a symlink component",
+            path.display()
+        )));
+    }
+
+    let canonical_repo = repo.as_ref().canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize owning repository '{}': {error}",
+            repo.display()
+        ))
+    })?;
+    let canonical_path = path.canonicalize().map_err(|_| {
+        AppError::conflict(format!("worktree path '{}' is unavailable", path.display()))
+    })?;
+    if !worktree.is_main && canonical_path == canonical_repo {
+        return Err(AppError::conflict(format!(
+            "linked worktree '{}' resolves to the owning repository root",
+            path.display()
+        )));
+    }
+    if worktree.is_main && canonical_path != canonical_repo {
+        return Err(AppError::conflict(format!(
+            "main worktree '{}' is not the owning repository root '{}'",
+            path.display(),
+            canonical_repo.display()
+        )));
+    }
+
+    let common_dir = canonical_git_path(repo.as_ref(), "--git-common-dir")?;
+    let worktree_common = canonical_git_path(path, "--git-common-dir")?;
+    if worktree_common != common_dir {
+        return Err(AppError::conflict(format!(
+            "Git common directory '{}' does not match owning repository '{}'",
+            worktree_common.display(),
+            common_dir.display()
+        )));
+    }
+
+    let worktree_git_file = path.join(".git");
+    match worktree.is_main {
+        true => {
+            let worktree_git_dir = canonical_git_path(path, "--git-dir")?;
+            if worktree_git_dir != common_dir {
+                return Err(AppError::conflict(format!(
+                    "main worktree Git directory '{}' does not match owning repository '{}'",
+                    worktree_git_dir.display(),
+                    common_dir.display()
+                )));
+            }
+        }
+        false => {
+            let metadata = fs::symlink_metadata(&worktree_git_file).map_err(|error| {
+                AppError::conflict(format!(
+                    "linked worktree Git link '{}' is unavailable: {error}",
+                    worktree_git_file.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(AppError::conflict(format!(
+                    "linked worktree '{}' does not have a regular .git link",
+                    path.display()
+                )));
+            }
+
+            let admin_dir = registered_worktree_admin(&common_dir, path)?;
+            let actual_git_dir = canonical_git_path(path, "--git-dir")?;
+            if actual_git_dir != admin_dir {
+                return Err(AppError::conflict(format!(
+                    "Git directory '{}' is not the registered admin entry '{}'",
+                    actual_git_dir.display(),
+                    admin_dir.display()
+                )));
+            }
+
+            let link = fs::read_to_string(&worktree_git_file).map_err(|error| {
+                AppError::conflict(format!(
+                    "cannot read linked worktree Git link '{}': {error}",
+                    worktree_git_file.display()
+                ))
+            })?;
+            let link = link.strip_prefix("gitdir:").map(str::trim).ok_or_else(|| {
+                AppError::conflict(format!(
+                    "linked worktree Git link '{}' has an invalid format",
+                    worktree_git_file.display()
+                ))
+            })?;
+            let linked_admin = resolve_admin_link(path, link)
+                .canonicalize()
+                .map_err(|error| {
+                    AppError::conflict(format!(
+                        "cannot canonicalize linked worktree admin path '{}': {error}",
+                        link
+                    ))
+                })?;
+            if linked_admin != admin_dir {
+                return Err(AppError::conflict(format!(
+                    "linked worktree Git link '{}' does not point to registered admin entry '{}'",
+                    linked_admin.display(),
+                    admin_dir.display()
+                )));
+            }
+
+            let admin_link = fs::read_to_string(admin_dir.join("gitdir")).map_err(|error| {
+                AppError::conflict(format!(
+                    "cannot read worktree admin link '{}': {error}",
+                    admin_dir.join("gitdir").display()
+                ))
+            })?;
+            let registered_path = resolve_admin_link(&admin_dir, admin_link.trim())
+                .canonicalize()
+                .map_err(|error| {
+                    AppError::conflict(format!(
+                        "cannot canonicalize worktree admin link '{}': {error}",
+                        admin_link.trim()
+                    ))
+                })?;
+            if registered_path
+                != worktree_git_file.canonicalize().map_err(|error| {
+                    AppError::conflict(format!(
+                        "cannot canonicalize worktree Git link '{}': {error}",
+                        worktree_git_file.display()
+                    ))
+                })?
+            {
+                return Err(AppError::conflict(format!(
+                    "worktree admin entry '{}' is not linked back to '{}'",
+                    admin_dir.display(),
+                    worktree_git_file.display()
+                )));
+            }
+
+            match fs::read_to_string(admin_dir.join("commondir")) {
+                Ok(commondir) => {
+                    let admin_common = resolve_admin_link(&admin_dir, commondir.trim())
+                        .canonicalize()
+                        .map_err(|error| {
+                            AppError::conflict(format!(
+                                "cannot canonicalize worktree admin common directory '{}': {error}",
+                                commondir.trim()
+                            ))
+                        })?;
+                    if admin_common != common_dir {
+                        return Err(AppError::conflict(format!(
+                            "worktree admin common directory '{}' does not match owning repository '{}'",
+                            admin_common.display(),
+                            common_dir.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::conflict(format!(
+                        "cannot read worktree admin common directory '{}': {error}",
+                        admin_dir.join("commondir").display()
+                    )));
+                }
+            }
+
+            let admin_head = fs::read_to_string(admin_dir.join("HEAD")).map_err(|error| {
+                AppError::conflict(format!(
+                    "cannot read worktree admin HEAD '{}': {error}",
+                    admin_dir.join("HEAD").display()
+                ))
+            })?;
+            let admin_branch = admin_head
+                .trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string);
+            let actual_branch = git(&["symbolic-ref", "--quiet", "--short", "HEAD"], path).ok();
+            if admin_branch != worktree.branch || actual_branch != worktree.branch {
+                return Err(AppError::conflict(format!(
+                    "worktree branch metadata does not match registered branch '{}'",
+                    worktree.branch.as_deref().unwrap_or("(detached)")
+                )));
+            }
+        }
+    }
+
+    let actual_branch = git(&["symbolic-ref", "--quiet", "--short", "HEAD"], path).ok();
+    if actual_branch != worktree.branch {
+        return Err(AppError::conflict(format!(
+            "worktree branch '{}' does not match the registered branch '{}'",
+            actual_branch.as_deref().unwrap_or("(detached)"),
+            worktree.branch.as_deref().unwrap_or("(detached)")
+        )));
+    }
+    let actual_head = git(&["rev-parse", "--verify", "HEAD"], path)?;
+    if !worktree.commit.is_empty() && !actual_head.starts_with(&worktree.commit) {
+        return Err(AppError::conflict(format!(
+            "worktree HEAD '{}' does not match registered HEAD '{}'",
+            actual_head, worktree.commit
+        )));
+    }
+
+    Ok(())
 }
 
 /// Return whether Git left unmerged index entries in a worktree.

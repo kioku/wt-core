@@ -345,6 +345,34 @@ fn remove_with_branch_context(
     })
 }
 
+/// Remove the exact source worktree captured by merge preflight.
+///
+/// Unlike the user-facing remove path, merge cleanup must not prune and then
+/// rediscover a worktree by branch name. Requiring both paths and identities
+/// prevents cleanup from deleting a replacement repository or branch.
+fn remove_exact_merge_source(repo: &RepoRoot, preflight: &MergePreflight) -> Result<RemoveResult> {
+    let (source, _) = validate_preflight_worktrees(repo, preflight, "source", "destination")?;
+    let removed_path = source.path.clone();
+    let target_branch = BranchName::new(&preflight.source);
+
+    git::remove_worktree(repo, &removed_path, false)?;
+
+    // The source was removed above, so validate the destination separately
+    // immediately before deleting the merged source branch in its context.
+    let destination = validate_preflight_destination(repo, preflight, "destination")?;
+
+    let warning = git::delete_branch_at(&destination.path, &target_branch, false)
+        .err()
+        .map(|e| format!("worktree removed but branch deletion failed: {e}"));
+
+    Ok(RemoveResult {
+        removed_path,
+        branch: target_branch,
+        repo_root: repo.to_path_buf(),
+        warning,
+    })
+}
+
 /// How a branch was detected as integrated into mainline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -647,6 +675,11 @@ pub struct MergeRefusal {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MergePreflight {
     pub source: String,
+    /// Exact source path captured from the owning repository's worktree list.
+    /// It is skipped by serde because the established JSON contract only
+    /// exposes the destination path.
+    #[serde(skip)]
+    pub(crate) source_path: PathBuf,
     pub destination: String,
     pub destination_path: PathBuf,
     pub upstream: Option<String>,
@@ -817,17 +850,82 @@ fn topology_refusal(
 /// Validate a worktree record before using it for a merge.
 ///
 /// Normal merges prune stale Git metadata before this check. Keeping the
-/// explicit validation here also handles locked or otherwise unusable records
-/// without falling through to a low-level "No such file" Git error.
-fn validate_merge_worktree(wt: &Worktree, role: &str) -> Result<()> {
-    if !git::worktree_is_valid(&wt.path) {
+/// explicit identity validation here also handles locked or otherwise
+/// replaced records without falling through to a low-level Git mutation.
+fn validate_merge_worktree(repo: &RepoRoot, wt: &Worktree, role: &str) -> Result<()> {
+    git::validate_worktree_identity(repo, wt).map_err(|error| {
         let branch = wt.branch.as_deref().unwrap_or("(detached)");
-        return Err(AppError::conflict(format!(
-            "stale {role} worktree metadata for branch '{branch}' at {}; run `git worktree prune`",
+        AppError::conflict(format!(
+            "stale {role} worktree metadata for branch '{branch}' at {}: {error}",
             wt.path.display()
-        )));
-    }
-    Ok(())
+        ))
+    })
+}
+
+/// Re-read both sides of a merge and require the paths and branch metadata to
+/// still be the exact records used by preflight. This is intentionally
+/// read-only so cleanup never selects a replacement by branch name alone.
+fn validate_preflight_worktrees(
+    repo: &RepoRoot,
+    preflight: &MergePreflight,
+    source_role: &str,
+    destination_role: &str,
+) -> Result<(Worktree, Worktree)> {
+    let worktrees = git::list_worktrees_readonly(repo)?;
+    let source = worktrees
+        .iter()
+        .find(|wt| {
+            wt.path == preflight.source_path
+                && wt.branch.as_deref() == Some(preflight.source.as_str())
+        })
+        .ok_or_else(|| {
+            AppError::conflict(format!(
+                "stale {source_role} worktree metadata for branch '{}' at {}: path or branch no longer matches the preflight record",
+                preflight.source,
+                preflight.source_path.display()
+            ))
+        })?;
+    let destination = worktrees
+        .iter()
+        .find(|wt| {
+            wt.path == preflight.destination_path
+                && wt.branch.as_deref() == Some(preflight.destination.as_str())
+        })
+        .ok_or_else(|| {
+            AppError::conflict(format!(
+                "stale {destination_role} worktree metadata for branch '{}' at {}: path or branch no longer matches the preflight record",
+                preflight.destination,
+                preflight.destination_path.display()
+            ))
+        })?;
+
+    validate_merge_worktree(repo, source, source_role)?;
+    validate_merge_worktree(repo, destination, destination_role)?;
+    Ok((source.clone(), destination.clone()))
+}
+
+/// Re-read and validate the exact destination record after source cleanup.
+fn validate_preflight_destination(
+    repo: &RepoRoot,
+    preflight: &MergePreflight,
+    role: &str,
+) -> Result<Worktree> {
+    let worktrees = git::list_worktrees_readonly(repo)?;
+    let destination = worktrees
+        .iter()
+        .find(|wt| {
+            wt.path == preflight.destination_path
+                && wt.branch.as_deref() == Some(preflight.destination.as_str())
+        })
+        .ok_or_else(|| {
+            AppError::conflict(format!(
+                "stale {role} worktree metadata for branch '{}' at {}: path or branch no longer matches the preflight record",
+                preflight.destination,
+                preflight.destination_path.display()
+            ))
+        })?;
+    validate_merge_worktree(repo, destination, role)?;
+    Ok(destination.clone())
 }
 
 /// Inspect the merge topology without changing repository state.
@@ -862,7 +960,7 @@ pub fn merge_preflight(
             "refusing to merge the main worktree".to_string(),
         ));
     }
-    validate_merge_worktree(source_wt, "source")?;
+    validate_merge_worktree(repo, source_wt, "source")?;
 
     let destination = resolve_merge_destination(repo, &worktrees, into)?;
     let destination_wt = worktrees
@@ -874,7 +972,7 @@ pub fn merge_preflight(
                 destination.path.display()
             ))
         })?;
-    validate_merge_worktree(destination_wt, "destination")?;
+    validate_merge_worktree(repo, destination_wt, "destination")?;
     if target_branch.as_str() == destination.branch {
         return Err(AppError::invariant(
             "refusing to merge a branch into itself".to_string(),
@@ -932,6 +1030,7 @@ pub fn merge_preflight(
 
     Ok(MergePreflight {
         source: target_branch.to_string(),
+        source_path: source_wt.path.clone(),
         destination: destination.branch,
         destination_path: destination.path,
         upstream,
@@ -990,6 +1089,15 @@ pub fn merge_with_preflight(
         });
     }
 
+    // Revalidate immediately before the first mutation. Preflight paths are
+    // not trusted across the gap between inspection and merge execution.
+    if let Err(error) = validate_preflight_worktrees(repo, &preflight, "source", "destination") {
+        return Err(MergeFailure {
+            kind: MergeFailureKind::GitFailure,
+            error,
+        });
+    }
+
     let destination_path = preflight.destination_path.clone();
     let target_branch = BranchName::new(&preflight.source);
     let destination_branch = preflight.destination.clone();
@@ -1012,7 +1120,7 @@ pub fn merge_with_preflight(
     let (cleaned_up, removed_path) = if no_cleanup {
         (false, None)
     } else {
-        match remove_with_branch_context(repo, Some(&target_branch), false, &destination_path) {
+        match remove_exact_merge_source(repo, &preflight) {
             Ok(result) => {
                 if let Some(warning) = result.warning {
                     warnings.push(warning);
@@ -1026,12 +1134,20 @@ pub fn merge_with_preflight(
         }
     };
 
-    // Push the selected destination branch to origin if requested.
+    // Push the selected destination branch to origin if requested. The
+    // destination may have changed while cleanup ran, so verify it again
+    // before allowing a remote mutation.
     let pushed = if push {
-        match git::push(&destination_path, &destination_branch) {
-            Ok(()) => true,
+        match validate_preflight_destination(repo, &preflight, "destination") {
+            Ok(_) => match git::push(&destination_path, &destination_branch) {
+                Ok(()) => true,
+                Err(error) => {
+                    warnings.push(format!("merge succeeded but push failed: {error}"));
+                    false
+                }
+            },
             Err(error) => {
-                warnings.push(format!("merge succeeded but push failed: {error}"));
+                warnings.push(format!("merge succeeded but push refused: {error}"));
                 false
             }
         }
