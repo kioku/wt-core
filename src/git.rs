@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 use std::process::Stdio;
@@ -103,7 +105,14 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
 pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     // Prune stale worktrees first (matches current behavior expectation).
     let _ = git(&["worktree", "prune"], repo.as_ref());
+    list_worktrees_readonly(repo)
+}
 
+/// List worktrees without pruning Git's worktree metadata.
+///
+/// Merge preflight and `--inspect` use this variant so inspection never
+/// changes repository state, including stale-worktree administrative files.
+pub fn list_worktrees_readonly(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     let raw = git(&["worktree", "list", "--porcelain"], repo.as_ref())?;
     parse_worktree_porcelain(&raw, repo)
 }
@@ -373,6 +382,21 @@ pub fn cherry(repo: &RepoRoot, mainline: &str, branch: &str) -> bool {
     }
 }
 
+/// Return whether the source and destination have equivalent content.
+///
+/// `git cherry` detects rebased and cherry-picked integrations, while an
+/// exact tree comparison covers a squash merge whose combined commit is not
+/// equivalent to any one source commit. This is deliberately conservative:
+/// it never treats a branch as integrated merely because a commit message or
+/// object name appears in the destination log.
+pub fn patch_equivalent(repo: &RepoRoot, destination: &str, source: &str) -> bool {
+    cherry(repo, destination, source)
+        || git_success(
+            &["diff", "--quiet", destination, source, "--"],
+            repo.as_ref(),
+        )
+}
+
 /// Try to resolve `refs/remotes/origin/HEAD` to a usable branch name.
 ///
 /// Returns the local branch name if it exists, otherwise the full remote
@@ -404,6 +428,17 @@ fn resolve_origin_head(repo: &RepoRoot) -> Option<String> {
 /// 3. Local branch named `master`
 /// 4. The main worktree's branch (first entry from `git worktree list`)
 pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
+    resolve_mainline_with_worktree_listing(repo, true)
+}
+
+/// Resolve the mainline without pruning worktree metadata.
+///
+/// This is used by merge preflight because inspection must be read-only.
+pub fn resolve_mainline_readonly(repo: &RepoRoot) -> Result<String> {
+    resolve_mainline_with_worktree_listing(repo, false)
+}
+
+fn resolve_mainline_with_worktree_listing(repo: &RepoRoot, prune: bool) -> Result<String> {
     // 1. Try origin/HEAD — prefer the local branch name if it exists,
     //    otherwise use the full remote ref so git commands can resolve it
     //    even when there is no local tracking branch.
@@ -424,7 +459,11 @@ pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
     }
 
     // 4. Fall back to main worktree's branch
-    let worktrees = list_worktrees(repo)?;
+    let worktrees = if prune {
+        list_worktrees(repo)?
+    } else {
+        list_worktrees_readonly(repo)?
+    };
     worktrees
         .iter()
         .find(|wt| wt.is_main)
@@ -434,6 +473,185 @@ pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
                 "could not determine mainline branch; use --mainline to specify".to_string(),
             )
         })
+}
+
+/// Return the configured upstream ref for a checked-out branch.
+///
+/// `for-each-ref` reads branch configuration without requiring the upstream
+/// object to exist. This keeps a configured-but-stale remote visible to
+/// callers instead of misreporting it as a branch with no upstream.
+pub fn branch_upstream(path: &Path, branch: &str) -> Result<Option<String>> {
+    let branch_ref = format!("refs/heads/{branch}");
+    let output = git(
+        &["for-each-ref", "--format=%(upstream:short)", &branch_ref],
+        path,
+    )?;
+    Ok((!output.is_empty()).then_some(output))
+}
+
+/// Return ahead and behind commit counts for a branch and its upstream.
+///
+/// The first value is commits the branch is behind; the second is commits it
+/// is ahead, matching Git's `--left-right --count` ordering. `None` means the
+/// configured upstream ref is unavailable locally; this is distinct from a
+/// branch with no configured upstream.
+pub fn upstream_counts(path: &Path, upstream: &str, branch: &str) -> Result<Option<(u32, u32)>> {
+    if !git_success(&["rev-parse", "--verify", upstream], path) {
+        return Ok(None);
+    }
+
+    let range = format!("{upstream}...{branch}");
+    let output = git(&["rev-list", "--left-right", "--count", &range], path)?;
+    let mut fields = output.split_whitespace();
+    let behind = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| AppError::git("failed to parse upstream behind count".to_string()))?;
+    let ahead = fields
+        .next()
+        .and_then(|value| value.parse::<u32>().ok())
+        .ok_or_else(|| AppError::git("failed to parse upstream ahead count".to_string()))?;
+    Ok(Some((ahead, behind)))
+}
+
+/// Compute a stable patch id for a revision range.
+///
+/// The caller can reverse the range endpoints when it needs to compare an
+/// inverse patch. An empty diff has no patch id because it cannot prove that
+/// any content was reverted.
+fn diff_patch_id(path: &Path, from: &str, to: &str) -> Option<String> {
+    let mut diff = Cmd::new("git");
+    diff.args(["diff", "--binary", "--no-ext-diff", from, to, "--"])
+        .current_dir(path)
+        .stdout(Stdio::piped());
+    for var in GIT_ENV_OVERRIDES {
+        diff.env_remove(var);
+    }
+    let diff_output = diff.output().ok()?;
+    if !diff_output.status.success() || diff_output.stdout.is_empty() {
+        return None;
+    }
+
+    let mut patch_id = Cmd::new("git");
+    patch_id.args(["patch-id", "--stable"]).current_dir(path);
+    for var in GIT_ENV_OVERRIDES {
+        patch_id.env_remove(var);
+    }
+    let mut child = patch_id
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child.stdin.take()?.write_all(&diff_output.stdout).ok()?;
+    let output = child.wait_with_output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    output
+        .stdout
+        .split(|byte| byte.is_ascii_whitespace())
+        .find(|field| !field.is_empty())
+        .map(|field| String::from_utf8_lossy(field).into_owned())
+}
+
+/// Confirm that a revert commit actually reverses the referenced commit.
+///
+/// Git's standard revert message is user-controlled, so the message alone is
+/// not evidence. Compare the referenced commit's forward patch with the
+/// revert commit's reverse patch; an empty or unrelated commit is rejected.
+fn revert_reverses_commit(path: &Path, revert_commit: &str, reverted: &str) -> bool {
+    let reverted_parent = format!("{reverted}^1");
+    let revert_parent = format!("{revert_commit}^1");
+    diff_patch_id(path, &reverted_parent, reverted).is_some_and(|original| {
+        diff_patch_id(path, revert_commit, &revert_parent)
+            .is_some_and(|inverse| original == inverse)
+    })
+}
+
+/// Find a standard Git revert commit that refers to source history.
+///
+/// Git records the reverted object in the body as `This reverts commit ...`.
+/// A marker alone is not enough: the reverted object must be in the
+/// destination history, the revert commit must actually reverse the object's
+/// tree diff, and either the object itself or (for a reverted merge) its second
+/// parent must be reachable from `source`. This avoids warning for a revert
+/// message that merely names an unrelated object.
+pub fn reverted_source_commit(
+    path: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<Option<String>> {
+    let log = git(&["log", "--format=%H%x00%P%x00%B%x1e", destination], path)?;
+    let source_was_merged =
+        git_success(&["merge-base", "--is-ancestor", source, destination], path);
+    let common_base = git(&["merge-base", source, destination], path).ok();
+
+    for record in log.split('\x1e') {
+        let mut fields = record.splitn(3, '\0');
+        let Some(revert_commit) = fields.next() else {
+            continue;
+        };
+        let Some(_revert_parents) = fields.next() else {
+            continue;
+        };
+        let Some(message) = fields.next() else {
+            continue;
+        };
+        let Some(marker) = message.find("This reverts commit ") else {
+            continue;
+        };
+        let start = marker + "This reverts commit ".len();
+        let Some(reverted) = message[start..]
+            .split(|character: char| !character.is_ascii_hexdigit())
+            .next()
+            .filter(|value| value.len() == 40)
+        else {
+            continue;
+        };
+
+        if !git_success(
+            &["merge-base", "--is-ancestor", reverted, destination],
+            path,
+        ) || !revert_reverses_commit(path, revert_commit, reverted)
+        {
+            continue;
+        }
+
+        let reverted_parents = match git(&["show", "-s", "--format=%P", reverted], path) {
+            Ok(parents) => parents,
+            Err(_) => continue,
+        };
+        let parents: Vec<&str> = reverted_parents.split_whitespace().collect();
+        let source_history_commit = parents
+            .get(1)
+            .copied()
+            .filter(|second_parent| {
+                git_success(
+                    &["merge-base", "--is-ancestor", second_parent, source],
+                    path,
+                )
+            })
+            .unwrap_or(reverted);
+        let is_shared_base = common_base.as_deref().is_some_and(|base| {
+            git_success(
+                &["merge-base", "--is-ancestor", source_history_commit, base],
+                path,
+            )
+        });
+        if !source_was_merged && is_shared_base {
+            continue;
+        }
+        if git_success(
+            &["merge-base", "--is-ancestor", source_history_commit, source],
+            path,
+        ) {
+            return Ok(Some(reverted.to_string()));
+        }
+    }
+
+    Ok(None)
 }
 
 /// Compute commit and diff stats for `branch` against `base`.
@@ -541,6 +759,374 @@ pub fn operation_state(path: &Path) -> Result<Option<&'static str>> {
 pub fn merge_in_progress(path: &Path) -> bool {
     git_path(path, "MERGE_HEAD")
         .map(|marker| marker.exists())
+        .unwrap_or(false)
+}
+
+/// Resolve a path returned by `git rev-parse` relative to its command cwd.
+fn canonical_git_path(cwd: &Path, argument: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(git(&["rev-parse", argument], cwd)?);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    path.canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize Git metadata path '{}': {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Reject aliases that could make a registered path resolve somewhere else.
+fn has_symlink_component(path: &Path) -> bool {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(path),
+            Err(_) => return true,
+        }
+    };
+
+    let mut current = PathBuf::new();
+    for component in absolute.components() {
+        current.push(component.as_os_str());
+        if fs::symlink_metadata(&current)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Resolve a path stored in a worktree admin file.
+fn resolve_admin_link(admin_dir: &Path, link: &str) -> PathBuf {
+    let link = PathBuf::from(link);
+    if link.is_absolute() {
+        link
+    } else {
+        admin_dir.join(link)
+    }
+}
+
+/// Find the one main-repository admin entry registered for `worktree`.
+fn registered_worktree_admin(common_dir: &Path, worktree: &Path) -> Result<PathBuf> {
+    let admin_root = common_dir.join("worktrees");
+    let canonical_admin_root = admin_root.canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize Git worktree admin directory '{}': {error}",
+            admin_root.display()
+        ))
+    })?;
+    let worktree_git = worktree.join(".git").canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize worktree Git link '{}': {error}",
+            worktree.join(".git").display()
+        ))
+    })?;
+
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(&canonical_admin_root).map_err(|error| {
+        AppError::conflict(format!(
+            "cannot inspect Git worktree admin directory '{}': {error}",
+            canonical_admin_root.display()
+        ))
+    })? {
+        let entry = entry.map_err(|error| {
+            AppError::conflict(format!("cannot inspect Git worktree admin entry: {error}"))
+        })?;
+        let admin_dir = entry.path();
+        if !admin_dir.is_dir() {
+            continue;
+        }
+        let canonical_admin = admin_dir.canonicalize().map_err(|error| {
+            AppError::conflict(format!(
+                "cannot canonicalize Git worktree admin entry '{}': {error}",
+                admin_dir.display()
+            ))
+        })?;
+        if canonical_admin.parent() != Some(canonical_admin_root.as_path()) {
+            continue;
+        }
+
+        let link = match fs::read_to_string(canonical_admin.join("gitdir")) {
+            Ok(link) => link,
+            Err(_) => continue,
+        };
+        let target = resolve_admin_link(&canonical_admin, link.trim());
+        let Ok(target) = target.canonicalize() else {
+            continue;
+        };
+        if target == worktree_git {
+            matches.push(canonical_admin);
+        }
+    }
+
+    match matches.as_slice() {
+        [admin] => Ok(admin.clone()),
+        [] => Err(AppError::conflict(format!(
+            "worktree '{}' has no matching main-repository admin entry",
+            worktree.display()
+        ))),
+        _ => Err(AppError::conflict(format!(
+            "worktree '{}' has multiple matching main-repository admin entries",
+            worktree.display()
+        ))),
+    }
+}
+
+/// Stable registration identity for a worktree.
+///
+/// The main worktree uses the repository's common Git directory as its admin
+/// directory. A linked worktree uses its unique entry below
+/// `<common-dir>/worktrees`. The path is captured before a merge and compared
+/// later; path, branch, and common-directory checks alone cannot distinguish a
+/// replacement worktree registered during a hook.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorktreeIdentity {
+    Main { admin_dir: PathBuf },
+    Linked { admin_dir: PathBuf },
+}
+
+impl WorktreeIdentity {
+    pub fn admin_dir(&self) -> &Path {
+        match self {
+            Self::Main { admin_dir } | Self::Linked { admin_dir } => admin_dir,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Main { .. } => "main",
+            Self::Linked { .. } => "linked",
+        }
+    }
+}
+
+/// Resolve and validate the exact worktree registration owned by `repo`.
+///
+/// `git worktree list` reports branch and path metadata from the owning
+/// repository even when the directory at that path has been replaced. Before
+/// merge code uses a path, compare both Git's canonical common directory and
+/// the per-worktree admin linkage. This prevents an unrelated, nested, or
+/// symlink-aliased repository from receiving a merge or cleanup operation.
+pub fn capture_worktree_identity(repo: &RepoRoot, worktree: &Worktree) -> Result<WorktreeIdentity> {
+    let path = &worktree.path;
+    if has_symlink_component(path) {
+        return Err(AppError::conflict(format!(
+            "worktree path '{}' contains a symlink component",
+            path.display()
+        )));
+    }
+
+    let canonical_repo = repo.as_ref().canonicalize().map_err(|error| {
+        AppError::conflict(format!(
+            "cannot canonicalize owning repository '{}': {error}",
+            repo.display()
+        ))
+    })?;
+    let canonical_path = path.canonicalize().map_err(|_| {
+        AppError::conflict(format!("worktree path '{}' is unavailable", path.display()))
+    })?;
+    if !worktree.is_main && canonical_path == canonical_repo {
+        return Err(AppError::conflict(format!(
+            "linked worktree '{}' resolves to the owning repository root",
+            path.display()
+        )));
+    }
+    if worktree.is_main && canonical_path != canonical_repo {
+        return Err(AppError::conflict(format!(
+            "main worktree '{}' is not the owning repository root '{}'",
+            path.display(),
+            canonical_repo.display()
+        )));
+    }
+
+    let common_dir = canonical_git_path(repo.as_ref(), "--git-common-dir")?;
+    let worktree_common = canonical_git_path(path, "--git-common-dir")?;
+    if worktree_common != common_dir {
+        return Err(AppError::conflict(format!(
+            "Git common directory '{}' does not match owning repository '{}'",
+            worktree_common.display(),
+            common_dir.display()
+        )));
+    }
+
+    let worktree_git_file = path.join(".git");
+    let identity = match worktree.is_main {
+        true => {
+            let worktree_git_dir = canonical_git_path(path, "--git-dir")?;
+            if worktree_git_dir != common_dir {
+                return Err(AppError::conflict(format!(
+                    "main worktree Git directory '{}' does not match owning repository '{}'",
+                    worktree_git_dir.display(),
+                    common_dir.display()
+                )));
+            }
+            WorktreeIdentity::Main {
+                admin_dir: common_dir.clone(),
+            }
+        }
+        false => {
+            let metadata = fs::symlink_metadata(&worktree_git_file).map_err(|error| {
+                AppError::conflict(format!(
+                    "linked worktree Git link '{}' is unavailable: {error}",
+                    worktree_git_file.display()
+                ))
+            })?;
+            if !metadata.file_type().is_file() {
+                return Err(AppError::conflict(format!(
+                    "linked worktree '{}' does not have a regular .git link",
+                    path.display()
+                )));
+            }
+
+            let admin_dir = registered_worktree_admin(&common_dir, path)?;
+            let actual_git_dir = canonical_git_path(path, "--git-dir")?;
+            if actual_git_dir != admin_dir {
+                return Err(AppError::conflict(format!(
+                    "Git directory '{}' is not the registered admin entry '{}'",
+                    actual_git_dir.display(),
+                    admin_dir.display()
+                )));
+            }
+
+            let link = fs::read_to_string(&worktree_git_file).map_err(|error| {
+                AppError::conflict(format!(
+                    "cannot read linked worktree Git link '{}': {error}",
+                    worktree_git_file.display()
+                ))
+            })?;
+            let link = link.strip_prefix("gitdir:").map(str::trim).ok_or_else(|| {
+                AppError::conflict(format!(
+                    "linked worktree Git link '{}' has an invalid format",
+                    worktree_git_file.display()
+                ))
+            })?;
+            let linked_admin = resolve_admin_link(path, link)
+                .canonicalize()
+                .map_err(|error| {
+                    AppError::conflict(format!(
+                        "cannot canonicalize linked worktree admin path '{}': {error}",
+                        link
+                    ))
+                })?;
+            if linked_admin != admin_dir {
+                return Err(AppError::conflict(format!(
+                    "linked worktree Git link '{}' does not point to registered admin entry '{}'",
+                    linked_admin.display(),
+                    admin_dir.display()
+                )));
+            }
+
+            let admin_link = fs::read_to_string(admin_dir.join("gitdir")).map_err(|error| {
+                AppError::conflict(format!(
+                    "cannot read worktree admin link '{}': {error}",
+                    admin_dir.join("gitdir").display()
+                ))
+            })?;
+            let registered_path = resolve_admin_link(&admin_dir, admin_link.trim())
+                .canonicalize()
+                .map_err(|error| {
+                    AppError::conflict(format!(
+                        "cannot canonicalize worktree admin link '{}': {error}",
+                        admin_link.trim()
+                    ))
+                })?;
+            if registered_path
+                != worktree_git_file.canonicalize().map_err(|error| {
+                    AppError::conflict(format!(
+                        "cannot canonicalize worktree Git link '{}': {error}",
+                        worktree_git_file.display()
+                    ))
+                })?
+            {
+                return Err(AppError::conflict(format!(
+                    "worktree admin entry '{}' is not linked back to '{}'",
+                    admin_dir.display(),
+                    worktree_git_file.display()
+                )));
+            }
+
+            match fs::read_to_string(admin_dir.join("commondir")) {
+                Ok(commondir) => {
+                    let admin_common = resolve_admin_link(&admin_dir, commondir.trim())
+                        .canonicalize()
+                        .map_err(|error| {
+                            AppError::conflict(format!(
+                                "cannot canonicalize worktree admin common directory '{}': {error}",
+                                commondir.trim()
+                            ))
+                        })?;
+                    if admin_common != common_dir {
+                        return Err(AppError::conflict(format!(
+                            "worktree admin common directory '{}' does not match owning repository '{}'",
+                            admin_common.display(),
+                            common_dir.display()
+                        )));
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(AppError::conflict(format!(
+                        "cannot read worktree admin common directory '{}': {error}",
+                        admin_dir.join("commondir").display()
+                    )));
+                }
+            }
+
+            let admin_head = fs::read_to_string(admin_dir.join("HEAD")).map_err(|error| {
+                AppError::conflict(format!(
+                    "cannot read worktree admin HEAD '{}': {error}",
+                    admin_dir.join("HEAD").display()
+                ))
+            })?;
+            let admin_branch = admin_head
+                .trim()
+                .strip_prefix("ref: refs/heads/")
+                .map(str::to_string);
+            let actual_branch = git(&["symbolic-ref", "--quiet", "--short", "HEAD"], path).ok();
+            if admin_branch != worktree.branch || actual_branch != worktree.branch {
+                return Err(AppError::conflict(format!(
+                    "worktree branch metadata does not match registered branch '{}'",
+                    worktree.branch.as_deref().unwrap_or("(detached)")
+                )));
+            }
+            WorktreeIdentity::Linked { admin_dir }
+        }
+    };
+
+    let actual_branch = git(&["symbolic-ref", "--quiet", "--short", "HEAD"], path).ok();
+    if actual_branch != worktree.branch {
+        return Err(AppError::conflict(format!(
+            "worktree branch '{}' does not match the registered branch '{}'",
+            actual_branch.as_deref().unwrap_or("(detached)"),
+            worktree.branch.as_deref().unwrap_or("(detached)")
+        )));
+    }
+    let actual_head = git(&["rev-parse", "--verify", "HEAD"], path)?;
+    if !worktree.commit.is_empty() && !actual_head.starts_with(&worktree.commit) {
+        return Err(AppError::conflict(format!(
+            "worktree HEAD '{}' does not match registered HEAD '{}'",
+            actual_head, worktree.commit
+        )));
+    }
+
+    Ok(identity)
+}
+
+/// Return whether Git left unmerged index entries in a worktree.
+///
+/// A failed hook can leave `MERGE_HEAD` and a staged merge without any
+/// unmerged entries, so the index is the authoritative signal for a content
+/// conflict. This keeps hook and other Git failures out of the
+/// `content_conflict` JSON category.
+pub fn has_unmerged_entries(path: &Path) -> bool {
+    git(&["ls-files", "--unmerged"], path)
+        .map(|output| !output.is_empty())
         .unwrap_or(false)
 }
 

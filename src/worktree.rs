@@ -412,6 +412,54 @@ fn remove_with_branch_context(
     })
 }
 
+/// Remove the exact source worktree captured by merge preflight.
+///
+/// Unlike the user-facing remove path, merge cleanup must not prune and then
+/// rediscover a worktree by branch name. Requiring both paths and identities
+/// prevents cleanup from deleting a replacement repository or branch.
+fn remove_exact_merge_source(repo: &RepoRoot, preflight: &MergePreflight) -> Result<RemoveResult> {
+    let (source, _) = validate_preflight_worktrees(repo, preflight, "source", "destination")?;
+    let removed_path = source.path.clone();
+    let target_branch = BranchName::new(&preflight.source);
+
+    git::remove_worktree(repo, &removed_path, false)?;
+
+    // The source was removed above, so validate the destination separately
+    // immediately before deleting the merged source branch in its context.
+    let destination = validate_preflight_destination(repo, preflight, "destination")?;
+
+    let (branch_deleted, warning) = match git::delete_branch_at(
+        &destination.path,
+        &target_branch,
+        false,
+    ) {
+        Ok(()) => {
+            let warning = git::clear_preserved_branch(repo, &target_branch)
+                .err()
+                .map(|error| {
+                    format!(
+                        "branch '{target_branch}' deleted but lifecycle marker cleanup failed: {error}"
+                    )
+                });
+            (true, warning)
+        }
+        Err(error) => (
+            false,
+            Some(format!(
+                "worktree removed but branch deletion failed: {error}"
+            )),
+        ),
+    };
+
+    Ok(RemoveResult {
+        removed_path,
+        branch: target_branch,
+        repo_root: repo.to_path_buf(),
+        branch_deleted,
+        warning,
+    })
+}
+
 /// How a branch was detected as integrated into mainline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -879,6 +927,64 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
     Ok(diags)
 }
 
+/// How the destination branch relates to its configured upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeTopology {
+    NoUpstream,
+    UpstreamUnavailable,
+    Synchronized,
+    Ahead,
+    Behind,
+    Diverged,
+}
+
+/// History relationship between the source branch and destination history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceHistory {
+    NotMerged,
+    AlreadyMerged,
+    MergedThenReverted,
+}
+
+/// A refusal identified before Git's content merge starts.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergeRefusal {
+    pub kind: String,
+    pub reason: String,
+    pub message: String,
+}
+
+/// Read-only facts and policy decision for a merge.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MergePreflight {
+    pub source: String,
+    /// Exact source path captured from the owning repository's worktree list.
+    /// It is skipped by serde because the established JSON contract only
+    /// exposes the destination path.
+    #[serde(skip)]
+    pub(crate) source_path: PathBuf,
+    /// Stable Git registration identity captured before any merge mutation.
+    #[serde(skip)]
+    pub(crate) source_identity: git::WorktreeIdentity,
+    pub destination: String,
+    pub destination_path: PathBuf,
+    /// Stable Git registration identity captured before any merge mutation.
+    #[serde(skip)]
+    pub(crate) destination_identity: git::WorktreeIdentity,
+    pub upstream: Option<String>,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    pub topology: MergeTopology,
+    pub source_history: SourceHistory,
+    pub source_was_merged: bool,
+    pub source_was_reverted: bool,
+    pub reverted_commit: Option<String>,
+    pub allowed: bool,
+    pub refusal: Option<MergeRefusal>,
+}
+
 /// Result of a successful `merge` operation.
 pub struct MergeResult {
     pub branch: BranchName,
@@ -890,8 +996,24 @@ pub struct MergeResult {
     /// Path of the removed worktree (only set when `cleaned_up` is true).
     pub removed_path: Option<PathBuf>,
     pub pushed: bool,
+    /// Facts gathered before the merge mutation.
+    pub preflight: MergePreflight,
     /// Non-fatal warnings (e.g. cleanup or push failure after merge).
     pub warnings: Vec<String>,
+}
+
+/// Category for a Git failure while attempting the content merge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MergeFailureKind {
+    ContentConflict,
+    GitFailure,
+}
+
+/// A merge attempt failure with enough context for human and JSON output.
+#[derive(Debug)]
+pub struct MergeFailure {
+    pub kind: MergeFailureKind,
+    pub error: AppError,
 }
 
 #[derive(Debug)]
@@ -913,7 +1035,7 @@ fn resolve_merge_destination(
     let mainline = into
         .map(str::to_string)
         .map(Ok)
-        .unwrap_or_else(|| git::resolve_mainline(repo))?;
+        .unwrap_or_else(|| git::resolve_mainline_readonly(repo))?;
 
     if into.is_none() {
         let main = worktrees
@@ -968,38 +1090,205 @@ fn resolve_merge_destination(
     }
 }
 
-/// Abort the merge marker created by this invocation, if any.
-fn abort_created_merge(path: &Path) {
-    if git::merge_in_progress(path) {
-        git::merge_abort(path);
+fn topology(upstream: Option<&str>, ahead: Option<u32>, behind: Option<u32>) -> MergeTopology {
+    match (upstream, ahead, behind) {
+        (None, None, None) => MergeTopology::NoUpstream,
+        (Some(_), None, None) => MergeTopology::UpstreamUnavailable,
+        (Some(_), Some(0), Some(0)) => MergeTopology::Synchronized,
+        (Some(_), Some(ahead), Some(0)) if ahead > 0 => MergeTopology::Ahead,
+        (Some(_), Some(0), Some(behind)) if behind > 0 => MergeTopology::Behind,
+        (Some(_), Some(ahead), Some(behind)) if ahead > 0 && behind > 0 => MergeTopology::Diverged,
+        _ => MergeTopology::UpstreamUnavailable,
     }
 }
 
-/// Merge a worktree's branch into the selected destination.
+fn topology_refusal(
+    destination: &str,
+    upstream: Option<&str>,
+    topology: MergeTopology,
+    ahead: Option<u32>,
+    behind: Option<u32>,
+) -> Option<MergeRefusal> {
+    let upstream = upstream?;
+    let (ahead, behind) = (ahead.unwrap_or(0), behind.unwrap_or(0));
+    match topology {
+        MergeTopology::UpstreamUnavailable => Some(MergeRefusal {
+            kind: "topology".to_string(),
+            reason: "destination_upstream_unavailable".to_string(),
+            message: format!(
+                "merge preflight refused: destination '{destination}' tracks upstream '{upstream}', but that configured ref is unavailable locally; restore the upstream before merging"
+            ),
+        }),
+        MergeTopology::Diverged => Some(MergeRefusal {
+            kind: "topology".to_string(),
+            reason: "destination_diverged_from_upstream".to_string(),
+            message: format!(
+                "merge preflight refused: destination '{destination}' has diverged from upstream '{upstream}' (ahead {ahead}, behind {behind}); reconcile the destination with its upstream before merging"
+            ),
+        }),
+        MergeTopology::Behind => Some(MergeRefusal {
+            kind: "topology".to_string(),
+            reason: "destination_behind_upstream".to_string(),
+            message: format!(
+                "merge preflight refused: destination '{destination}' is behind upstream '{upstream}' by {behind} commit{}; update the destination before merging",
+                if behind == 1 { "" } else { "s" }
+            ),
+        }),
+        _ => None,
+    }
+}
+
+/// Validate a worktree record before using it for a merge and capture its
+/// stable Git registration identity.
 ///
-/// 1. Resolve the source branch (argument, cwd inference, or picker)
-/// 2. Resolve the destination worktree (`--into` or detected mainline)
-/// 3. Refuse self-merges and source merges from the main worktree
-/// 4. Refuse destinations with an existing Git operation in progress
-/// 5. Run `git merge --no-ff <branch>` from the destination worktree
-/// 6. On conflict: abort only a merge state created by this invocation
-/// 7. On success: optionally remove only the source worktree+branch, optionally push
-pub fn merge(
+/// Normal merges prune stale Git metadata before this check. Keeping the
+/// explicit identity validation here also handles locked or otherwise
+/// replaced records without falling through to a low-level Git mutation.
+fn validate_merge_worktree(
+    repo: &RepoRoot,
+    wt: &Worktree,
+    role: &str,
+) -> Result<git::WorktreeIdentity> {
+    git::capture_worktree_identity(repo, wt).map_err(|error| {
+        let branch = wt.branch.as_deref().unwrap_or("(detached)");
+        AppError::conflict(format!(
+            "stale {role} worktree metadata for branch '{branch}' at {}: {error}",
+            wt.path.display()
+        ))
+    })
+}
+
+fn identity_changed(
+    role: &str,
+    branch: &str,
+    path: &Path,
+    expected: &git::WorktreeIdentity,
+    actual: &git::WorktreeIdentity,
+) -> AppError {
+    AppError::conflict(format!(
+        "worktree identity changed for {role} branch '{branch}' at {}: preflight {} Git admin directory '{}' is now {} Git admin directory '{}'; refusing to use the replacement",
+        path.display(),
+        expected.kind(),
+        expected.admin_dir().display(),
+        actual.kind(),
+        actual.admin_dir().display()
+    ))
+}
+
+/// Re-read both sides of a merge and require the paths, branch metadata, and
+/// stable Git registration identities to still be the exact records used by
+/// preflight. This is intentionally read-only so cleanup never selects a
+/// replacement by branch name alone.
+fn validate_preflight_worktrees(
+    repo: &RepoRoot,
+    preflight: &MergePreflight,
+    source_role: &str,
+    destination_role: &str,
+) -> Result<(Worktree, Worktree)> {
+    let worktrees = git::list_worktrees_readonly(repo)?;
+    let source = worktrees
+        .iter()
+        .find(|wt| {
+            wt.path == preflight.source_path
+                && wt.branch.as_deref() == Some(preflight.source.as_str())
+        })
+        .ok_or_else(|| {
+            AppError::conflict(format!(
+                "stale {source_role} worktree metadata for branch '{}' at {}: path or branch no longer matches the preflight record",
+                preflight.source,
+                preflight.source_path.display()
+            ))
+        })?;
+    let destination = worktrees
+        .iter()
+        .find(|wt| {
+            wt.path == preflight.destination_path
+                && wt.branch.as_deref() == Some(preflight.destination.as_str())
+        })
+        .ok_or_else(|| {
+            AppError::conflict(format!(
+                "stale {destination_role} worktree metadata for branch '{}' at {}: path or branch no longer matches the preflight record",
+                preflight.destination,
+                preflight.destination_path.display()
+            ))
+        })?;
+
+    let source_identity = validate_merge_worktree(repo, source, source_role)?;
+    if source_identity != preflight.source_identity {
+        return Err(identity_changed(
+            source_role,
+            &preflight.source,
+            &preflight.source_path,
+            &preflight.source_identity,
+            &source_identity,
+        ));
+    }
+    let destination_identity = validate_merge_worktree(repo, destination, destination_role)?;
+    if destination_identity != preflight.destination_identity {
+        return Err(identity_changed(
+            destination_role,
+            &preflight.destination,
+            &preflight.destination_path,
+            &preflight.destination_identity,
+            &destination_identity,
+        ));
+    }
+    Ok((source.clone(), destination.clone()))
+}
+
+/// Re-read and validate the exact destination record after source cleanup.
+fn validate_preflight_destination(
+    repo: &RepoRoot,
+    preflight: &MergePreflight,
+    role: &str,
+) -> Result<Worktree> {
+    let worktrees = git::list_worktrees_readonly(repo)?;
+    let destination = worktrees
+        .iter()
+        .find(|wt| {
+            wt.path == preflight.destination_path
+                && wt.branch.as_deref() == Some(preflight.destination.as_str())
+        })
+        .ok_or_else(|| {
+            AppError::conflict(format!(
+                "stale {role} worktree metadata for branch '{}' at {}: path or branch no longer matches the preflight record",
+                preflight.destination,
+                preflight.destination_path.display()
+            ))
+        })?;
+    let identity = validate_merge_worktree(repo, destination, role)?;
+    if identity != preflight.destination_identity {
+        return Err(identity_changed(
+            role,
+            &preflight.destination,
+            &preflight.destination_path,
+            &preflight.destination_identity,
+            &identity,
+        ));
+    }
+    Ok(destination.clone())
+}
+
+/// Inspect the merge topology without changing repository state.
+///
+/// `readonly` is true for `--inspect`. Normal merges deliberately prune
+/// stale worktree metadata before selecting either side of the merge.
+pub fn merge_preflight(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
     into: Option<&str>,
-    push: bool,
-    no_cleanup: bool,
-) -> Result<MergeResult> {
-    let worktrees = git::list_worktrees(repo)?;
-
-    // Resolve which branch to merge (same cwd-inference as `remove`).
-    let target_branch = match branch {
-        Some(b) => b.clone(),
-        None => resolve_branch_from_cwd(&worktrees)?,
+    readonly: bool,
+) -> Result<MergePreflight> {
+    let worktrees = if readonly {
+        git::list_worktrees_readonly(repo)?
+    } else {
+        git::list_worktrees(repo)?
     };
 
-    // Find the source worktree entry.
+    let target_branch = match branch {
+        Some(branch) => branch.clone(),
+        None => resolve_branch_from_cwd(&worktrees)?,
+    };
     let source_wt = worktrees
         .iter()
         .find(|wt| wt.branch.as_deref() == Some(target_branch.as_str()))
@@ -1007,40 +1296,173 @@ pub fn merge(
             AppError::usage(format!("no worktree found for branch '{target_branch}'"))
         })?;
 
-    // Never merge the main worktree into itself.
     if source_wt.is_main {
         return Err(AppError::invariant(
             "refusing to merge the main worktree".to_string(),
         ));
     }
+    let source_identity = validate_merge_worktree(repo, source_wt, "source")?;
 
     let destination = resolve_merge_destination(repo, &worktrees, into)?;
+    let destination_wt = worktrees
+        .iter()
+        .find(|wt| wt.path == destination.path)
+        .ok_or_else(|| {
+            AppError::invariant(format!(
+                "destination worktree '{}' disappeared during merge preflight",
+                destination.path.display()
+            ))
+        })?;
+    let destination_identity = validate_merge_worktree(repo, destination_wt, "destination")?;
     if target_branch.as_str() == destination.branch {
         return Err(AppError::invariant(
             "refusing to merge a branch into itself".to_string(),
         ));
     }
 
-    // Never inspect or mutate an operation that was started before this
-    // invocation. In particular, `git merge --abort` below must not erase a
-    // user's existing merge, rebase, cherry-pick, or revert state.
-    if let Some(state) = git::operation_state(&destination.path)? {
-        return Err(AppError::conflict(format!(
-            "destination worktree '{}' has an in-progress {state}; finish or abort it before merging",
-            destination.path.display()
-        )));
+    let upstream = git::branch_upstream(&destination.path, &destination.branch)?;
+    let (ahead, behind) = match upstream.as_deref() {
+        Some(upstream) => {
+            match git::upstream_counts(&destination.path, upstream, &destination.branch)? {
+                Some((ahead, behind)) => (Some(ahead), Some(behind)),
+                None => (None, None),
+            }
+        }
+        None => (None, None),
+    };
+    let topology = topology(upstream.as_deref(), ahead, behind);
+    let source_was_merged = git::is_ancestor(repo, target_branch.as_str(), &destination.branch);
+    let source_patch_equivalent =
+        git::patch_equivalent(repo, &destination.branch, target_branch.as_str());
+    let reverted_commit = git::reverted_source_commit(
+        &destination.path,
+        target_branch.as_str(),
+        &destination.branch,
+    )?;
+    let source_was_reverted = reverted_commit.is_some();
+    let source_history = if source_was_reverted {
+        SourceHistory::MergedThenReverted
+    } else if source_was_merged || source_patch_equivalent {
+        // Keep the existing `already_merged` output for both ancestry and a
+        // proven equivalent tree/patch. Do not report a known squash or rebase
+        // integration as `not_merged` merely because commit IDs differ.
+        SourceHistory::AlreadyMerged
+    } else {
+        SourceHistory::NotMerged
+    };
+
+    let refusal = match git::operation_state(&destination.path)? {
+        Some(state) => Some(MergeRefusal {
+            kind: "state".to_string(),
+            reason: "destination_operation_in_progress".to_string(),
+            message: format!(
+                "destination worktree '{}' has an in-progress {state}; finish or abort it before merging",
+                destination.path.display()
+            ),
+        }),
+        None => topology_refusal(
+            &destination.branch,
+            upstream.as_deref(),
+            topology,
+            ahead,
+            behind,
+        ),
+    };
+
+    Ok(MergePreflight {
+        source: target_branch.to_string(),
+        source_path: source_wt.path.clone(),
+        source_identity,
+        destination: destination.branch,
+        destination_path: destination.path,
+        destination_identity,
+        upstream,
+        ahead,
+        behind,
+        topology,
+        source_history,
+        source_was_merged,
+        source_was_reverted,
+        reverted_commit,
+        allowed: refusal.is_none(),
+        refusal,
+    })
+}
+
+/// Abort the merge marker created by this invocation, if any.
+fn abort_created_merge(path: &Path) {
+    if git::merge_in_progress(path) {
+        git::merge_abort(path);
+    }
+}
+
+fn classify_merge_failure(
+    path: &Path,
+    target_branch: &BranchName,
+    error: AppError,
+) -> MergeFailure {
+    let kind = match git::has_unmerged_entries(path) {
+        true => MergeFailureKind::ContentConflict,
+        false => MergeFailureKind::GitFailure,
+    };
+    let error = match kind {
+        MergeFailureKind::ContentConflict => AppError::conflict(format!(
+            "content merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{error}",
+            target_branch
+        )),
+        MergeFailureKind::GitFailure => AppError {
+            code: error.code,
+            message: format!("merge of '{}' failed and was aborted\n{error}", target_branch),
+        },
+    };
+    MergeFailure { kind, error }
+}
+
+fn partial_success_warning(action: &str, replacement_action: &str, error: &AppError) -> String {
+    if error.message.contains("worktree identity changed") {
+        format!(
+            "partial success: merge succeeded; {action} skipped because {error}. The merge commit was preserved; the replacement was not {replacement_action}. Inspect the original worktree and recover manually before retrying."
+        )
+    } else {
+        format!("merge succeeded but {action} failed: {error}")
+    }
+}
+
+/// Run a merge using an already collected preflight.
+pub fn merge_with_preflight(
+    repo: &RepoRoot,
+    preflight: MergePreflight,
+    push: bool,
+    no_cleanup: bool,
+) -> std::result::Result<MergeResult, MergeFailure> {
+    if let Some(refusal) = &preflight.refusal {
+        return Err(MergeFailure {
+            kind: MergeFailureKind::GitFailure,
+            error: AppError::conflict(refusal.message.clone()),
+        });
     }
 
+    // Revalidate immediately before the first mutation. Preflight paths are
+    // not trusted across the gap between inspection and merge execution.
+    if let Err(error) = validate_preflight_worktrees(repo, &preflight, "source", "destination") {
+        return Err(MergeFailure {
+            kind: MergeFailureKind::GitFailure,
+            error,
+        });
+    }
+
+    let destination_path = preflight.destination_path.clone();
+    let target_branch = BranchName::new(&preflight.source);
+    let destination_branch = preflight.destination.clone();
+
     // Attempt the merge from the selected destination worktree's context.
-    if let Err(e) = git::merge_no_ff(&destination.path, target_branch.as_str()) {
-        // The preflight above established that any merge state now belongs to
-        // this invocation. Do not abort unrelated failures that created no
-        // merge state.
-        abort_created_merge(&destination.path);
-        return Err(AppError::conflict(format!(
-            "merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{e}",
-            target_branch
-        )));
+    if let Err(error) = git::merge_no_ff(&destination_path, target_branch.as_str()) {
+        // The preflight established that any merge state now belongs to this
+        // invocation. Abort it after classifying the failure so a hook or
+        // other Git failure is not mislabeled as a content conflict.
+        let failure = classify_merge_failure(&destination_path, &target_branch, error);
+        abort_created_merge(&destination_path);
+        return Err(failure);
     }
 
     let mut warnings = Vec::new();
@@ -1051,32 +1473,38 @@ pub fn merge(
     let (cleaned_up, removed_path) = if no_cleanup {
         (false, None)
     } else {
-        match remove_with_branch_context(
-            repo,
-            Some(&target_branch),
-            false,
-            &destination.path,
-            false,
-        ) {
+        match remove_exact_merge_source(repo, &preflight) {
             Ok(result) => {
-                if let Some(w) = result.warning {
-                    warnings.push(w);
+                if let Some(warning) = result.warning {
+                    warnings.push(warning);
                 }
                 (true, Some(result.removed_path))
             }
-            Err(e) => {
-                warnings.push(format!("merge succeeded but cleanup failed: {e}"));
+            Err(error) => {
+                warnings.push(partial_success_warning("cleanup", "removed", &error));
                 (false, None)
             }
         }
     };
 
-    // Push the selected destination branch to origin if requested.
+    // Push the selected destination branch to origin if requested. The
+    // destination may have changed while cleanup ran, so verify it again
+    // before allowing a remote mutation.
     let pushed = if push {
-        match git::push(&destination.path, &destination.branch) {
-            Ok(()) => true,
-            Err(e) => {
-                warnings.push(format!("merge succeeded but push failed: {e}"));
+        match validate_preflight_destination(repo, &preflight, "destination") {
+            Ok(_) => match git::push(&destination_path, &destination_branch) {
+                Ok(()) => true,
+                Err(error) => {
+                    warnings.push(format!("merge succeeded but push failed: {error}"));
+                    false
+                }
+            },
+            Err(error) => {
+                warnings.push(partial_success_warning(
+                    "destination push",
+                    "pushed",
+                    &error,
+                ));
                 false
             }
         }
@@ -1086,12 +1514,13 @@ pub fn merge(
 
     Ok(MergeResult {
         branch: target_branch,
-        mainline: destination.branch,
-        destination_path: destination.path,
+        mainline: destination_branch,
+        destination_path,
         repo_root: repo.to_path_buf(),
         cleaned_up,
         removed_path,
         pushed,
+        preflight,
         warnings,
     })
 }

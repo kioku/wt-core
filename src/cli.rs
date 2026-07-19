@@ -147,6 +147,13 @@ pub enum Command {
         #[arg(long, value_name = "BRANCH")]
         into: Option<String>,
 
+        /// Inspect merge topology without merging, cleaning up, or pushing
+        #[arg(
+            long,
+            conflicts_with_all = ["push", "no_cleanup", "print_paths", "print_paths_v2"]
+        )]
+        inspect: bool,
+
         /// Push the target branch to origin after successful merge
         #[arg(long)]
         push: bool,

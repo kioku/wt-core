@@ -369,6 +369,101 @@ pub enum MergeFormat {
     PrintPathsV2,
 }
 
+/// Machine-readable refusal details for a merge preflight or content merge.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeRefusal {
+    pub kind: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Facts collected before a merge mutates the destination.
+#[derive(Debug, Serialize)]
+pub struct JsonMergePreflight {
+    pub source: String,
+    pub destination: String,
+    pub destination_path: String,
+    pub upstream: Option<String>,
+    /// Alias kept explicit for consumers that name the destination side.
+    pub destination_upstream: Option<String>,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    pub topology: String,
+    pub source_history: String,
+    pub source_was_merged: bool,
+    pub source_was_reverted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverted_commit: Option<String>,
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_message: Option<String>,
+}
+
+impl JsonMergePreflight {
+    pub fn from_preflight(preflight: &crate::worktree::MergePreflight) -> Self {
+        let (refusal_kind, refusal_reason, refusal_message) = preflight
+            .refusal
+            .as_ref()
+            .map(|refusal| {
+                (
+                    Some(refusal.kind.clone()),
+                    Some(refusal.reason.clone()),
+                    Some(refusal.message.clone()),
+                )
+            })
+            .unwrap_or((None, None, None));
+
+        Self {
+            source: preflight.source.clone(),
+            destination: preflight.destination.clone(),
+            destination_path: preflight.destination_path.display().to_string(),
+            upstream: preflight.upstream.clone(),
+            destination_upstream: preflight.upstream.clone(),
+            ahead: preflight.ahead,
+            behind: preflight.behind,
+            topology: merge_topology_name(preflight.topology),
+            source_history: source_history_name(preflight.source_history),
+            source_was_merged: preflight.source_was_merged,
+            source_was_reverted: preflight.source_was_reverted,
+            reverted_commit: preflight.reverted_commit.clone(),
+            allowed: preflight.allowed,
+            refusal_kind,
+            refusal_reason,
+            refusal_message,
+        }
+    }
+}
+
+fn merge_topology_name(topology: crate::worktree::MergeTopology) -> String {
+    match topology {
+        crate::worktree::MergeTopology::NoUpstream => "no_upstream",
+        crate::worktree::MergeTopology::UpstreamUnavailable => "upstream_unavailable",
+        crate::worktree::MergeTopology::Synchronized => "synchronized",
+        crate::worktree::MergeTopology::Ahead => "ahead",
+        crate::worktree::MergeTopology::Behind => "behind",
+        crate::worktree::MergeTopology::Diverged => "diverged",
+    }
+    .to_string()
+}
+
+fn source_history_name(history: crate::worktree::SourceHistory) -> String {
+    match history {
+        crate::worktree::SourceHistory::NotMerged => "not_merged",
+        crate::worktree::SourceHistory::AlreadyMerged => "already_merged",
+        crate::worktree::SourceHistory::MergedThenReverted => "merged_then_reverted",
+    }
+    .to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 /// JSON response for the merge command.
 #[derive(Debug, Serialize)]
 pub struct JsonMergeResponse {
@@ -385,6 +480,16 @@ pub struct JsonMergeResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_path: Option<String>,
     pub pushed: bool,
+    /// Partial-success diagnostics, such as an identity change after commit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<JsonMergePreflight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<JsonMergeRefusal>,
+    /// True when this response came from `merge --inspect`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub inspect: bool,
 }
 
 /// Resolution metadata emitted before an `exec --json` child starts.

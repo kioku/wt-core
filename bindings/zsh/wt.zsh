@@ -180,6 +180,15 @@ wt() {
                 [[ "$arg" == "--json" ]] && want_json=true
             done
 
+            # Inspection is a read-only protocol. Bypass navigation metadata
+            # and legacy path parsing for every output mode.
+            for arg in "$@"; do
+                if [[ "$arg" == "--inspect" ]]; then
+                    wt-core merge "$@"
+                    return $?
+                fi
+            done
+
             if [[ "$want_json" == true ]]; then
                 local cwd_before nav_file output rc
                 cwd_before=$(pwd -P)

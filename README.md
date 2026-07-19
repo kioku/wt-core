@@ -58,6 +58,7 @@ wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
                                       [--keep-branch] preserves the branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
+wt merge [<branch>] --inspect         Inspect merge topology without mutation
 wt diff [<branch>] [--dry-run]         Open difftool for branch or dirty changes
 wt materialize --sha <sha> ...         Create an explicit detached checkout
 wt prune [--execute] [--force]         Remove integrated worktrees and branches
@@ -175,7 +176,23 @@ wt merge feature/auth --into rc  # merge into checked-out branch rc
 wt merge feature/auth --into release/1.0  # destination may be linked
 wt merge --push                  # push target branch to origin after merge
 wt merge --no-cleanup            # keep worktree and branch after merge
+wt merge feature/auth --inspect  # report topology without changing the repo
 ```
+
+Before a merge, wt-core reports the destination's configured upstream and
+commit counts. Synchronized destinations are ready to merge; destinations
+that are ahead are called out prominently because a subsequent push includes
+those local commits. Destinations behind or diverged from their upstream are
+refused before Git's content merge starts, so update or reconcile the target
+first. A configured upstream whose remote-tracking ref is unavailable is also
+refused rather than treated as an untracked destination. A source that appears
+in a standard Git revert record is reported as previously merged then reverted.
+
+`--inspect` performs the same read-only preflight and never fetches, prunes
+worktree metadata, merges, pushes, or cleans up. With `--json`, the
+`preflight` object contains `upstream`, `ahead`, `behind`, `topology`, source
+history, and any structured refusal reason. Topology refusals are distinct
+from `content_conflict` refusals.
 
 ### `wt diff`
 
@@ -250,13 +267,14 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 
 ## Output Modes
 
-| Flag                | Behavior                                                               |
-|---------------------|------------------------------------------------------------------------|
-| *(default)*         | Human-readable text                                                    |
+| Flag                | Behavior                                                                  |
+|---------------------|---------------------------------------------------------------------------|
+| *(default)*         | Human-readable text                                                       |
 | `--json`            | Single-line JSON on stdout (except `exec`, which emits metadata on stderr) |
-| `--print-cd-path`   | Bare absolute path on stdout for `add` and `go`                       |
-| `--print-paths`     | Legacy multi-line fields for `remove` and `merge`                    |
-| `--print-paths-v2`  | Merge fields plus `destination_path` as line seven                    |
+| `--print-cd-path`   | Bare absolute path on stdout for `add` and `go`                          |
+| `--print-paths`     | Legacy multi-line fields for `remove` and `merge`                       |
+| `--print-paths-v2`  | Merge fields plus `destination_path` as line seven                       |
+| `--inspect`         | Read-only merge topology preflight (use with `--json` for facts)         |
 
 For `add`, `go`, `remove`, and `merge`, `--json` is authoritative when it is
 combined with either legacy path flag. This lets a wrapper safely append its
