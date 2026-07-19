@@ -13,6 +13,35 @@ fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct FilesystemMetadata {
+    file_type: (bool, bool, bool),
+    len: u64,
+    readonly: bool,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    mode: u32,
+}
+
+fn filesystem_metadata(path: &std::path::Path) -> Option<FilesystemMetadata> {
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    Some(FilesystemMetadata {
+        file_type: (
+            metadata.file_type().is_file(),
+            metadata.file_type().is_dir(),
+            metadata.file_type().is_symlink(),
+        ),
+        len: metadata.len(),
+        readonly: metadata.permissions().readonly(),
+        modified: metadata.modified().ok(),
+        #[cfg(unix)]
+        mode: metadata.permissions().mode() & 0o7777,
+    })
+}
+
 /// Environment variables cleared for raw git commands in tests.
 const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_DIR",
@@ -97,6 +126,38 @@ fn merge_no_cleanup_keeps_worktree_and_branch() {
 }
 
 // ── Conflict tests ──────────────────────────────────────────────────
+
+#[test]
+fn merge_status_does_not_initialize_missing_state_namespace() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let git_dir = repo.path().join(".git");
+    let state_dir = git_dir.join("wt-core");
+    let state_path = state_dir.join("merge-operation.json");
+    let lock_path = state_dir.join("merge-operation.lock");
+    let paths = [git_dir, state_dir, state_path, lock_path];
+    let before: Vec<_> = paths.iter().map(|path| filesystem_metadata(path)).collect();
+    assert!(
+        before[1].is_none(),
+        "fixture must start without managed state"
+    );
+
+    let output = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run without managed state");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let status: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(status["state"], "none");
+    assert_eq!(status["ok"], true);
+
+    let after: Vec<_> = paths.iter().map(|path| filesystem_metadata(path)).collect();
+    assert_eq!(before, after, "status changed managed filesystem metadata");
+}
 
 #[test]
 fn merge_conflict_preserves_destination_and_managed_state() {

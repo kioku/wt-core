@@ -972,18 +972,11 @@ enum MergeOperationFile {
 
 fn merge_operation_file(repo: &RepoRoot) -> Result<MergeOperationFile> {
     let path = git::merge_operation_path(repo)?;
-    if let Some(error) = path
-        .parent()
-        .and_then(|parent| operation_state::ensure_private_directory(parent).err())
-    {
-        return Ok(MergeOperationFile::Corrupt {
-            path,
-            reason: error.message,
-        });
-    }
     match fs::symlink_metadata(&path) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A status query must not initialize the journal namespace just to
+            // discover that there is no operation to report.
             return Ok(MergeOperationFile::Missing);
         }
         Err(error) => {
@@ -992,6 +985,15 @@ fn merge_operation_file(repo: &RepoRoot) -> Result<MergeOperationFile> {
                 reason: format!("cannot inspect state file: {error}"),
             });
         }
+    }
+    if let Some(error) = path
+        .parent()
+        .and_then(|parent| operation_state::ensure_private_directory(parent).err())
+    {
+        return Ok(MergeOperationFile::Corrupt {
+            path,
+            reason: error.message,
+        });
     }
     if let Err(error) = operation_state::ensure_private_file(&path) {
         return Ok(MergeOperationFile::Corrupt {
