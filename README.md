@@ -211,16 +211,13 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
 | `--print-paths`   | Multi-line key values on stdout (for wrappers) |
 
-For `remove --print-paths`, the lines are `removed_path`, `repo_root`,
-`branch`, and `branch_deleted` in that order. The first three lines remain
-path/branch values; the fourth line makes preserved-branch cleanup explicit.
-
-`--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
-For `remove`, `worktree_removed` and `branch_deleted` explicitly report each
-lifecycle action. Prune dry-runs report `worktree_present` and
-`branch_will_be_deleted`; execute results report `worktree_removed` and
-`branch_deleted`. A preserved branch has a null prune `path` because no
-worktree remains.
+For `remove --print-paths`, the exact legacy protocol is three lines:
+`removed_path`, `repo_root`, and `branch`. This format is intentionally stable
+for already-installed shell bindings. Use `--json` when lifecycle status is
+needed: `worktree_removed` and `branch_deleted` explicitly report each action.
+Prune dry-runs report `worktree_present` and `branch_will_be_deleted`; execute
+results report `worktree_removed` and `branch_deleted`. A preserved branch has
+a null prune `path` because no worktree remains.
 
 JSON envelope example (`add`, `go`, `remove`):
 

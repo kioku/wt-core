@@ -108,27 +108,32 @@ wt() {
 
             local cwd_before
             cwd_before=$(pwd)
-            # --print-paths outputs four lines: removed_path, repo_root, branch, branch_deleted.
+            # --print-paths is the stable legacy three-line protocol:
+            # removed_path, repo_root, branch. Lifecycle status is explicit in
+            # --json; the binding also knows whether --keep-branch was requested.
+            local keep_branch=false
+            for arg in "$@"; do
+                [ "$arg" = "--keep-branch" ] && keep_branch=true
+            done
             # stderr is left connected to the terminal so the interactive picker
             # (if triggered) renders correctly and errors are visible.
             local result
             result=$(wt-core remove "$@" --print-paths)
             local rc=$?
             if [ $rc -eq 0 ]; then
-                local removed_path repo_root branch branch_deleted
+                local removed_path repo_root branch
                 removed_path=$(printf '%s\n' "$result" | sed -n '1p')
                 repo_root=$(printf '%s\n' "$result" | sed -n '2p')
                 branch=$(printf '%s\n' "$result" | sed -n '3p')
-                branch_deleted=$(printf '%s\n' "$result" | sed -n '4p')
                 case "$cwd_before" in
                     "${removed_path}"*)
                         cd "$repo_root" || true
                         ;;
                 esac
-                if [ "$branch_deleted" = true ]; then
-                    echo "Removed worktree and branch '${branch}'"
-                else
+                if [ "$keep_branch" = true ]; then
                     echo "Removed worktree and kept branch '${branch}'"
+                else
+                    echo "Removed worktree and branch '${branch}'"
                 fi
             else
                 return $rc

@@ -1154,10 +1154,12 @@ fn cmd_remove(
 
     match fmt {
         RemoveFormat::PrintPaths => {
+            // This is a stable legacy protocol used by installed shell
+            // bindings: exactly removed_path, repo_root, and branch.
+            // Lifecycle status is available in the explicit JSON response.
             println!("{removed_str}");
             println!("{root_str}");
             println!("{branch_name}");
-            println!("{}", result.branch_deleted);
         }
         RemoveFormat::Json => {
             let resp = JsonResponse::success(if result.branch_deleted {
@@ -1372,6 +1374,7 @@ fn cmd_prune_execute(
                     "not_integrated" => "not integrated",
                     "no_branch" => "no branch",
                     "removal_failed" => "removal failed",
+                    "stale_marker" => "stale preservation marker",
                     other => other,
                 };
                 println!("  Skipped {label} ({reason})");

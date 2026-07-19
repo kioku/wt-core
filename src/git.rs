@@ -223,7 +223,8 @@ pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Resul
 ///
 /// The marker is a private ref rather than a file in the repository, so the
 /// state follows clones only when explicitly copied and does not alter branch
-/// names or worktree directories.
+/// names or worktree directories. Its object ID is the branch incarnation
+/// that was explicitly preserved; prune must not authorize a later incarnation.
 pub fn mark_preserved_branch(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
     let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
     let branch_ref = format!("refs/heads/{}", branch.as_str());
@@ -231,18 +232,70 @@ pub fn mark_preserved_branch(repo: &RepoRoot, branch: &BranchName) -> Result<()>
     Ok(())
 }
 
+/// A branch preserved by `remove --keep-branch`, including its exact marker
+/// object ID. The ID is intentionally retained through prune planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreservedBranch {
+    pub name: String,
+    pub oid: String,
+}
+
 /// List branches explicitly preserved by `remove --keep-branch`.
-pub fn list_preserved_branches(repo: &RepoRoot) -> Result<Vec<String>> {
+pub fn list_preserved_branches(repo: &RepoRoot) -> Result<Vec<PreservedBranch>> {
     let output = git(
         &[
             "for-each-ref",
-            "--format=%(refname:strip=3)",
+            "--format=%(refname:strip=3)%09%(objectname)",
             "refs/wt-core/preserved/",
         ],
         repo.as_ref(),
     )?;
 
-    Ok(output.lines().map(str::to_string).collect())
+    Ok(output
+        .lines()
+        .filter_map(|line| {
+            let (name, oid) = line.split_once('\t')?;
+            Some(PreservedBranch {
+                name: name.to_string(),
+                oid: oid.to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Resolve the current object ID of a local branch.
+pub fn branch_oid(repo: &RepoRoot, branch: &BranchName) -> Option<String> {
+    let branch_ref = format!("refs/heads/{}^{{commit}}", branch.as_str());
+    git(&["rev-parse", "--verify", &branch_ref], repo.as_ref()).ok()
+}
+
+/// Resolve a revision to its peeled commit object ID.
+pub fn resolve_commit(repo: &RepoRoot, revision: &str) -> Result<String> {
+    let peeled = format!("{revision}^{{commit}}");
+    git(&["rev-parse", "--verify", &peeled], repo.as_ref())
+}
+
+/// Return a canonical short remote-tracking ref (`origin/topic`) when the
+/// supplied revision names one directly or through its full ref name.
+pub fn remote_branch_revision(repo: &RepoRoot, revision: &str) -> Option<String> {
+    let short = revision.strip_prefix("refs/remotes/").unwrap_or(revision);
+    let reference = format!("refs/remotes/{short}^{{commit}}");
+    git(&["rev-parse", "--verify", &reference], repo.as_ref())
+        .ok()
+        .map(|_| short.to_string())
+}
+
+/// Return the local branch corresponding to a canonical remote ref, if one
+/// exists. A remote ref itself is not a local worktree target.
+pub fn local_branch_for_remote(repo: &RepoRoot, remote_revision: &str) -> Option<String> {
+    let (_, branch) = remote_revision.split_once('/')?;
+    let branch_name = BranchName::new(branch);
+    branch_exists(repo, &branch_name).then_some(branch.to_string())
+}
+
+/// Resolve `HEAD` to its checked-out local branch when it is symbolic.
+pub fn current_branch(repo: &RepoRoot) -> Option<String> {
+    git(&["symbolic-ref", "--short", "HEAD"], repo.as_ref()).ok()
 }
 
 /// Remove the lifecycle marker for a preserved branch.

@@ -231,6 +231,127 @@ fn prune_execute_no_integrated_worktrees() {
 
 // ── Mainline tests ──────────────────────────────────────────────────
 
+/// Create a linked integration target and a candidate worktree merged into it.
+/// The target is deliberately linked, so a raw revision comparison would
+/// incorrectly classify it as a prune candidate.
+fn setup_linked_integration_target(repo: &std::path::Path) -> (std::path::PathBuf, String) {
+    run_git(&["branch", "integration/release"], repo);
+    let target_dir = repo.join("integration-target");
+    run_git(
+        &[
+            "worktree",
+            "add",
+            &target_dir.display().to_string(),
+            "integration/release",
+        ],
+        repo,
+    );
+
+    let repo_str = repo.display().to_string();
+    wt_core()
+        .args(["add", "feature/target-candidate", "--repo", &repo_str])
+        .assert()
+        .success();
+    let candidate_dir = find_worktree_dir(repo, "feature-target-candidate");
+    commit_file(
+        &candidate_dir,
+        "target.txt",
+        "target candidate",
+        "target candidate",
+    );
+    run_git(
+        &["merge", "--no-ff", "feature/target-candidate"],
+        &target_dir,
+    );
+
+    let target_sha = git_ref_hash(&target_dir, "HEAD").expect("target should have a tip");
+    (target_dir, target_sha)
+}
+
+fn assert_target_survives_prune(
+    repo: &std::path::Path,
+    target_dir: &std::path::Path,
+    target_revision: &str,
+    expected_mainline: &str,
+) {
+    let repo_str = repo.display().to_string();
+    let output = wt_core()
+        .args([
+            "prune",
+            "--integrated-into",
+            target_revision,
+            "--execute",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["mainline"], expected_mainline);
+    assert!(target_dir.exists(), "selected target worktree was pruned");
+    assert_branch_exists(repo, "integration/release");
+    assert_branch_deleted(repo, "feature/target-candidate");
+}
+
+#[test]
+fn prune_never_prunes_linked_target_branch() {
+    let repo = fixtures::TestRepo::new();
+    let (target_dir, _) = setup_linked_integration_target(&repo.path());
+
+    assert_target_survives_prune(
+        &repo.path(),
+        &target_dir,
+        "integration/release",
+        "integration/release",
+    );
+}
+
+#[test]
+fn prune_canonicalizes_full_target_ref_and_protects_linked_target() {
+    let repo = fixtures::TestRepo::new();
+    let (target_dir, _) = setup_linked_integration_target(&repo.path());
+
+    assert_target_survives_prune(
+        &repo.path(),
+        &target_dir,
+        "refs/heads/integration/release",
+        "integration/release",
+    );
+}
+
+#[test]
+fn prune_protects_linked_target_selected_by_remote_ref() {
+    let repo = fixtures::TestRepo::new();
+    let (target_dir, target_sha) = setup_linked_integration_target(&repo.path());
+    run_git(
+        &[
+            "update-ref",
+            "refs/remotes/origin/integration/release",
+            &target_sha,
+        ],
+        &repo.path(),
+    );
+
+    assert_target_survives_prune(
+        &repo.path(),
+        &target_dir,
+        "origin/integration/release",
+        "origin/integration/release",
+    );
+}
+
+#[test]
+fn prune_conservatively_protects_target_selected_by_commit_sha() {
+    let repo = fixtures::TestRepo::new();
+    let (target_dir, target_sha) = setup_linked_integration_target(&repo.path());
+
+    assert_target_survives_prune(&repo.path(), &target_dir, &target_sha, &target_sha);
+}
+
 #[test]
 fn prune_integrated_into_removes_preserved_branch_without_worktree() {
     let repo = fixtures::TestRepo::new();
@@ -307,6 +428,174 @@ fn prune_integrated_into_removes_preserved_branch_without_worktree() {
     assert_eq!(pruned[0]["branch_deleted"], true);
     assert_eq!(pruned[0]["path"], serde_json::Value::Null);
     assert_branch_deleted(&repo.path(), "feature/staged");
+}
+
+#[test]
+fn prune_rejects_moved_preserved_branch_and_clears_marker() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/moved-marker", "--repo", &repo_str])
+        .assert()
+        .success();
+    let feature_dir = find_worktree_dir(&repo.path(), "feature-moved-marker");
+    commit_file(&feature_dir, "moved.txt", "moved", "moved feature");
+    run_git(&["checkout", "main"], &repo.path());
+    run_git(&["merge", "feature/moved-marker"], &repo.path());
+
+    wt_core()
+        .args([
+            "remove",
+            "feature/moved-marker",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+
+    let marker = git_ref_hash(&repo.path(), "refs/wt-core/preserved/feature/moved-marker")
+        .expect("preservation marker should exist");
+    assert_eq!(marker, git_log_hash(&repo.path(), "feature/moved-marker"));
+    commit_file(
+        &repo.path(),
+        "after-preserve-move.txt",
+        "after preserve",
+        "advance target",
+    );
+
+    // A moved ref is a different branch incarnation and must not be pruned,
+    // even though its new tip is already integrated into main.
+    run_git(
+        &["branch", "-f", "feature/moved-marker", "main"],
+        &repo.path(),
+    );
+    let reattached = repo.path().join("moved-marker-reattached");
+    run_git(
+        &[
+            "worktree",
+            "add",
+            &reattached.display().to_string(),
+            "feature/moved-marker",
+        ],
+        &repo.path(),
+    );
+    wt_core()
+        .args(["prune", "--execute", "--json", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_branch_exists(&repo.path(), "feature/moved-marker");
+    assert!(
+        reattached.exists(),
+        "stale reattached worktree should survive"
+    );
+    assert!(
+        git_ref_hash(&repo.path(), "refs/wt-core/preserved/feature/moved-marker").is_none(),
+        "stale marker should be cleared"
+    );
+}
+
+#[test]
+fn prune_rejects_recreated_preserved_branch_and_clears_marker() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/recreated-marker", "--repo", &repo_str])
+        .assert()
+        .success();
+    let feature_dir = find_worktree_dir(&repo.path(), "feature-recreated-marker");
+    commit_file(
+        &feature_dir,
+        "recreated.txt",
+        "recreated",
+        "recreated feature",
+    );
+    run_git(&["checkout", "main"], &repo.path());
+    run_git(&["merge", "feature/recreated-marker"], &repo.path());
+
+    wt_core()
+        .args([
+            "remove",
+            "feature/recreated-marker",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+
+    commit_file(
+        &repo.path(),
+        "after-preserve-recreate.txt",
+        "after preserve",
+        "advance target",
+    );
+    run_git(&["branch", "-D", "feature/recreated-marker"], &repo.path());
+    run_git(
+        &["branch", "feature/recreated-marker", "main"],
+        &repo.path(),
+    );
+
+    wt_core()
+        .args(["prune", "--execute", "--json", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_branch_exists(&repo.path(), "feature/recreated-marker");
+    assert!(
+        git_ref_hash(
+            &repo.path(),
+            "refs/wt-core/preserved/feature/recreated-marker"
+        )
+        .is_none(),
+        "recreated branch marker should be cleared"
+    );
+}
+
+#[test]
+fn successful_default_deletion_clears_an_existing_marker() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/clear-marker", "--repo", &repo_str])
+        .assert()
+        .success();
+    wt_core()
+        .args([
+            "remove",
+            "feature/clear-marker",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+
+    // Reattach the preserved branch, then take the normal deletion path.
+    let reattached = repo.path().join("reattached-worktree");
+    run_git(
+        &[
+            "worktree",
+            "add",
+            &reattached.display().to_string(),
+            "feature/clear-marker",
+        ],
+        &repo.path(),
+    );
+    wt_core()
+        .args(["remove", "feature/clear-marker", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_branch_deleted(&repo.path(), "feature/clear-marker");
+    assert!(
+        git_ref_hash(&repo.path(), "refs/wt-core/preserved/feature/clear-marker").is_none(),
+        "successful deletion should clear the marker"
+    );
 }
 
 #[test]
@@ -669,6 +958,20 @@ fn git_log_hash(repo: &std::path::Path, branch: &str) -> String {
     }
     let output = cmd.output().expect("git log failed");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+fn git_ref_hash(repo: &std::path::Path, reference: &str) -> Option<String> {
+    let mut cmd = StdCommand::new("git");
+    cmd.args(["rev-parse", "--verify", reference])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        cmd.env_remove(var);
+    }
+    let output = cmd.output().expect("git rev-parse failed");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
 /// Assert that a branch exists in the repo.

@@ -373,7 +373,7 @@ fn remove_keep_branch_preserves_dirty_safety() {
 }
 
 #[test]
-fn remove_keep_branch_print_paths_reports_branch_retained() {
+fn remove_keep_branch_print_paths_preserves_legacy_protocol() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
@@ -399,14 +399,13 @@ fn remove_keep_branch_print_paths_reports_branch_retained() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 4, "expected exactly 4 lines: {stdout}");
+    assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout}");
     assert_eq!(lines[2], "staged/paths");
-    assert_eq!(lines[3], "false");
     assert_branch_exists(&repo.path(), "staged/paths");
 }
 
 #[test]
-fn remove_print_paths_returns_four_lines() {
+fn remove_print_paths_returns_three_lines() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
@@ -432,7 +431,7 @@ fn remove_print_paths_returns_four_lines() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 4, "expected exactly 4 lines: {stdout}");
+    assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout}");
 
     // Line 1: removed worktree path (under .worktrees/)
     assert!(
@@ -453,9 +452,6 @@ fn remove_print_paths_returns_four_lines() {
         lines[2], "feature/paths-rm",
         "line 3 should be the real branch name, not the slug"
     );
-
-    // Line 4: branch was deleted by the default cleanup.
-    assert_eq!(lines[3], "true");
 
     // No line should be JSON
     assert!(!lines[0].starts_with('{'));
@@ -604,9 +600,8 @@ fn remove_no_branch_print_paths_uses_cwd_inference() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 4);
+    assert_eq!(lines.len(), 3);
     assert_eq!(lines[2], "paths-infer");
-    assert_eq!(lines[3], "true");
 }
 
 #[test]
@@ -647,9 +642,8 @@ fn remove_no_branch_print_paths_from_nested_dir_uses_cwd_inference() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     let lines: Vec<&str> = stdout.trim().lines().collect();
-    assert_eq!(lines.len(), 4);
+    assert_eq!(lines.len(), 3);
     assert_eq!(lines[2], "paths-infer-nested");
-    assert_eq!(lines[3], "true");
 }
 
 #[test]

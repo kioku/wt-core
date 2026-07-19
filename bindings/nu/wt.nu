@@ -118,20 +118,22 @@ export def --env "wt remove" [
         # inherited, keeping the interactive picker and error messages
         # visible in the terminal.
         let output = try { ^wt-core ...$full_args } catch { return }
+        # --print-paths is the stable legacy three-line protocol:
+        # removed_path, repo_root, branch. Lifecycle status is explicit in
+        # --json; the binding already knows whether --keep-branch was requested.
         let lines = ($output | lines)
         let removed_path = ($lines | get 0)
         let repo_root = ($lines | get 1)
         let branch_name = ($lines | get 2)
-        let branch_deleted = ($lines | get 3)
 
         if ($cwd_before | str starts-with $removed_path) {
             cd $repo_root
         }
 
-        if $branch_deleted == "true" {
-            print $"Removed worktree and branch '($branch_name)'"
-        } else {
+        if $keep_branch {
             print $"Removed worktree and kept branch '($branch_name)'"
+        } else {
+            print $"Removed worktree and branch '($branch_name)'"
         }
     }
 }

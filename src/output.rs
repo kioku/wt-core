@@ -24,7 +24,8 @@ pub enum StatusFormat {
 pub enum RemoveFormat {
     Human,
     Json,
-    /// `--print-paths`: prints removed_path, repo_root, and branch (one per line).
+    /// Stable legacy `--print-paths`: removed_path, repo_root, and branch
+    /// (exactly three lines). Lifecycle status is exposed by JSON.
     PrintPaths,
 }
 
