@@ -1301,6 +1301,11 @@ pub fn merge_operation_path(repo: &RepoRoot) -> Result<PathBuf> {
     git_path(repo.as_ref(), "wt-core/merge-operation.json")
 }
 
+/// Location of the OS-backed owner lock for mutating merge lifecycles.
+pub fn merge_operation_lock_path(repo: &RepoRoot) -> Result<PathBuf> {
+    git_path(repo.as_ref(), "wt-core/merge-operation.lock")
+}
+
 /// Verify Git has a usable difftool before launching an interactive diff.
 pub fn ensure_difftool_available(path: &Path, tool: Option<&str>) -> Result<()> {
     match tool {

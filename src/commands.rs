@@ -1334,12 +1334,18 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
         Some(branch) => Some(branch),
         None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge", inspect)?,
     };
-    let preflight =
-        worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), inspect)?;
-
     if inspect {
+        let preflight =
+            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), true)?;
         return print_merge_inspection(&repo, &preflight, fmt);
     }
+
+    // Hold ownership before preflight and keep it through Git finalization and
+    // every durable journal/cleanup update. A paused hook therefore blocks all
+    // competing mutators while read-only status remains available.
+    let lifecycle_lock = worktree::acquire_merge_lifecycle_lock(&repo)?;
+    let preflight =
+        worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), false)?;
 
     if fmt == MergeFormat::Human {
         print_merge_preflight(&preflight);
@@ -1351,30 +1357,31 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
     }
 
     let preflight_for_error = preflight.clone();
-    let result = match worktree::merge_with_preflight(&repo, preflight, push, no_cleanup) {
-        Ok(result) => result,
-        Err(failure) => {
-            let refusal = match failure.kind {
-                worktree::MergeFailureKind::ContentConflict => JsonMergeRefusal {
-                    kind: "content".to_string(),
-                    reason: "content_conflict".to_string(),
-                    message: Some("destination content conflicts with the source".to_string()),
-                },
-                worktree::MergeFailureKind::GitFailure => JsonMergeRefusal {
-                    kind: "git".to_string(),
-                    reason: "git_error".to_string(),
-                    message: Some(failure.error.message.clone()),
-                },
-            };
-            return report_merge_failure(
-                &repo,
-                &preflight_for_error,
-                fmt,
-                failure.error,
-                Some(refusal),
-            );
-        }
-    };
+    let result =
+        match worktree::merge_with_preflight(&repo, preflight, push, no_cleanup, &lifecycle_lock) {
+            Ok(result) => result,
+            Err(failure) => {
+                let refusal = match failure.kind {
+                    worktree::MergeFailureKind::ContentConflict => JsonMergeRefusal {
+                        kind: "content".to_string(),
+                        reason: "content_conflict".to_string(),
+                        message: Some("destination content conflicts with the source".to_string()),
+                    },
+                    worktree::MergeFailureKind::GitFailure => JsonMergeRefusal {
+                        kind: "git".to_string(),
+                        reason: "git_error".to_string(),
+                        message: Some(failure.error.message.clone()),
+                    },
+                };
+                return report_merge_failure(
+                    &repo,
+                    &preflight_for_error,
+                    fmt,
+                    failure.error,
+                    Some(refusal),
+                );
+            }
+        };
 
     print_merge_result(&repo, result, fmt, navigation_file.as_deref())
 }

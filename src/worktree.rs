@@ -909,6 +909,13 @@ pub enum SourceHistory {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MergeOperationState {
     schema: u32,
+    /// Stable identity for one merge lifecycle. Journal mutations must never
+    /// cross this boundary, even if a stale process wakes after recovery.
+    #[serde(default)]
+    operation_id: String,
+    /// Monotonic journal generation used as the compare-and-swap version.
+    #[serde(default)]
+    generation: u64,
     phase: MergePhase,
     source: String,
     destination: String,
@@ -1003,9 +1010,13 @@ fn merge_operation_file(repo: &RepoRoot) -> Result<MergeOperationFile> {
     };
 
     match serde_json::from_str::<MergeOperationState>(&contents) {
-        Ok(state) if state.schema == MERGE_OPERATION_SCHEMA => {
+        Ok(state) if state.schema == MERGE_OPERATION_SCHEMA && !state.operation_id.is_empty() => {
             Ok(MergeOperationFile::Valid(Box::new(state)))
         }
+        Ok(state) if state.schema == MERGE_OPERATION_SCHEMA => Ok(MergeOperationFile::Corrupt {
+            path,
+            reason: "managed merge state has no operation identity".to_string(),
+        }),
         Ok(state) => Ok(MergeOperationFile::Corrupt {
             path,
             reason: format!("unsupported state schema {}", state.schema),
@@ -1180,10 +1191,37 @@ fn sync_operation_parent(_parent: &Path) -> Result<()> {
     Ok(())
 }
 
+fn verify_operation_generation(repo: &RepoRoot, expected: &MergeOperationState) -> Result<()> {
+    match merge_operation_file(repo)? {
+        MergeOperationFile::Valid(current)
+            if current.operation_id == expected.operation_id
+                && current.generation == expected.generation =>
+        {
+            Ok(())
+        }
+        MergeOperationFile::Valid(current) => Err(AppError::conflict(format!(
+            "managed merge state belongs to operation '{}' generation {}; refusing to overwrite operation '{}' generation {}",
+            current.operation_id,
+            current.generation,
+            expected.operation_id,
+            expected.generation
+        ))),
+        MergeOperationFile::Missing => Err(AppError::conflict(
+            "managed merge state disappeared before its compare-and-swap update; preserving the Git operation"
+                .to_string(),
+        )),
+        MergeOperationFile::Corrupt { path, reason } => Err(AppError::conflict(format!(
+            "managed merge state at '{}' changed before its compare-and-swap update ({reason}); preserving it",
+            path.display()
+        ))),
+    }
+}
+
 fn write_operation_state_inner(
     repo: &RepoRoot,
     state: &MergeOperationState,
     create_only: bool,
+    expected: Option<&MergeOperationState>,
 ) -> Result<()> {
     let path = git::merge_operation_path(repo)?;
     let parent = path.parent().ok_or_else(|| {
@@ -1193,6 +1231,9 @@ fn write_operation_state_inner(
         ))
     })?;
     operation_state::ensure_private_directory(parent)?;
+    if let Some(expected) = expected {
+        verify_operation_generation(repo, expected)?;
+    }
     let bytes = serde_json::to_vec_pretty(state).map_err(|error| {
         AppError::invariant(format!("cannot encode managed merge state: {error}"))
     })?;
@@ -1236,30 +1277,42 @@ fn write_operation_state_inner(
             }
         },
         false => {
-            match fs::symlink_metadata(&path) {
-                Ok(_) => operation_state::ensure_private_file(&path)?,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
+            // Recheck immediately before replacement. The lifecycle lock is
+            // the synchronization boundary, while this generation check makes
+            // stale callers fail closed even if they bypass that boundary.
+            if let Some(expected) = expected {
+                verify_operation_generation(repo, expected).map_err(|error| {
                     let _ = fs::remove_file(&temp);
-                    return Err(AppError::git(format!(
-                        "cannot inspect managed merge state '{}': {error}",
-                        path.display()
-                    )));
-                }
+                    error
+                })?;
             }
-            operation_state::replace_existing(&temp, &path)?;
+            if let Err(error) = operation_state::ensure_private_file(&path) {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
+            if let Err(error) = operation_state::replace_existing(&temp, &path) {
+                let _ = fs::remove_file(&temp);
+                return Err(error);
+            }
         }
     }
     sync_operation_parent(parent)?;
     Ok(())
 }
 
-fn write_operation_state(repo: &RepoRoot, state: &MergeOperationState) -> Result<()> {
-    write_operation_state_inner(repo, state, false)
+fn write_operation_state(repo: &RepoRoot, state: &mut MergeOperationState) -> Result<()> {
+    let next_generation = state.generation.checked_add(1).ok_or_else(|| {
+        AppError::invariant("managed merge state generation exhausted".to_string())
+    })?;
+    let mut next = state.clone();
+    next.generation = next_generation;
+    write_operation_state_inner(repo, &next, false, Some(state))?;
+    state.generation = next_generation;
+    Ok(())
 }
 
 fn create_operation_state(repo: &RepoRoot, state: &MergeOperationState) -> Result<()> {
-    write_operation_state_inner(repo, state, true)
+    write_operation_state_inner(repo, state, true, None)
 }
 
 /// Remove the operation record only after atomically detaching and verifying
@@ -1304,8 +1357,20 @@ fn clear_operation_state(repo: &RepoRoot, expected: &MergeOperationState) -> Res
         .as_deref()
         .ok()
         .and_then(|value| serde_json::from_str::<MergeOperationState>(value).ok());
-    if current.as_ref() != Some(expected) {
-        let _ = (!path.exists()).then(|| fs::rename(&tombstone, &path));
+    let matches_generation = current.as_ref().is_some_and(|current| {
+        current.operation_id == expected.operation_id && current.generation == expected.generation
+    });
+    if !matches_generation {
+        match path.exists() {
+            false => {
+                let _ = fs::rename(&tombstone, &path);
+            }
+            true => {
+                // The canonical path is another operation. Remove only the
+                // detached record that we already proved was not its journal.
+                let _ = fs::remove_file(&tombstone);
+            }
+        }
         return Err(AppError::conflict(
             "managed merge state changed while the operation was running; refusing to clear the replacement".to_string(),
         ));
@@ -2054,9 +2119,12 @@ fn merge_state_from_preflight(
     destination_head: String,
     push: bool,
     no_cleanup: bool,
+    operation_id: &str,
 ) -> MergeOperationState {
     MergeOperationState {
         schema: MERGE_OPERATION_SCHEMA,
+        operation_id: operation_id.to_string(),
+        generation: 0,
         phase: MergePhase::Starting,
         source: preflight.source.clone(),
         destination: preflight.destination.clone(),
@@ -2087,6 +2155,16 @@ fn merge_state_from_preflight(
             ..MergeProgress::default()
         },
     }
+}
+
+/// Acquire the one owner allowed to mutate a repository's merge lifecycle.
+///
+/// Read-only status intentionally does not acquire this lock.
+pub(crate) fn acquire_merge_lifecycle_lock(
+    repo: &RepoRoot,
+) -> Result<operation_state::MergeLifecycleLock> {
+    let path = git::merge_operation_lock_path(repo)?;
+    operation_state::acquire_merge_lifecycle_lock(&path)
 }
 
 fn load_valid_merge_state(repo: &RepoRoot) -> Result<(PathBuf, MergeOperationState)> {
@@ -2407,11 +2485,12 @@ fn continue_merge_commit(
 
 /// Continue a managed merge after its conflicts have been resolved.
 pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
+    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     let (_, mut state) = load_valid_merge_state(repo)?;
     if reconcile_operation_progress(repo, &mut state)? {
         // A prior action or the commit itself may have completed before its
         // progress write. Persist reconciliation before taking another action.
-        write_operation_state(repo, &state)?;
+        write_operation_state(repo, &mut state)?;
     }
     let report = merge_operation_status(repo)?;
     if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
@@ -2442,6 +2521,7 @@ pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
 
 /// Abort a managed merge and clear only the matching operation record.
 pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
+    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     let (_, state) = load_valid_merge_state(repo)?;
     let report = merge_operation_status(repo)?;
     if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
@@ -2533,11 +2613,12 @@ fn handle_merge_failure(
 }
 
 /// Run a merge using an already collected preflight.
-pub fn merge_with_preflight(
+pub(crate) fn merge_with_preflight(
     repo: &RepoRoot,
     preflight: MergePreflight,
     push: bool,
     no_cleanup: bool,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> std::result::Result<MergeResult, MergeFailure> {
     if let Some(refusal) = &preflight.refusal {
         return Err(MergeFailure {
@@ -2575,8 +2656,14 @@ pub fn merge_with_preflight(
             });
         }
     };
-    let mut operation =
-        merge_state_from_preflight(&preflight, source_head, destination_head, push, no_cleanup);
+    let mut operation = merge_state_from_preflight(
+        &preflight,
+        source_head,
+        destination_head,
+        push,
+        no_cleanup,
+        lifecycle_lock.operation_id(),
+    );
 
     // Never overwrite an operation that may require recovery. This also
     // keeps a stale or corrupt record from being silently detached from the
@@ -2634,7 +2721,7 @@ pub fn merge_with_preflight(
         })?;
     operation.phase = MergePhase::Committed;
     operation.completed_destination_head = Some(expected);
-    if let Err(error) = write_operation_state(repo, &operation) {
+    if let Err(error) = write_operation_state(repo, &mut operation) {
         return Err(MergeFailure {
             kind: MergeFailureKind::GitFailure,
             error: AppError::git(format!(

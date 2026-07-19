@@ -1,6 +1,8 @@
 mod fixtures;
 
 use std::process::Command as StdCommand;
+#[cfg(unix)]
+use std::process::Stdio;
 
 use assert_cmd::Command;
 use predicates::prelude::*;
@@ -518,6 +520,182 @@ fn merge_state_and_directory_are_private() {
         .assert()
         .failure()
         .stdout(predicate::str::contains("insecure permissions"));
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_lifecycle_lock_blocks_hook_race_but_allows_read_only_status() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/paused", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-paused");
+    commit_file(&source, "paused.txt", "paused", "paused source");
+    wt_core()
+        .args(["add", "feature/new", "--repo", &repo_str])
+        .assert()
+        .success();
+    let new_source = find_worktree_dir(&repo.path(), "feature-new");
+    commit_file(&new_source, "new.txt", "new", "new source");
+
+    let entered = repo.path().join("post-merge-entered");
+    let release = repo.path().join("post-merge-release");
+    install_hook(
+        &repo,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            shell_quote(&entered.display().to_string()),
+            shell_quote(&release.display().to_string()),
+        ),
+    );
+
+    let mut original = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+    original
+        .args(["merge", "feature/paused", "--repo", &repo_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let original = original.spawn().expect("paused merge should start");
+    wait_for_file(&entered);
+
+    let status = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run while the hook owns the lifecycle");
+    assert!(
+        status.status.success(),
+        "status should remain read-only: {}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    let continue_output = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .output()
+        .expect("continue should run");
+    assert!(!continue_output.status.success());
+    assert!(String::from_utf8_lossy(&continue_output.stderr).contains("busy"));
+    assert!(String::from_utf8_lossy(&continue_output.stderr).contains("--status"));
+
+    let abort_output = wt_core()
+        .args(["merge", "--abort", "--repo", &repo_str])
+        .output()
+        .expect("abort should run");
+    assert!(!abort_output.status.success());
+    assert!(String::from_utf8_lossy(&abort_output.stderr).contains("busy"));
+
+    let new_merge_output = wt_core()
+        .args(["merge", "feature/new", "--repo", &repo_str])
+        .output()
+        .expect("new merge should run");
+    assert!(!new_merge_output.status.success());
+    assert!(String::from_utf8_lossy(&new_merge_output.stderr).contains("busy"));
+
+    std::fs::write(&release, "release\n").expect("release paused hook");
+    let output = original
+        .wait_with_output()
+        .expect("original merge should finish after hook release");
+    assert!(
+        output.status.success(),
+        "original merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+    assert!(!git_path(&repo.path(), "MERGE_HEAD").exists());
+    assert!(!source.exists());
+    assert!(new_source.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/death", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-death");
+    commit_file(&source, "death.txt", "death", "death source");
+
+    let entered = repo.path().join("post-merge-death-entered");
+    let release = repo.path().join("post-merge-death-release");
+    install_hook(
+        &repo,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            shell_quote(&entered.display().to_string()),
+            shell_quote(&release.display().to_string()),
+        ),
+    );
+
+    let mut original = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+    original
+        .args(["merge", "feature/death", "--repo", &repo_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut original = original.spawn().expect("merge should start");
+    wait_for_file(&entered);
+    original.kill().expect("owner should be terminable");
+
+    // Git and its hook retain the inherited lifecycle lock after the owner
+    // dies. Releasing the hook first must not let continuation race Git's
+    // finalization; it may only recover after the child has exited.
+    let busy = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .output()
+        .expect("continuation should run");
+    assert!(!busy.status.success());
+    assert!(String::from_utf8_lossy(&busy.stderr).contains("busy"));
+
+    std::fs::write(&release, "release\n").expect("release orphaned hook");
+    let _ = original.wait_with_output();
+
+    let mut recovered = None;
+    for _ in 0..100 {
+        let output = wt_core()
+            .args(["merge", "--continue", "--repo", &repo_str])
+            .output()
+            .expect("recovery continuation should run");
+        if output.status.success() {
+            recovered = Some(output);
+            break;
+        }
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("busy"),
+            "unexpected recovery failure: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        sleep(Duration::from_millis(20));
+    }
+    assert!(recovered.is_some(), "lifecycle lock did not recover");
+    assert!(!repo
+        .path()
+        .join(".git/wt-core/merge-operation.json")
+        .exists());
+    assert!(!source.exists());
+}
+
+#[cfg(unix)]
+fn wait_for_file(path: &std::path::Path) {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    for _ in 0..200 {
+        if path.is_file() {
+            return;
+        }
+        sleep(Duration::from_millis(10));
+    }
+    panic!("timed out waiting for {}", path.display());
 }
 
 #[cfg(unix)]

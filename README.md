@@ -224,6 +224,14 @@ identity, branch heads, or Git's merge marker no longer match the record,
 wt-core refuses mutation and prints recovery guidance rather than selecting a
 replacement by branch name.
 
+Only one mutating merge lifecycle may own a repository at a time. An
+OS-backed lock is held from preflight through Git subprocess finalization and
+all durable journal/cleanup updates; its lock state is released safely by the
+OS after process death. A live owner makes a new merge, `--continue`, or
+`--abort` fail with recovery guidance, while `--status` remains read-only.
+Journal updates also compare the operation identity and generation before
+replacement or deletion, so a stale process cannot overwrite a newer journal.
+
 The Bash, Zsh, Fish, and Nushell bindings pass `--status`, `--continue`, and
 `--abort` through without applying legacy navigation or path-only parsing.
 JSON output remains available for all three lifecycle commands.
