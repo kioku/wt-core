@@ -6,7 +6,7 @@ use crate::domain::{self, BranchName, WorktreeStatsStatus};
 use crate::error::{AppError, Result};
 use crate::git;
 use crate::output::{
-    find_current_worktree, print_json, JsonDoctorResponse, JsonListResponse,
+    find_current_worktree, print_json, write_navigation_file, JsonDoctorResponse, JsonListResponse,
     JsonMaterializeResponse, JsonMaterializeTimings, JsonMergeResponse, JsonPruneDryRunEntry,
     JsonPruneDryRunResponse, JsonPruneExecuteResponse, JsonPrunedEntry, JsonResponse,
     JsonSkippedEntry, MergeFormat, NavigationFormat, PruneFormat, RemoveFormat, StatusFormat,
@@ -53,11 +53,13 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
             print_paths,
+            navigation_file,
         } => cmd_remove(
             branch.as_deref().map(BranchName::new),
             force,
             repo,
             remove_fmt(json, print_paths),
+            navigation_file.as_deref(),
         ),
         Command::Merge {
             branch,
@@ -67,6 +69,7 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
             print_paths,
+            navigation_file,
         } => cmd_merge(
             branch.as_deref().map(BranchName::new),
             into,
@@ -74,6 +77,7 @@ pub fn run(cli: Cli) -> Result<()> {
             no_cleanup,
             repo,
             merge_fmt(json, print_paths),
+            navigation_file.as_deref(),
         ),
         Command::Materialize {
             repo_slug,
@@ -1058,6 +1062,7 @@ fn cmd_merge(
     no_cleanup: bool,
     repo: Option<PathBuf>,
     fmt: MergeFormat,
+    navigation_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
 
@@ -1081,6 +1086,17 @@ fn cmd_merge(
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
+
+    if let Some(Err(error)) = navigation_file.map(|path| {
+        write_navigation_file(
+            path,
+            result.cleaned_up,
+            result.removed_path.as_deref(),
+            &result.repo_root,
+        )
+    }) {
+        eprintln!("warning: could not write navigation metadata: {error}");
+    }
 
     match fmt {
         MergeFormat::PrintPaths => {
@@ -1134,6 +1150,7 @@ fn cmd_remove(
     force: bool,
     repo: Option<PathBuf>,
     fmt: RemoveFormat,
+    navigation_file: Option<&std::path::Path>,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
 
@@ -1147,6 +1164,12 @@ fn cmd_remove(
     let removed_str = result.removed_path.display().to_string();
     let root_str = result.repo_root.display().to_string();
     let branch_name = &result.branch;
+
+    if let Some(Err(error)) = navigation_file.map(|path| {
+        write_navigation_file(path, true, Some(&result.removed_path), &result.repo_root)
+    }) {
+        eprintln!("warning: could not write navigation metadata: {error}");
+    }
 
     match fmt {
         RemoveFormat::PrintPaths => {

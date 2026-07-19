@@ -17,6 +17,24 @@ def --wrapped wt [
     }
 }
 
+# Return true only when child is the parent itself or a descendant directory.
+def path-is-within [child: string parent: string] {
+    try { $child | path relative-to $parent; true } catch { false }
+}
+
+# Read the NUL-delimited navigation record written by wt-core. This keeps
+# paths out of JSON parsing and preserves quotes and backslashes verbatim.
+def read-navigation [file: path] {
+    open --raw $file
+    | bytes split 0x[00]
+    | each { |field| $field | decode utf-8 }
+}
+
+def navigation-file [] {
+    let tmpdir = ($env.TMPDIR? | default "/tmp")
+    ^mktemp $"($tmpdir)/wt-core-nav.XXXXXX" | str trim
+}
+
 # List all worktrees
 export def "wt list" [
     --repo: path        # Repository path (defaults to cwd)
@@ -32,7 +50,8 @@ export def "wt list" [
 
     let full_args = (build-args $args $repo $json false)
     if $json {
-        ^wt-core ...$full_args | from json
+        let output = try { ^wt-core ...$full_args } catch { return }
+        $output
     } else {
         ^wt-core ...$full_args
     }
@@ -50,7 +69,8 @@ export def --env "wt add" [
     if $json {
         mut args = (build-args ["add" $branch] $repo true false)
         if $base != null { $args = ($args | append ["--base" $base]) }
-        ^wt-core ...$args | from json
+        let output = try { ^wt-core ...$args } catch { return }
+        $output
     } else {
         mut args = (build-args ["add" $branch] $repo false true)
         if $base != null { $args = ($args | append ["--base" $base]) }
@@ -72,7 +92,8 @@ export def --env "wt go" [
 
     if $json {
         let full_args = (build-args $args $repo true false)
-        ^wt-core ...$full_args | from json
+        let output = try { ^wt-core ...$full_args } catch { return }
+        $output
     } else {
         # --print-cd-path works with the interactive picker:
         # the picker UI renders on stderr/tty, the path goes to stdout.
@@ -96,17 +117,49 @@ export def --env "wt remove" [
     if $force { $args = ($args | append "--force") }
 
     if $json {
-        # --json: machine output, no interactive picker.
-        let full_args = (build-args $args $repo true false)
-        let result = (^wt-core ...$full_args | from json)
-
-        if ($result.ok) and ($result.removed_path? != null) {
-            if ($cwd_before | str starts-with $result.removed_path) {
-                cd $result.repo_root
+        # Run from the repository root so removing the current worktree does
+        # not invalidate Nushell's own cwd while it captures stdout.
+        let command_repo = if $repo != null {
+            $repo | path expand
+        } else {
+            try {
+                ^git rev-parse --path-format=absolute --git-common-dir
+                | str trim
+                | path dirname
+            } catch { return }
+        }
+        if $branch == null {
+            let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
+            if $inferred_branch != "" {
+                $args = ($args | append $inferred_branch)
             }
         }
-
-        $result
+        cd $command_repo
+        let effective_repo = if $repo != null { $command_repo } else { null }
+        let nav_file = (navigation-file)
+        let full_args = (build-args $args $effective_repo true false | append ["--navigation-file" $nav_file])
+        let output = try { ^wt-core ...$full_args } catch {
+            cd $cwd_before
+            ^rm -f $nav_file
+            return
+        }
+        let navigation = if ($nav_file | path exists) {
+            try { read-navigation $nav_file } catch { [] }
+        } else {
+            []
+        }
+        if (
+            (($navigation | get 0 | default "") == "reset")
+            and (($navigation | get 1 | default "") != "")
+            and (($navigation | get 2 | default "") != "")
+            and (path-is-within $cwd_before ($navigation | get 1))
+        ) {
+            cd ($navigation | get 2)
+        } else {
+            cd $cwd_before
+        }
+        ^rm -f $nav_file
+        $output
     } else {
         # --print-paths: allows the interactive picker to render on
         # stderr/tty while paths go to stdout (same pattern as `go`
@@ -123,7 +176,7 @@ export def --env "wt remove" [
         let repo_root = ($lines | get 1)
         let branch_name = ($lines | get 2)
 
-        if ($cwd_before | str starts-with $removed_path) {
+        if (path-is-within $cwd_before $removed_path) {
             cd $repo_root
         }
 
@@ -147,16 +200,49 @@ export def --env "wt merge" [
     if $no_cleanup { $args = ($args | append "--no-cleanup") }
 
     if $json {
-        let full_args = (build-args $args $repo true false)
-        let result = (^wt-core ...$full_args | from json)
-
-        if ($result.ok) and ($result.removed_path? != null) {
-            if ($cwd_before | str starts-with ($result.removed_path)) {
-                cd $result.repo_root
+        # Run from the repository root so cleanup cannot invalidate Nushell's
+        # cwd while it captures stdout.
+        let command_repo = if $repo != null {
+            $repo | path expand
+        } else {
+            try {
+                ^git rev-parse --path-format=absolute --git-common-dir
+                | str trim
+                | path dirname
+            } catch { return }
+        }
+        if $branch == null {
+            let inferred_branch = try { ^git branch --show-current | str trim } catch { "" }
+            if $inferred_branch != "" {
+                $args = ($args | append $inferred_branch)
             }
         }
-
-        $result
+        cd $command_repo
+        let effective_repo = if $repo != null { $command_repo } else { null }
+        let nav_file = (navigation-file)
+        let full_args = (build-args $args $effective_repo true false | append ["--navigation-file" $nav_file])
+        let output = try { ^wt-core ...$full_args } catch {
+            cd $cwd_before
+            ^rm -f $nav_file
+            return
+        }
+        let navigation = if ($nav_file | path exists) {
+            try { read-navigation $nav_file } catch { [] }
+        } else {
+            []
+        }
+        if (
+            (($navigation | get 0 | default "") == "reset")
+            and (($navigation | get 1 | default "") != "")
+            and (($navigation | get 2 | default "") != "")
+            and (path-is-within $cwd_before ($navigation | get 1))
+        ) {
+            cd ($navigation | get 2)
+        } else {
+            cd $cwd_before
+        }
+        ^rm -f $nav_file
+        $output
     } else {
         let full_args = (build-args $args $repo false false | append "--print-paths")
         let output = try { ^wt-core ...$full_args } catch { return }
@@ -169,7 +255,7 @@ export def --env "wt merge" [
         let pushed = ($lines | get 5)
 
         if $cleaned_up == "true" and $removed_path != "" {
-            if ($cwd_before | str starts-with $removed_path) {
+            if (path-is-within $cwd_before $removed_path) {
                 cd $repo_root
             }
         }
@@ -191,7 +277,8 @@ export def "wt doctor" [
 ] {
     let args = (build-args ["doctor"] $repo $json false)
     if $json {
-        ^wt-core ...$args | from json
+        let output = try { ^wt-core ...$args } catch { return }
+        $output
     } else {
         ^wt-core ...$args
     }

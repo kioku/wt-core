@@ -252,10 +252,14 @@ JSON envelope example (`merge`):
 
 ## Shell Integration
 
-Each binding wraps the binary and handles `cd` in the parent shell. A
-caller-supplied `--json` is passed through unchanged, so it returns the JSON
-document and does not change the shell's cwd. Without `--json`, bindings use
-the legacy path output internally and preserve the normal `cd` behavior.
+The direct `wt-core` CLI never changes its caller's cwd. Each binding wraps the
+binary and may `cd` in the parent shell: normal `add`/`go` use the legacy path
+output to enter a worktree, while normal `remove`/`merge` return to the
+repository root when cleanup removes the current worktree. With `--json`,
+`add` and `go` leave cwd unchanged; JSON `remove` and `merge` still perform that
+safe reset when needed. The JSON document remains raw on stdout (including in
+Nushell); pipe it through Nushell's `from json` explicitly when structured
+values are desired. Warnings and diagnostics remain on stderr.
 
 You can either source files from `bindings/` directly, or generate them with
 `wt-core init <shell>`.

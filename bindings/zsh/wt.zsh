@@ -2,6 +2,11 @@
 # Source this file in your .zshrc:
 #   source path/to/bindings/zsh/wt.zsh
 
+# Match complete path components, not merely a textual prefix.
+wt__path_is_within() {
+    [[ "$1" == "$2" || "$1" == "$2"/* ]]
+}
+
 wt() {
     emulate -L zsh
 
@@ -33,13 +38,15 @@ wt() {
                 return $?
             fi
 
-            local target
-            target=$(wt-core add "$@" --print-cd-path 2>/dev/null)
-            if [[ $? -eq 0 ]] && [[ -n "$target" ]]; then
+            local target rc
+            # Keep stdout private for the path while leaving stderr inherited so
+            # setup recommendations and warnings remain visible on success.
+            target=$(wt-core add "$@" --print-cd-path)
+            rc=$?
+            if [[ $rc -eq 0 ]] && [[ -n "$target" ]]; then
                 cd "$target" || return 1
             else
-                wt-core add "$@"
-                return $?
+                return $rc
             fi
             ;;
         go)
@@ -99,26 +106,31 @@ wt() {
             done
 
             if [[ "$want_json" == true ]]; then
-                local cwd_before="${PWD}"
-                local output
-                output=$(wt-core remove "$@")
-                local rc=$?
+                local cwd_before nav_file output rc
+                cwd_before=$(pwd -P)
+                nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                output=$(wt-core remove "$@" --navigation-file "$nav_file")
+                rc=$?
                 if [[ $rc -eq 0 ]]; then
-                    # Extract paths from JSON for cd-out-of-removed-worktree logic
-                    local removed_path repo_root
-                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
-                    repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                    if [[ -n "$removed_path" ]] && [[ -n "$repo_root" ]]; then
-                        if [[ "$cwd_before" == "${removed_path}"* ]]; then
-                            cd "$repo_root" || true
-                        fi
+                    local nav_fd nav_action nav_removed nav_root
+                    exec {nav_fd}<"$nav_file"
+                    IFS= read -r -d $'\0' nav_action <&$nav_fd
+                    IFS= read -r -d $'\0' nav_removed <&$nav_fd
+                    IFS= read -r -d $'\0' nav_root <&$nav_fd
+                    exec {nav_fd}<&-
+                    if [[ "$nav_action" == reset ]] && [[ -n "$nav_removed" ]] \
+                        && [[ -n "$nav_root" ]] \
+                        && wt__path_is_within "$cwd_before" "$nav_removed"; then
+                        cd "$nav_root" || true
                     fi
                 fi
+                rm -f "$nav_file"
                 printf '%s\n' "$output"
                 return $rc
             fi
 
-            local cwd_before="${PWD}"
+            local cwd_before
+            cwd_before=$(pwd -P)
             # --print-paths outputs three lines: removed_path, repo_root, branch.
             # stderr is left connected to the terminal so the interactive picker
             # (if triggered) renders correctly and errors are visible.
@@ -130,7 +142,7 @@ wt() {
                 removed_path=$(printf '%s\n' "$result" | sed -n '1p')
                 repo_root=$(printf '%s\n' "$result" | sed -n '2p')
                 branch=$(printf '%s\n' "$result" | sed -n '3p')
-                if [[ "$cwd_before" == "${removed_path}"* ]]; then
+                if wt__path_is_within "$cwd_before" "$removed_path"; then
                     cd "$repo_root" || true
                 fi
                 echo "Removed worktree and branch '${branch}'"
@@ -159,24 +171,31 @@ wt() {
             done
 
             if [[ "$want_json" == true ]]; then
-                local cwd_before="${PWD}"
-                local output
-                output=$(wt-core merge "$@")
-                local rc=$?
+                local cwd_before nav_file output rc
+                cwd_before=$(pwd -P)
+                nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                output=$(wt-core merge "$@" --navigation-file "$nav_file")
+                rc=$?
                 if [[ $rc -eq 0 ]]; then
-                    local removed_path
-                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
-                    if [[ -n "$removed_path" ]] && [[ "$cwd_before" == "${removed_path}"* ]]; then
-                        local repo_root
-                        repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                        cd "$repo_root" || true
+                    local nav_fd nav_action nav_removed nav_root
+                    exec {nav_fd}<"$nav_file"
+                    IFS= read -r -d $'\0' nav_action <&$nav_fd
+                    IFS= read -r -d $'\0' nav_removed <&$nav_fd
+                    IFS= read -r -d $'\0' nav_root <&$nav_fd
+                    exec {nav_fd}<&-
+                    if [[ "$nav_action" == reset ]] && [[ -n "$nav_removed" ]] \
+                        && [[ -n "$nav_root" ]] \
+                        && wt__path_is_within "$cwd_before" "$nav_removed"; then
+                        cd "$nav_root" || true
                     fi
                 fi
+                rm -f "$nav_file"
                 printf '%s\n' "$output"
                 return $rc
             fi
 
-            local cwd_before="${PWD}"
+            local cwd_before
+            cwd_before=$(pwd -P)
             # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
             local result
             result=$(wt-core merge "$@" --print-paths)
@@ -190,7 +209,7 @@ wt() {
                 removed_path=$(printf '%s\n' "$result" | sed -n '5p')
                 pushed=$(printf '%s\n' "$result" | sed -n '6p')
                 if [[ "$cleaned_up" == "true" ]] && [[ -n "$removed_path" ]]; then
-                    if [[ "$cwd_before" == "${removed_path}"* ]]; then
+                    if wt__path_is_within "$cwd_before" "$removed_path"; then
                         cd "$repo_root" || true
                     fi
                 fi

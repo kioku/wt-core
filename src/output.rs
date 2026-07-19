@@ -394,6 +394,33 @@ pub struct JsonSetupResponse {
     pub gitignore_updated: bool,
 }
 
+/// Write the wrapper navigation side channel without involving JSON parsing.
+///
+/// The record is NUL-delimited as `action`, `removed_path`, and `repo_root`.
+/// Paths are written as their display representation, so shell bindings can
+/// read each field verbatim even when it contains JSON-significant characters.
+/// `action` is `reset` when the parent shell should leave the removed
+/// worktree, and `none` otherwise.
+pub fn write_navigation_file(
+    file: &Path,
+    reset: bool,
+    removed_path: Option<&Path>,
+    repo_root: &Path,
+) -> crate::error::Result<()> {
+    let action = if reset { "reset" } else { "none" };
+    let removed = removed_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let record = format!("{action}\0{removed}\0{}\0", repo_root.display());
+    std::fs::write(file, record.as_bytes()).map_err(|error| {
+        crate::error::AppError::git(format!(
+            "could not write navigation metadata to {}: {error}",
+            file.display()
+        ))
+    })?;
+    Ok(())
+}
+
 /// Serialize a value as a compact single-line JSON object to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(

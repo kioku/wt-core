@@ -267,6 +267,42 @@ fn remove_json_includes_removed_path() {
 }
 
 #[test]
+fn remove_json_writes_nul_delimited_navigation_metadata() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "navigation-protocol", "--repo", &repo_str])
+        .assert()
+        .success();
+    let removed_path = fixtures::find_worktree_dir(&repo.path(), "navigation-protocol");
+    let navigation_file = tempfile::NamedTempFile::new().expect("navigation file");
+
+    wt_core()
+        .args([
+            "remove",
+            "navigation-protocol",
+            "--repo",
+            &repo_str,
+            "--json",
+            "--navigation-file",
+            &navigation_file.path().display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let expected = format!(
+        "reset\0{}\0{}\0",
+        removed_path.display(),
+        repo.path().display()
+    );
+    assert_eq!(
+        std::fs::read(navigation_file.path()).expect("read navigation file"),
+        expected.as_bytes()
+    );
+}
+
+#[test]
 fn remove_print_paths_returns_three_lines() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();

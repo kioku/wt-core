@@ -108,6 +108,10 @@ pub enum Command {
         /// When combined with --json, JSON output takes precedence.
         #[arg(long)]
         print_paths: bool,
+
+        /// Write wrapper navigation metadata to a private side channel.
+        #[arg(long, hide = true, value_name = "PATH")]
+        navigation_file: Option<PathBuf>,
     },
 
     /// Merge a worktree's branch into a checked-out target and clean up
@@ -140,6 +144,10 @@ pub enum Command {
         /// When combined with --json, JSON output takes precedence.
         #[arg(long)]
         print_paths: bool,
+
+        /// Write wrapper navigation metadata to a private side channel.
+        #[arg(long, hide = true, value_name = "PATH")]
+        navigation_file: Option<PathBuf>,
     },
 
     /// Materialize an explicit detached checkout at a workspace path

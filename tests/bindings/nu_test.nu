@@ -45,10 +45,10 @@ let wt_path = $env.PWD
 # ── JSON output selection ────────────────────────────────────────────
 cd $"($work)/repo"
 let json_add = (wt add feat-json --json)
-if ($json_add.cd_path? != null) {
-    pass "wt add --json: returns one JSON document"
+if ($json_add | str contains '"cd_path"') {
+    pass "wt add --json: returns raw JSON stdout"
 } else {
-    fail "wt add --json: expected JSON with cd_path"
+    fail "wt add --json: expected raw JSON with cd_path"
 }
 if $env.PWD == ($"($work)/repo" | path expand) {
     pass "wt add --json: cwd unchanged"
@@ -95,6 +95,95 @@ if not ($wt_path | path exists) {
     pass "wt remove: worktree directory deleted"
 } else {
     fail $"wt remove: ($wt_path) still exists"
+}
+
+# ── JSON/navigation matrix ───────────────────────────────────────────
+# Use a repository path containing JSON-significant characters.
+let matrix_repo = ($work | path join 'repo"quote\slash')
+^git init $matrix_repo o+e>| ignore
+cd $matrix_repo
+let matrix_root = ($env.PWD | path expand)
+if not (path-is-within ($matrix_root | path join ".worktrees/app-copy") ($matrix_root | path join ".worktrees/app")) {
+    pass "matrix containment: sibling prefix is not a descendant"
+} else {
+    fail "matrix containment: sibling prefix was treated as a descendant"
+}
+^git config user.name "test"
+^git config user.email "test@test.com"
+^git commit --allow-empty -m "initial" o+e>| ignore
+^touch ($matrix_repo | path join "pnpm-workspace.yaml")
+
+let matrix_add = (wt add matrix-json --json)
+if ($matrix_add | str contains '"cd_path"') {
+    pass "matrix add --json: raw JSON stdout"
+} else {
+    fail "matrix add --json: missing cd_path"
+}
+if ($matrix_add | str contains 'quote\\slash') {
+    pass "matrix add --json: escaped path preserved"
+} else {
+    fail "matrix add --json: escaped path was lost"
+}
+if ($env.PWD | path expand) == $matrix_root {
+    pass "matrix add --json: cwd unchanged"
+} else {
+    fail "matrix add --json: cwd changed"
+}
+
+let matrix_go = (wt go matrix-json --json)
+if ($matrix_go | str contains '"event":"switch"') {
+    pass "matrix go --json: command fields preserved"
+} else {
+    fail "matrix go --json: missing switch event"
+}
+cd $matrix_root
+wt remove matrix-json | ignore
+
+let nu_stderr = ($work | path join "nu-add.stderr")
+let _ = (wt add matrix-diagnostics err> $nu_stderr)
+if (open $nu_stderr | str contains "pnpm install --prefer-offline --frozen-lockfile") {
+    pass "matrix add: successful stderr diagnostics preserved"
+} else {
+    fail "matrix add: stderr diagnostics were discarded"
+}
+wt remove matrix-diagnostics | ignore
+
+wt add matrix-remove | ignore
+let matrix_remove_file = ($work | path join "nu-remove.json")
+wt remove matrix-remove --json | save --force $matrix_remove_file
+let matrix_remove = (open --raw $matrix_remove_file | decode utf-8)
+if ($matrix_remove | str contains '"removed_path"') {
+    pass "matrix remove --json: command fields preserved"
+} else {
+    fail "matrix remove --json: missing removed_path"
+}
+if ($matrix_remove | str contains 'quote\\slash') {
+    pass "matrix remove --json: escaped path preserved"
+} else {
+    fail "matrix remove --json: escaped path was lost"
+}
+if ($env.PWD | path expand) == $matrix_root {
+    pass "matrix remove --json: cwd reset to repository root"
+} else {
+    fail "matrix remove --json: cwd was not reset"
+}
+
+wt add matrix-merge | ignore
+"merge" | save --force merge.txt
+^git add merge.txt
+^git commit -m "merge" o+e>| ignore
+let matrix_merge_file = ($work | path join "nu-merge.json")
+wt merge matrix-merge --json | save --force $matrix_merge_file
+let matrix_merge = (open --raw $matrix_merge_file | decode utf-8)
+if ($matrix_merge | str contains '"cleaned_up":true') {
+    pass "matrix merge --json: command fields preserved"
+} else {
+    fail "matrix merge --json: missing cleanup field"
+}
+if ($env.PWD | path expand) == $matrix_root {
+    pass "matrix merge --json: cwd reset to repository root"
+} else {
+    fail "matrix merge --json: cwd was not reset"
 }
 
 cd /tmp

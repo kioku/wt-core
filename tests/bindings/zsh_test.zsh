@@ -94,4 +94,86 @@ wt remove feat-one 2>&1
     && pass "wt remove: worktree directory deleted" \
     || fail "wt remove: $WT_PATH still exists"
 
+# ── JSON/navigation matrix ───────────────────────────────────────────
+MATRIX_REPO="$WORK/repo\"quote\\slash"
+git init "$MATRIX_REPO" >/dev/null 2>&1
+cd "$MATRIX_REPO"
+MATRIX_ROOT="$(pwd -P)"
+if ! wt__path_is_within "$MATRIX_ROOT/.worktrees/app-copy" "$MATRIX_ROOT/.worktrees/app"; then
+    pass "matrix containment: sibling prefix is not a descendant"
+else
+    fail "matrix containment: sibling prefix was treated as a descendant"
+fi
+git config user.name  "test"
+git config user.email "test@test.com"
+git commit --allow-empty -m "initial" >/dev/null 2>&1
+touch pnpm-workspace.yaml
+
+json_add=$(wt add matrix-json --json)
+[[ "$(printf '%s\n' "$json_add" | wc -l)" -eq 1 ]] \
+    && pass "matrix add --json: one raw stdout document" \
+    || fail "matrix add --json: expected one stdout line"
+echo "$json_add" | grep -q '"cd_path"' \
+    && pass "matrix add --json: command fields preserved" \
+    || fail "matrix add --json: missing cd_path"
+echo "$json_add" | grep -Fq 'quote\\slash' \
+    && pass "matrix add --json: escaped path preserved" \
+    || fail "matrix add --json: escaped path was lost"
+[[ "$(pwd -P)" == "$MATRIX_ROOT" ]] \
+    && pass "matrix add --json: cwd unchanged" \
+    || fail "matrix add --json: cwd changed"
+
+json_go=$(wt go matrix-json --json)
+[[ "$(printf '%s\n' "$json_go" | wc -l)" -eq 1 ]] \
+    && pass "matrix go --json: one raw stdout document" \
+    || fail "matrix go --json: expected one stdout line"
+echo "$json_go" | grep -q '"event":"switch"' \
+    && pass "matrix go --json: command fields preserved" \
+    || fail "matrix go --json: missing switch event"
+cd "$MATRIX_ROOT"
+wt remove matrix-json >/dev/null 2>&1
+
+legacy_stderr="$WORK/zsh-add.stderr"
+wt add matrix-diagnostics >/dev/null 2>"$legacy_stderr"
+grep -q 'pnpm install --prefer-offline --frozen-lockfile' "$legacy_stderr" \
+    && pass "matrix add: successful stderr diagnostics preserved" \
+    || fail "matrix add: stderr diagnostics were discarded"
+wt remove matrix-diagnostics >/dev/null 2>&1
+
+wt add matrix-remove >/dev/null 2>&1
+json_remove_file="$WORK/zsh-remove.json"
+wt remove matrix-remove --json >"$json_remove_file"
+json_remove=$(<"$json_remove_file")
+[[ "$(printf '%s\n' "$json_remove" | wc -l)" -eq 1 ]] \
+    && pass "matrix remove --json: one raw stdout document" \
+    || fail "matrix remove --json: expected one stdout line"
+echo "$json_remove" | grep -q '"removed_path"' \
+    && pass "matrix remove --json: command fields preserved" \
+    || fail "matrix remove --json: missing removed_path"
+echo "$json_remove" | grep -Fq 'quote\\slash' \
+    && pass "matrix remove --json: escaped path preserved" \
+    || fail "matrix remove --json: escaped path was lost"
+[[ "$(pwd -P)" == "$MATRIX_ROOT" ]] \
+    && pass "matrix remove --json: cwd reset to repository root" \
+    || fail "matrix remove --json: cwd was not reset"
+
+wt add matrix-merge >/dev/null 2>&1
+printf 'merge\n' > merge.txt
+git add merge.txt
+git commit -m "merge" >/dev/null 2>&1
+json_merge_file="$WORK/zsh-merge.json"
+wt merge matrix-merge --json >"$json_merge_file"
+json_merge=$(<"$json_merge_file")
+[[ "$(printf '%s\n' "$json_merge" | wc -l)" -eq 1 ]] \
+    && pass "matrix merge --json: one raw stdout document" \
+    || fail "matrix merge --json: expected one stdout line"
+echo "$json_merge" | grep -q '"cleaned_up":true' \
+    && pass "matrix merge --json: command fields preserved" \
+    || fail "matrix merge --json: missing cleanup field"
+[[ "$(pwd -P)" == "$MATRIX_ROOT" ]] \
+    && pass "matrix merge --json: cwd reset to repository root" \
+    || fail "matrix merge --json: cwd was not reset"
+
+cd /tmp
+
 echo "All zsh binding tests passed."
