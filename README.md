@@ -112,15 +112,16 @@ wt remove --force          # remove even if dirty, use -D for branch
 ### `wt merge`
 
 Merges a worktree's branch into the auto-detected mainline using
-`--no-ff`, then removes the worktree and branch by default. Use `--into`
-to merge into a different branch that is already checked out in the main
-worktree. Conflicts cause an automatic `merge --abort` to keep the main
-worktree clean.
+`--no-ff`, then removes the source worktree and branch by default. Use
+`--into` to merge into a different branch that is already checked out in the
+main or a linked worktree. The merge and conflict abort run in the destination
+worktree, and conflicts cause an automatic `merge --abort` to keep it clean.
 
 ```
 wt merge                         # merge current worktree's branch
 wt merge feature/auth            # explicit branch
 wt merge feature/auth --into rc  # merge into checked-out branch rc
+wt merge feature/auth --into release/1.0  # destination may be linked
 wt merge --push                  # push target branch to origin after merge
 wt merge --no-cleanup            # keep worktree and branch after merge
 ```
@@ -226,6 +227,7 @@ JSON envelope example (`merge`):
   "message": "merged 'feature/auth' into main",
   "branch": "feature/auth",
   "mainline": "main",
+  "destination_path": "/abs/repo",
   "repo_root": "/abs/repo",
   "cleaned_up": true,
   "removed_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4",

@@ -1097,6 +1097,7 @@ fn cmd_merge(
                 message: format!("merged '{}' into {}", branch_name, result.mainline),
                 branch: branch_name.to_string(),
                 mainline: result.mainline.clone(),
+                destination_path: result.destination_path.display().to_string(),
                 repo_root: root_str,
                 cleaned_up: result.cleaned_up,
                 removed_path: if result.cleaned_up {
@@ -1109,6 +1110,10 @@ fn cmd_merge(
         }
         MergeFormat::Human => {
             println!("Merged '{}' into {}", branch_name, result.mainline);
+            println!(
+                "Destination worktree: {}",
+                result.destination_path.display()
+            );
             if result.cleaned_up {
                 println!("Removed worktree and branch '{}'", branch_name);
             }

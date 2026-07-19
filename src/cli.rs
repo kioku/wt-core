@@ -109,7 +109,7 @@ pub enum Command {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,
 
-        /// Merge into this checked-out branch instead of the detected mainline
+        /// Merge into this branch checked out in the main or a linked worktree
         #[arg(long, value_name = "BRANCH")]
         into: Option<String>,
 

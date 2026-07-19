@@ -212,10 +212,20 @@ pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete a local branch.
+/// Delete a local branch, using the main worktree as the merge base for
+/// Git's safe `-d` check.
 pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Result<()> {
+    delete_branch_at(repo.as_ref(), branch, force)
+}
+
+/// Delete a local branch using `path` as the current worktree context.
+///
+/// The context matters for `git branch -d`: Git checks whether the branch is
+/// merged into the currently checked-out branch. Merge cleanup uses the
+/// destination worktree so linked-target merges satisfy that check.
+pub fn delete_branch_at(path: &Path, branch: &BranchName, force: bool) -> Result<()> {
     let flag = if force { "-D" } else { "-d" };
-    git(&["branch", flag, branch.as_str()], repo.as_ref())?;
+    git(&["branch", flag, branch.as_str()], path)?;
     Ok(())
 }
 
@@ -410,9 +420,10 @@ pub fn set_upstream(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
 
 /// Merge a branch into the current branch using `--no-ff`.
 ///
-/// Must be run from the main worktree (the `repo` root). Returns `Ok(())`
-/// on a clean merge or an error if conflicts arise (or any other git failure).
-pub fn merge_no_ff(repo: &RepoRoot, branch: &str) -> Result<()> {
+/// `path` identifies the worktree whose checked-out branch is the merge
+/// destination. Returns `Ok(())` on a clean merge or an error if conflicts
+/// arise (or any other git failure).
+pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
     git(
         &[
             "merge",
@@ -421,17 +432,17 @@ pub fn merge_no_ff(repo: &RepoRoot, branch: &str) -> Result<()> {
             "-m",
             &format!("Merge branch '{branch}'"),
         ],
-        repo.as_ref(),
+        path,
     )?;
     Ok(())
 }
 
-/// Abort an in-progress merge.
+/// Abort an in-progress merge in the destination worktree.
 ///
 /// Best-effort: if there is no merge to abort, git returns an error that
 /// we silently ignore.
-pub fn merge_abort(repo: &RepoRoot) {
-    let _ = git(&["merge", "--abort"], repo.as_ref());
+pub fn merge_abort(path: &Path) {
+    let _ = git(&["merge", "--abort"], path);
 }
 
 /// Verify Git has a usable difftool before launching an interactive diff.
@@ -640,9 +651,9 @@ fn run_difftool(mut cmd: Cmd) -> Result<()> {
     Ok(())
 }
 
-/// Push a branch to `origin`.
-pub fn push(repo: &RepoRoot, branch: &str) -> Result<()> {
-    git(&["push", "origin", branch], repo.as_ref())?;
+/// Push a branch to `origin` from the worktree where it is checked out.
+pub fn push(path: &Path, branch: &str) -> Result<()> {
+    git(&["push", "origin", branch], path)?;
     Ok(())
 }
 

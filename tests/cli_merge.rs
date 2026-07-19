@@ -387,6 +387,7 @@ fn merge_json_output_structure() {
     assert_eq!(json["event"], "reset");
     assert_eq!(json["branch"], "feature/json-merge");
     assert_eq!(json["mainline"], "main");
+    assert_eq!(json["destination_path"], repo_str);
     assert!(json["repo_root"].as_str().is_some());
     assert_eq!(json["cleaned_up"], true);
     assert!(
@@ -681,6 +682,146 @@ fn merge_into_checked_out_non_mainline_branch() {
 }
 
 #[test]
+fn merge_into_linked_worktree_succeeds_and_cleans_only_source() {
+    let (repo, upstream) = setup_repo_with_upstream();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/linked");
+    let destination_str = destination.display().to_string();
+
+    run_git(&["push", "-u", "origin", "release/linked"], &repo.path());
+
+    wt_core()
+        .args(["add", "feature/linked", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let source = find_worktree_dir(&repo.path(), "feature-linked");
+    commit_file(&source, "linked.txt", "linked merge", "linked merge");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/linked",
+            "--into",
+            "release/linked",
+            "--push",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "Merged 'feature/linked' into release/linked",
+        ))
+        .stdout(predicate::str::contains(format!(
+            "Destination worktree: {destination_str}"
+        )))
+        .stdout(predicate::str::contains("Pushed release/linked to origin"));
+
+    assert!(destination.exists(), "destination worktree must remain");
+    assert_branch_exists(&repo.path(), "release/linked");
+    assert_branch_deleted(&repo.path(), "feature/linked");
+
+    let destination_log = git_log_oneline(&destination, "HEAD");
+    assert!(
+        destination_log.contains("Merge branch 'feature/linked'"),
+        "merge commit should exist in linked destination: {destination_log}"
+    );
+
+    let upstream_log = git_log_oneline(upstream.path(), "release/linked");
+    assert!(
+        upstream_log.contains("Merge branch 'feature/linked'"),
+        "linked destination branch should be pushed: {upstream_log}"
+    );
+}
+
+#[test]
+fn merge_into_linked_worktree_dirty_destination_fails_and_aborts_there() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let destination = add_linked_destination(&repo, "release/dirty");
+
+    wt_core()
+        .args(["add", "feature/linked-dirty", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let source = find_worktree_dir(&repo.path(), "feature-linked-dirty");
+    commit_file(
+        &source,
+        "README.md",
+        "source changes README",
+        "source changes README",
+    );
+    std::fs::write(destination.join("README.md"), "dirty destination").expect("write failed");
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/linked-dirty",
+            "--into",
+            "release/dirty",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("merge conflicts"))
+        .stderr(predicate::str::contains("merge aborted"));
+
+    let destination_status = git_status(&destination);
+    assert!(
+        destination_status.contains("README.md"),
+        "destination dirty state should be preserved: {destination_status}"
+    );
+    assert_branch_exists(&repo.path(), "feature/linked-dirty");
+    assert!(
+        !git_log_oneline(&destination, "HEAD").contains("Merge branch 'feature/linked-dirty'"),
+        "dirty destination must not receive a merge commit"
+    );
+}
+
+#[test]
+fn merge_into_unchecked_out_destination_fails_before_merge() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/missing-destination", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-missing-destination");
+    commit_file(
+        &source,
+        "missing.txt",
+        "missing destination",
+        "missing destination",
+    );
+
+    wt_core()
+        .args([
+            "merge",
+            "feature/missing-destination",
+            "--into",
+            "release/not-checked-out",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "destination branch 'release/not-checked-out' is not checked out in a worktree",
+        ));
+
+    assert_branch_exists(&repo.path(), "feature/missing-destination");
+    assert!(
+        source.exists(),
+        "source worktree must remain after preflight failure"
+    );
+}
+
+#[test]
 fn merge_into_wrong_checked_out_destination_errors_before_merge() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -849,6 +990,18 @@ fn assert_branch_exists(repo: &std::path::Path, branch: &str) {
         !branches.is_empty(),
         "branch '{branch}' should exist but was not found"
     );
+}
+
+/// Check out an existing branch in a linked worktree for merge integration tests.
+fn add_linked_destination(repo: &fixtures::TestRepo, branch: &str) -> std::path::PathBuf {
+    run_git(&["checkout", "-b", branch], &repo.path());
+    run_git(&["checkout", "main"], &repo.path());
+
+    let slug = branch.replace('/', "-");
+    let destination = repo.path().join(format!(".linked-{slug}"));
+    let destination_str = destination.display().to_string();
+    run_git(&["worktree", "add", &destination_str, branch], &repo.path());
+    destination
 }
 
 /// Create a repo with a bare upstream configured as `origin`.
