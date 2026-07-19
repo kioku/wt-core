@@ -109,7 +109,7 @@ pub enum Command {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,
 
-        /// Merge into this checked-out branch instead of the detected mainline
+        /// Merge into this branch checked out in the main or a linked worktree
         #[arg(long, value_name = "BRANCH")]
         into: Option<String>,
 
@@ -130,8 +130,12 @@ pub enum Command {
         json: bool,
 
         /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line) for shell wrappers
-        #[arg(long, conflicts_with = "json")]
+        #[arg(long, conflicts_with_all = ["json", "print_paths_v2"])]
         print_paths: bool,
+
+        /// Print version 2 merge info, including destination_path, for shell wrappers
+        #[arg(long, conflicts_with_all = ["json", "print_paths"])]
+        print_paths_v2: bool,
     },
 
     /// Materialize an explicit detached checkout at a workspace path

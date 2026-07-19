@@ -83,4 +83,22 @@ wt remove feat-one 2>&1
     && pass "wt remove: worktree directory deleted" \
     || fail "wt remove: $WT_PATH still exists"
 
+# ── wt merge destination metadata ───────────────────────────────────
+wt add feat-merge >/dev/null 2>&1
+MERGE_WT_PATH="$PWD"
+printf 'merge content\n' > merge.txt
+git add merge.txt
+git commit -m "merge content" >/dev/null 2>&1
+MERGE_OUTPUT="$WORK/merge-output"
+wt merge feat-merge >"$MERGE_OUTPUT" 2>&1
+grep -q "Destination worktree: $REPO_PATH" "$MERGE_OUTPUT" \
+    && pass "wt merge: human output includes destination path" \
+    || fail "wt merge: destination path missing from human output"
+[[ "$(pwd -P)" == "$REPO_PATH" ]] \
+    && pass "wt merge: cd back to destination repository" \
+    || fail "wt merge: expected $REPO_PATH, got $(pwd -P)"
+[[ ! -d "$MERGE_WT_PATH" ]] \
+    && pass "wt merge: source worktree deleted" \
+    || fail "wt merge: source worktree still exists"
+
 echo "All zsh binding tests passed."

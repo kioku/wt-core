@@ -106,7 +106,7 @@ export def --env "wt remove" [
 
         $result
     } else {
-        # --print-paths: allows the interactive picker to render on
+        # --print-paths allows the interactive picker to render on
         # stderr/tty while paths go to stdout (same pattern as `go`
         # with --print-cd-path).
         let full_args = (build-args $args $repo false false | append "--print-paths")
@@ -132,6 +132,7 @@ export def --env "wt remove" [
 # Merge a worktree's branch into mainline and clean up
 export def --env "wt merge" [
     branch?: string  # Branch name (defaults to current worktree)
+    --into: string   # Merge into a branch checked out in any worktree
     --push           # Push mainline to origin after merge
     --no-cleanup     # Keep worktree and branch after merge
     --repo: path     # Repository path (defaults to cwd)
@@ -141,6 +142,7 @@ export def --env "wt merge" [
 
     mut args = ["merge"]
     if $branch != null { $args = ($args | append $branch) }
+    if $into != null { $args = ($args | append ["--into" $into]) }
     if $push { $args = ($args | append "--push") }
     if $no_cleanup { $args = ($args | append "--no-cleanup") }
 
@@ -156,7 +158,10 @@ export def --env "wt merge" [
 
         $result
     } else {
-        let full_args = (build-args $args $repo false false | append "--print-paths")
+        # --print-paths-v2 preserves the six legacy fields and appends
+        # destination_path as field seven. This lets the binding expose
+        # linked-worktree merge destinations without changing v1.
+        let full_args = (build-args $args $repo false false | append "--print-paths-v2")
         let output = try { ^wt-core ...$full_args } catch { return }
         let lines = ($output | lines)
         let repo_root = ($lines | get 0)
@@ -165,6 +170,7 @@ export def --env "wt merge" [
         let cleaned_up = ($lines | get 3)
         let removed_path = ($lines | get 4)
         let pushed = ($lines | get 5)
+        let destination_path = ($lines | get 6)
 
         if $cleaned_up == "true" and $removed_path != "" {
             if ($cwd_before | str starts-with $removed_path) {
@@ -173,6 +179,7 @@ export def --env "wt merge" [
         }
 
         print $"Merged '($branch_name)' into ($mainline)"
+        print $"Destination worktree: ($destination_path)"
         if $cleaned_up == "true" {
             print $"Removed worktree and branch '($branch_name)'"
         }

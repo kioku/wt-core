@@ -115,4 +115,28 @@ else
     fail "wt remove: $WT_PATH still exists"
 end
 
+# ── wt merge destination metadata ───────────────────────────────────
+wt add feat-merge >/dev/null 2>&1
+set MERGE_WT_PATH $PWD
+printf 'merge content\n' > merge.txt
+git add merge.txt
+git commit -m "merge content" >/dev/null 2>&1
+set MERGE_OUTPUT "$WORK/merge-output"
+wt merge feat-merge > "$MERGE_OUTPUT" 2>&1
+if string match -q "*Destination worktree: $REPO_PATH*" (cat "$MERGE_OUTPUT")
+    pass "wt merge: human output includes destination path"
+else
+    fail "wt merge: destination path missing from human output"
+end
+if test (realpath "$PWD") = "$REPO_PATH"
+    pass "wt merge: cd back to destination repository"
+else
+    fail "wt merge: expected $REPO_PATH, got "(realpath "$PWD")
+end
+if not test -d "$MERGE_WT_PATH"
+    pass "wt merge: source worktree deleted"
+else
+    fail "wt merge: source worktree still exists"
+end
+
 echo "All fish binding tests passed."

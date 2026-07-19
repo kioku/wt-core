@@ -291,6 +291,20 @@ pub fn go(repo: &RepoRoot, branch: &BranchName) -> Result<GoResult> {
 
 /// Remove a worktree and delete its local branch.
 pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Result<RemoveResult> {
+    remove_with_branch_context(repo, branch, force, repo.as_ref())
+}
+
+/// Remove a worktree and evaluate safe branch deletion from `branch_context`.
+///
+/// Merges into linked destinations need the destination worktree as the
+/// context for `git branch -d`; the ordinary `remove` command keeps its
+/// existing main-worktree context.
+fn remove_with_branch_context(
+    repo: &RepoRoot,
+    branch: Option<&BranchName>,
+    force: bool,
+    branch_context: &Path,
+) -> Result<RemoveResult> {
     let worktrees = git::list_worktrees(repo)?;
 
     // Resolve which branch to remove.
@@ -319,7 +333,7 @@ pub fn remove(repo: &RepoRoot, branch: Option<&BranchName>, force: bool) -> Resu
     // Remove worktree first, then branch.
     git::remove_worktree(repo, &removed_path, force)?;
     // Branch deletion: best-effort — bubble warning instead of blocking.
-    let warning = git::delete_branch(repo, &target_branch, force)
+    let warning = git::delete_branch_at(branch_context, &target_branch, force)
         .err()
         .map(|e| format!("worktree removed but branch deletion failed: {e}"));
 
@@ -604,6 +618,8 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
 pub struct MergeResult {
     pub branch: BranchName,
     pub mainline: String,
+    /// Path of the worktree where the destination branch was checked out.
+    pub destination_path: PathBuf,
     pub repo_root: PathBuf,
     pub cleaned_up: bool,
     /// Path of the removed worktree (only set when `cleaned_up` is true).
@@ -613,14 +629,96 @@ pub struct MergeResult {
     pub warnings: Vec<String>,
 }
 
-/// Merge a worktree's branch into the mainline.
+#[derive(Debug)]
+struct MergeDestination {
+    branch: String,
+    path: PathBuf,
+}
+
+/// Resolve the worktree where a merge destination branch is checked out.
 ///
-/// 1. Resolve the target branch (argument, cwd inference, or picker)
-/// 2. Refuse if it is the main worktree
-/// 3. Resolve the target branch (`--into` or detected mainline)
-/// 4. Run `git merge --no-ff <branch>` from the main worktree
-/// 5. On conflict: abort the merge and return an error
-/// 6. On success: optionally remove the worktree+branch, optionally push
+/// Explicit destinations may be in the main worktree or any linked
+/// worktree. With no explicit destination, retain the legacy requirement
+/// that the auto-detected mainline is checked out in the main worktree.
+fn resolve_merge_destination(
+    repo: &RepoRoot,
+    worktrees: &[Worktree],
+    into: Option<&str>,
+) -> Result<MergeDestination> {
+    let mainline = into
+        .map(str::to_string)
+        .map(Ok)
+        .unwrap_or_else(|| git::resolve_mainline(repo))?;
+
+    if into.is_none() {
+        let main = worktrees
+            .iter()
+            .find(|wt| wt.is_main)
+            .ok_or_else(|| AppError::invariant("main worktree is not available".to_string()))?;
+        return match main.branch.as_deref() {
+            Some(branch) if branch == mainline => Ok(MergeDestination {
+                branch: mainline,
+                path: main.path.clone(),
+            }),
+            branch => Err(AppError::invariant(format!(
+                "main worktree is on '{}', expected '{mainline}' — checkout mainline first",
+                branch.unwrap_or("(detached)")
+            ))),
+        };
+    }
+
+    let matches: Vec<&Worktree> = worktrees
+        .iter()
+        .filter(|wt| wt.branch.as_deref() == Some(mainline.as_str()))
+        .collect();
+
+    match matches.as_slice() {
+        [] if git::rev_exists(repo, &mainline) => {
+            let main_wt_branch = worktrees
+                .iter()
+                .find(|wt| wt.is_main)
+                .and_then(|wt| wt.branch.as_deref());
+            Err(AppError::invariant(format!(
+                "main worktree is on '{}', expected '{mainline}' — checkout target branch first",
+                main_wt_branch.unwrap_or("(detached)")
+            )))
+        }
+        [] => Err(AppError::usage(format!(
+            "destination branch '{mainline}' is not checked out in a worktree"
+        ))),
+        [destination] => Ok(MergeDestination {
+            branch: mainline,
+            path: destination.path.clone(),
+        }),
+        _ => {
+            let paths = matches
+                .iter()
+                .map(|wt| wt.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(AppError::invariant(format!(
+                "destination branch '{mainline}' is checked out in multiple worktrees: {paths}"
+            )))
+        }
+    }
+}
+
+/// Abort the merge marker created by this invocation, if any.
+fn abort_created_merge(path: &Path) {
+    if git::merge_in_progress(path) {
+        git::merge_abort(path);
+    }
+}
+
+/// Merge a worktree's branch into the selected destination.
+///
+/// 1. Resolve the source branch (argument, cwd inference, or picker)
+/// 2. Resolve the destination worktree (`--into` or detected mainline)
+/// 3. Refuse self-merges and source merges from the main worktree
+/// 4. Refuse destinations with an existing Git operation in progress
+/// 5. Run `git merge --no-ff <branch>` from the destination worktree
+/// 6. On conflict: abort only a merge state created by this invocation
+/// 7. On success: optionally remove only the source worktree+branch, optionally push
 pub fn merge(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
@@ -636,8 +734,8 @@ pub fn merge(
         None => resolve_branch_from_cwd(&worktrees)?,
     };
 
-    // Find the worktree entry.
-    let wt = worktrees
+    // Find the source worktree entry.
+    let source_wt = worktrees
         .iter()
         .find(|wt| wt.branch.as_deref() == Some(target_branch.as_str()))
         .ok_or_else(|| {
@@ -645,42 +743,35 @@ pub fn merge(
         })?;
 
     // Never merge the main worktree into itself.
-    if wt.is_main {
+    if source_wt.is_main {
         return Err(AppError::invariant(
             "refusing to merge the main worktree".to_string(),
         ));
     }
 
-    // Resolve target and verify the main worktree is checked out to it.
-    let mainline = into
-        .map(str::to_string)
-        .map(Ok)
-        .unwrap_or_else(|| git::resolve_mainline(repo))?;
-    if target_branch.as_str() == mainline {
+    let destination = resolve_merge_destination(repo, &worktrees, into)?;
+    if target_branch.as_str() == destination.branch {
         return Err(AppError::invariant(
             "refusing to merge a branch into itself".to_string(),
         ));
     }
 
-    let main_wt_branch = worktrees
-        .iter()
-        .find(|w| w.is_main)
-        .and_then(|w| w.branch.as_deref());
-    let checkout_hint = match into {
-        Some(_) => "checkout target branch first",
-        None => "checkout mainline first",
-    };
-    if main_wt_branch != Some(&mainline) {
-        return Err(AppError::invariant(format!(
-            "main worktree is on '{}', expected '{mainline}' — {checkout_hint}",
-            main_wt_branch.unwrap_or("(detached)")
+    // Never inspect or mutate an operation that was started before this
+    // invocation. In particular, `git merge --abort` below must not erase a
+    // user's existing merge, rebase, cherry-pick, or revert state.
+    if let Some(state) = git::operation_state(&destination.path)? {
+        return Err(AppError::conflict(format!(
+            "destination worktree '{}' has an in-progress {state}; finish or abort it before merging",
+            destination.path.display()
         )));
     }
 
-    // Attempt the merge from the main worktree's context.
-    if let Err(e) = git::merge_no_ff(repo, target_branch.as_str()) {
-        // Abort to restore the main worktree to a clean state.
-        git::merge_abort(repo);
+    // Attempt the merge from the selected destination worktree's context.
+    if let Err(e) = git::merge_no_ff(&destination.path, target_branch.as_str()) {
+        // The preflight above established that any merge state now belongs to
+        // this invocation. Do not abort unrelated failures that created no
+        // merge state.
+        abort_created_merge(&destination.path);
         return Err(AppError::conflict(format!(
             "merge conflicts with '{}' — merge aborted; use `git merge` directly to handle conflicts\n{e}",
             target_branch
@@ -689,13 +780,13 @@ pub fn merge(
 
     let mut warnings = Vec::new();
 
-    // Cleanup: remove worktree and branch (default behaviour).
+    // Cleanup: remove the source worktree and branch (default behaviour).
     // Downgraded to a warning because the merge has already been committed;
     // a hard error would hide the successful merge from the caller.
     let (cleaned_up, removed_path) = if no_cleanup {
         (false, None)
     } else {
-        match remove(repo, Some(&target_branch), false) {
+        match remove_with_branch_context(repo, Some(&target_branch), false, &destination.path) {
             Ok(result) => {
                 if let Some(w) = result.warning {
                     warnings.push(w);
@@ -709,9 +800,9 @@ pub fn merge(
         }
     };
 
-    // Push mainline to origin if requested.
+    // Push the selected destination branch to origin if requested.
     let pushed = if push {
-        match git::push(repo, &mainline) {
+        match git::push(&destination.path, &destination.branch) {
             Ok(()) => true,
             Err(e) => {
                 warnings.push(format!("merge succeeded but push failed: {e}"));
@@ -724,7 +815,8 @@ pub fn merge(
 
     Ok(MergeResult {
         branch: target_branch,
-        mainline,
+        mainline: destination.branch,
+        destination_path: destination.path,
         repo_root: repo.to_path_buf(),
         cleaned_up,
         removed_path,
@@ -746,6 +838,68 @@ mod tests {
             commit: "deadbee".to_string(),
             is_main,
         }
+    }
+
+    #[test]
+    fn resolve_merge_destination_accepts_linked_worktree() {
+        let repo = RepoRoot(PathBuf::from("/repo"));
+        let worktrees = vec![
+            wt("/repo", Some("main"), true),
+            wt(
+                "/repo/.worktrees/release--12345678",
+                Some("release/1.0"),
+                false,
+            ),
+        ];
+
+        let destination = resolve_merge_destination(&repo, &worktrees, Some("release/1.0"))
+            .expect("linked destination should resolve");
+
+        assert_eq!(destination.branch, "release/1.0");
+        assert_eq!(
+            destination.path,
+            PathBuf::from("/repo/.worktrees/release--12345678")
+        );
+    }
+
+    #[test]
+    fn resolve_merge_destination_rejects_missing_worktree() {
+        let repo = RepoRoot(PathBuf::from("/repo"));
+        let worktrees = vec![wt("/repo", Some("main"), true)];
+
+        let error = resolve_merge_destination(&repo, &worktrees, Some("release/1.0"))
+            .expect_err("missing destination should fail");
+
+        assert!(error
+            .message
+            .contains("destination branch 'release/1.0' is not checked out"));
+    }
+
+    #[test]
+    fn resolve_merge_destination_rejects_ambiguous_worktree() {
+        let repo = RepoRoot(PathBuf::from("/repo"));
+        let worktrees = vec![
+            wt("/repo", Some("main"), true),
+            wt(
+                "/repo/.worktrees/release-a--12345678",
+                Some("release/1.0"),
+                false,
+            ),
+            wt(
+                "/repo/.worktrees/release-b--87654321",
+                Some("release/1.0"),
+                false,
+            ),
+        ];
+
+        let error = resolve_merge_destination(&repo, &worktrees, Some("release/1.0"))
+            .expect_err("ambiguous destination should fail");
+
+        assert!(error
+            .message
+            .contains("destination branch 'release/1.0' is checked out in multiple worktrees"));
+        assert!(error.message.contains("release-a--12345678"));
+        assert!(error.message.contains("release-b--87654321"));
     }
 
     #[test]

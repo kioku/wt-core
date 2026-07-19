@@ -151,8 +151,9 @@ function wt --description "Git worktree manager"
             end
 
             set -l cwd_before (pwd)
-            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
-            set -l lines (wt-core merge $argv --print-paths)
+            # --print-paths-v2 preserves the six legacy fields and appends
+            # destination_path as field seven.
+            set -l lines (wt-core merge $argv --print-paths-v2)
             set -l rc $status
             if test $rc -eq 0
                 set -l repo_root $lines[1]
@@ -161,12 +162,14 @@ function wt --description "Git worktree manager"
                 set -l cleaned_up $lines[4]
                 set -l removed_path $lines[5]
                 set -l pushed $lines[6]
+                set -l destination_path $lines[7]
                 if test "$cleaned_up" = "true" -a -n "$removed_path"
                     if string match -q "$removed_path*" "$cwd_before"
                         cd "$repo_root"; or true
                     end
                 end
                 echo "Merged '$branch' into $mainline"
+                echo "Destination worktree: $destination_path"
                 if test "$cleaned_up" = "true"
                     echo "Removed worktree and branch '$branch'"
                 end

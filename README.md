@@ -36,7 +36,7 @@ these conventions upfront makes everything else predictable.
 
 - **Three output modes everywhere.** Every command supports human-readable
   output (default), `--json` for machine consumption, and a
-  `--print-cd-path` / `--print-paths` mode for shell wrappers.
+  `--print-cd-path` / versioned `--print-paths` modes for shell wrappers.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -112,15 +112,16 @@ wt remove --force          # remove even if dirty, use -D for branch
 ### `wt merge`
 
 Merges a worktree's branch into the auto-detected mainline using
-`--no-ff`, then removes the worktree and branch by default. Use `--into`
-to merge into a different branch that is already checked out in the main
-worktree. Conflicts cause an automatic `merge --abort` to keep the main
-worktree clean.
+`--no-ff`, then removes the source worktree and branch by default. Use
+`--into` to merge into a different branch that is already checked out in the
+main or a linked worktree. The merge and conflict abort run in the destination
+worktree, and conflicts cause an automatic `merge --abort` to keep it clean.
 
 ```
 wt merge                         # merge current worktree's branch
 wt merge feature/auth            # explicit branch
 wt merge feature/auth --into rc  # merge into checked-out branch rc
+wt merge feature/auth --into release/1.0  # destination may be linked
 wt merge --push                  # push target branch to origin after merge
 wt merge --no-cleanup            # keep worktree and branch after merge
 ```
@@ -200,9 +201,16 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 | *(default)*       | Human-readable text                          |
 | `--json`          | Single-line JSON envelope on stdout          |
 | `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
-| `--print-paths`   | Multi-line key values on stdout (for wrappers) |
+| `--print-paths`   | Version 1 merge metadata on stdout (for wrappers) |
+| `--print-paths-v2` | Version 2 merge metadata, including destination path (for wrappers) |
 
 `--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
+
+The merge `--print-paths` protocol is version 1 and emits six lines:
+`repo_root`, `branch`, `mainline`, `cleaned_up`, `removed_path`, and
+`pushed`. It remains unchanged for existing consumers. Bindings use the
+explicitly versioned `--print-paths-v2` protocol, which emits those same six
+lines followed by `destination_path` as line seven.
 
 JSON envelope example (`add`, `go`, `remove`):
 
@@ -226,6 +234,7 @@ JSON envelope example (`merge`):
   "message": "merged 'feature/auth' into main",
   "branch": "feature/auth",
   "mainline": "main",
+  "destination_path": "/abs/repo",
   "repo_root": "/abs/repo",
   "cleaned_up": true,
   "removed_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4",

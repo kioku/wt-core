@@ -212,10 +212,20 @@ pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
     Ok(())
 }
 
-/// Delete a local branch.
+/// Delete a local branch, using the main worktree as the merge base for
+/// Git's safe `-d` check.
 pub fn delete_branch(repo: &RepoRoot, branch: &BranchName, force: bool) -> Result<()> {
+    delete_branch_at(repo.as_ref(), branch, force)
+}
+
+/// Delete a local branch using `path` as the current worktree context.
+///
+/// The context matters for `git branch -d`: Git checks whether the branch is
+/// merged into the currently checked-out branch. Merge cleanup uses the
+/// destination worktree so linked-target merges satisfy that check.
+pub fn delete_branch_at(path: &Path, branch: &BranchName, force: bool) -> Result<()> {
     let flag = if force { "-D" } else { "-d" };
-    git(&["branch", flag, branch.as_str()], repo.as_ref())?;
+    git(&["branch", flag, branch.as_str()], path)?;
     Ok(())
 }
 
@@ -390,6 +400,47 @@ pub fn rev_exists(repo: &RepoRoot, rev: &str) -> bool {
     git(&["rev-parse", "--verify", rev], repo.as_ref()).is_ok()
 }
 
+/// Return the path Git uses for a repository-local marker from `cwd`.
+fn git_path(cwd: &Path, marker: &str) -> Result<PathBuf> {
+    let path = PathBuf::from(git(&["rev-parse", "--git-path", marker], cwd)?);
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        Ok(cwd.join(path))
+    }
+}
+
+/// Detect an operation already in progress in a particular worktree.
+///
+/// Git stores these markers in the per-worktree git directory when linked
+/// worktrees are enabled, so resolving them from `path` avoids inspecting the
+/// main worktree's state by mistake.
+pub fn operation_state(path: &Path) -> Result<Option<&'static str>> {
+    let markers = [
+        ("merge", &["MERGE_HEAD"][..]),
+        ("rebase", &["rebase-merge", "rebase-apply"][..]),
+        ("cherry-pick", &["CHERRY_PICK_HEAD", "sequencer"][..]),
+        ("revert", &["REVERT_HEAD"][..]),
+    ];
+
+    for (state, state_markers) in markers {
+        for marker in state_markers {
+            if git_path(path, marker)?.exists() {
+                return Ok(Some(state));
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+/// Check whether this invocation's merge left a merge state to abort.
+pub fn merge_in_progress(path: &Path) -> bool {
+    git_path(path, "MERGE_HEAD")
+        .map(|marker| marker.exists())
+        .unwrap_or(false)
+}
+
 /// Check if a remote-tracking branch exists for `origin/<branch>`.
 pub fn remote_branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
     let refspec = format!("refs/remotes/origin/{}", branch.as_str());
@@ -410,9 +461,10 @@ pub fn set_upstream(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
 
 /// Merge a branch into the current branch using `--no-ff`.
 ///
-/// Must be run from the main worktree (the `repo` root). Returns `Ok(())`
-/// on a clean merge or an error if conflicts arise (or any other git failure).
-pub fn merge_no_ff(repo: &RepoRoot, branch: &str) -> Result<()> {
+/// `path` identifies the worktree whose checked-out branch is the merge
+/// destination. Returns `Ok(())` on a clean merge or an error if conflicts
+/// arise (or any other git failure).
+pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
     git(
         &[
             "merge",
@@ -421,17 +473,17 @@ pub fn merge_no_ff(repo: &RepoRoot, branch: &str) -> Result<()> {
             "-m",
             &format!("Merge branch '{branch}'"),
         ],
-        repo.as_ref(),
+        path,
     )?;
     Ok(())
 }
 
-/// Abort an in-progress merge.
+/// Abort an in-progress merge in the destination worktree.
 ///
 /// Best-effort: if there is no merge to abort, git returns an error that
 /// we silently ignore.
-pub fn merge_abort(repo: &RepoRoot) {
-    let _ = git(&["merge", "--abort"], repo.as_ref());
+pub fn merge_abort(path: &Path) {
+    let _ = git(&["merge", "--abort"], path);
 }
 
 /// Verify Git has a usable difftool before launching an interactive diff.
@@ -640,9 +692,9 @@ fn run_difftool(mut cmd: Cmd) -> Result<()> {
     Ok(())
 }
 
-/// Push a branch to `origin`.
-pub fn push(repo: &RepoRoot, branch: &str) -> Result<()> {
-    git(&["push", "origin", branch], repo.as_ref())?;
+/// Push a branch to `origin` from the worktree where it is checked out.
+pub fn push(path: &Path, branch: &str) -> Result<()> {
+    git(&["push", "origin", branch], path)?;
     Ok(())
 }
 

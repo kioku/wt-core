@@ -67,13 +67,14 @@ pub fn run(cli: Cli) -> Result<()> {
             repo,
             json,
             print_paths,
+            print_paths_v2,
         } => cmd_merge(
             branch.as_deref().map(BranchName::new),
             into,
             push,
             no_cleanup,
             repo,
-            merge_fmt(json, print_paths),
+            merge_fmt(json, print_paths, print_paths_v2),
         ),
         Command::Materialize {
             repo_slug,
@@ -157,8 +158,10 @@ fn remove_fmt(json: bool, print_paths: bool) -> RemoveFormat {
     }
 }
 
-fn merge_fmt(json: bool, print_paths: bool) -> MergeFormat {
-    if print_paths {
+fn merge_fmt(json: bool, print_paths: bool, print_paths_v2: bool) -> MergeFormat {
+    if print_paths_v2 {
+        MergeFormat::PrintPathsV2
+    } else if print_paths {
         MergeFormat::PrintPaths
     } else if json {
         MergeFormat::Json
@@ -1085,6 +1088,15 @@ fn cmd_merge(
             println!("{removed_str}");
             println!("{}", result.pushed);
         }
+        MergeFormat::PrintPathsV2 => {
+            println!("{root_str}");
+            println!("{branch_name}");
+            println!("{}", result.mainline);
+            println!("{}", result.cleaned_up);
+            println!("{removed_str}");
+            println!("{}", result.pushed);
+            println!("{}", result.destination_path.display());
+        }
         MergeFormat::Json => {
             let event = if result.cleaned_up {
                 Some("reset".to_string())
@@ -1097,6 +1109,7 @@ fn cmd_merge(
                 message: format!("merged '{}' into {}", branch_name, result.mainline),
                 branch: branch_name.to_string(),
                 mainline: result.mainline.clone(),
+                destination_path: result.destination_path.display().to_string(),
                 repo_root: root_str,
                 cleaned_up: result.cleaned_up,
                 removed_path: if result.cleaned_up {
@@ -1109,6 +1122,10 @@ fn cmd_merge(
         }
         MergeFormat::Human => {
             println!("Merged '{}' into {}", branch_name, result.mainline);
+            println!(
+                "Destination worktree: {}",
+                result.destination_path.display()
+            );
             if result.cleaned_up {
                 println!("Removed worktree and branch '{}'", branch_name);
             }
