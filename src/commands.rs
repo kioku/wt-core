@@ -22,90 +22,6 @@ use crate::output::{
 use crate::worktree;
 use unicode_width::UnicodeWidthStr;
 
-#[cfg(windows)]
-mod windows_job {
-    use std::io;
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
-
-    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
-    use windows_sys::Win32::System::JobObjects::{
-        AssignProcessToJobObject, CreateJobObjectW, JobObjectExtendedLimitInformation,
-        SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    };
-
-    /// Keeps the child and its descendants in a kill-on-close job.
-    ///
-    /// Windows has no Unix-style `exec`, so a terminated `wt-core` process
-    /// cannot otherwise guarantee that descendants do not outlive it.
-    pub struct ChildJob(HANDLE);
-
-    impl ChildJob {
-        pub fn for_child(child: &Child) -> io::Result<Self> {
-            // A private job with KILL_ON_JOB_CLOSE is closed automatically by
-            // the OS if wt-core is terminated without unwinding.
-            let handle =
-                // SAFETY: null attributes and name request an unnamed private job.
-                unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-            if handle.is_null() {
-                return Err(last_error());
-            }
-
-            let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-            let configured =
-                // SAFETY: handle is valid and limits remains alive for this call.
-                unsafe {
-                    SetInformationJobObject(
-                        handle,
-                        JobObjectExtendedLimitInformation,
-                        (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION)
-                            .cast::<core::ffi::c_void>(),
-                        size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                    )
-                } != 0;
-            if !configured {
-                let error = last_error();
-                let _ =
-                    // SAFETY: handle was returned by CreateJobObjectW and is owned here.
-                    unsafe { CloseHandle(handle) };
-                return Err(error);
-            }
-
-            let assigned =
-                // SAFETY: handle is valid and the live child owns a valid process handle.
-                unsafe { AssignProcessToJobObject(handle, child.as_raw_handle()) } != 0;
-            if !assigned {
-                let error = last_error();
-                let _ =
-                    // SAFETY: handle was returned by CreateJobObjectW and is owned here.
-                    unsafe { CloseHandle(handle) };
-                return Err(error);
-            }
-
-            Ok(Self(handle))
-        }
-    }
-
-    impl Drop for ChildJob {
-        fn drop(&mut self) {
-            // Closing the final job handle terminates all remaining members.
-            let _ =
-                // SAFETY: self.0 is the owned handle returned by CreateJobObjectW.
-                unsafe { CloseHandle(self.0) };
-        }
-    }
-
-    fn last_error() -> io::Error {
-        let error =
-            // SAFETY: GetLastError has no preconditions and returns this thread's error.
-            unsafe { GetLastError() };
-        io::Error::from_raw_os_error(error as i32)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
     Success,
@@ -375,7 +291,7 @@ fn cmd_list(
     color: ColorChoice,
 ) -> Result<()> {
     let repo = resolve_repo(repo)?;
-    let worktrees = git::list_worktrees(&repo)?;
+    let worktrees = git::list_worktrees_readonly(&repo)?;
     let cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.canonicalize().ok());
@@ -852,30 +768,7 @@ fn run_resolved_command(mut process: ProcessCommand, program: &OsStr) -> Result<
     Err(execution_error(program, error))
 }
 
-#[cfg(windows)]
-fn run_resolved_command(mut process: ProcessCommand, program: &OsStr) -> Result<RunOutcome> {
-    let mut child = process
-        .spawn()
-        .map_err(|error| execution_error(program, error))?;
-    let _job = match windows_job::ChildJob::for_child(&child) {
-        Ok(job) => job,
-        Err(error) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(AppError::usage(format!(
-                "failed to contain '{}': {error}",
-                program.to_string_lossy()
-            )));
-        }
-    };
-
-    let status = child
-        .wait()
-        .map_err(|error| execution_error(program, error))?;
-    Ok(child_outcome(status))
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn run_resolved_command(mut process: ProcessCommand, program: &OsStr) -> Result<RunOutcome> {
     let status = process
         .status()
@@ -914,7 +807,7 @@ fn resolve_interactive_branch(
         ));
     }
 
-    let worktrees = git::list_worktrees(repo)?;
+    let worktrees = git::list_worktrees_readonly(repo)?;
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
@@ -1008,10 +901,9 @@ fn resolve_action_branch(
         return Ok(None);
     }
 
-    // Target selection happens before destructive commands acquire their
-    // lifecycle lock. Keep this observation strictly read-only; the command
-    // performs any required metadata prune after it owns the lock.
-    let worktrees = git::list_worktrees(repo)?;
+    // Selection is read-only. Destructive callers prune only after taking
+    // the lifecycle lock.
+    let worktrees = git::list_worktrees_readonly(repo)?;
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
@@ -1219,7 +1111,7 @@ fn resolve_diff_worktree(
     repo: &domain::RepoRoot,
     branch: Option<BranchName>,
 ) -> Result<domain::Worktree> {
-    let worktrees = git::list_worktrees(repo)?;
+    let worktrees = git::list_worktrees_readonly(repo)?;
 
     if let Some(branch) = branch {
         return worktrees
@@ -1260,7 +1152,7 @@ fn resolve_diff_worktree(
 }
 
 fn resolve_diff_branch(repo: &domain::RepoRoot) -> Result<BranchName> {
-    let worktrees = git::list_worktrees(repo)?;
+    let worktrees = git::list_worktrees_readonly(repo)?;
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
@@ -1335,7 +1227,7 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
     };
     if inspect {
         let preflight =
-            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref())?;
+            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), true)?;
         return print_merge_inspection(&repo, &preflight, fmt);
     }
 
@@ -1343,12 +1235,8 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
     // every durable journal/cleanup update. A paused hook therefore blocks all
     // competing mutators while read-only status remains available.
     let lifecycle_lock = worktree::acquire_merge_lifecycle_lock(&repo)?;
-    let preflight = worktree::merge_preflight_with_lifecycle_lock(
-        &repo,
-        resolved_branch.as_ref(),
-        into.as_deref(),
-        &lifecycle_lock,
-    )?;
+    let preflight =
+        worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), false)?;
 
     if fmt == MergeFormat::Human {
         print_merge_preflight(&preflight);

@@ -127,12 +127,10 @@ The metadata schema is:
 ```
 
 On Unix, `wt-core` replaces itself with the resolved command, preserving
-native stdio, status, and signal behavior. On Windows, it waits for the child
-inside a kill-on-close Job Object so descendants are terminated if `wt-core`
-is terminated. If containment cannot be established, execution is stopped
-rather than leaving an uncontained child. Windows console-control behavior is
-still governed by Windows console semantics, and the short CreateProcess/job
-attachment interval is an unavoidable residual race.
+native stdio, status, and signal behavior. On Windows, it runs the command
+with normal `Command` process execution and waits for its exit status. Child
+processes are not placed in a custom containment boundary; Windows console
+and descendant behavior follows native operating-system semantics.
 
 ### `wt list`
 
@@ -229,37 +227,19 @@ OS-backed lock is held from preflight through Git subprocess finalization and
 all durable journal/cleanup updates; its lock state is released safely by the
 OS after process death. A live owner makes a new merge, `--continue`, or
 `--abort` fail with recovery guidance, while `--status` remains read-only.
+On Unix, lifecycle Git children acquire a separate child lease in `pre_exec`,
+so unrelated subprocesses cannot inherit the parent lock. Synchronous hooks
+are supported; background or daemonized hooks are not.
 
-On Windows 10 and Windows Server 2016 or newer, lifecycle Git is managed by a
-normally-created guardian outside a private kill-on-close Job Object. The
-owner first gives the guardian only a duplicated owner-process handle. The
-guardian acquires the child lease by path and publishes a durable READY status
-containing its PID and operation ID; only then does the owner publish the
-nonce-bound command handoff with non-inheritable stdio/event handles and the
-final start authorization. Git is then atomically created suspended in the Job
-Object with `PROC_THREAD_ATTRIBUTE_JOB_LIST` and resumed. Git receives the
-exact args, environment, working directory, stdio, and supported creation
-flags, and cannot break away from the job. The guardian waits Git and
-synchronous hooks, terminates and waits every remaining member, and only then
-releases the child lease. If the owner dies, the guardian uses its duplicated
-owner-process handle rather than capture-pipe EOF as the death signal and
-continues that cleanup; recovery remains busy until job quiescence.
-Bootstrap and protocol files are owner-only ACL-validated, nonce-bound, and
-swept on the next startup after a crash. On Windows, “owner-only” means the
-current user plus trusted local SYSTEM and the built-in Administrators group;
-those two machine principals intentionally retain full lifecycle access for
-system administration and recovery. Lifecycle ACL creation must run under the
-process identity; wt-core rejects thread impersonation before changing a new
-object's DACL. Existing files and directories must already satisfy this
-explicit, protected DACL policy; only paths just created by wt-core receive the
-policy. This protects cooperative `wt` operations;
-deliberate tampering, killing, or path replacement by an arbitrary same-user
-process is outside the threat boundary. Git hooks that daemonize,
-detach, or mutate the repository after Git exits are outside the supported
-contract and must not be used for lifecycle repository mutation.
+On Windows, cooperating `wt` operations use ordinary parent-lock
+serialization and normal `Command` execution. An abnormal owner termination
+may release the wt lifecycle lock before Git descendants or hooks exit; Git's
+native locks and recovery behavior remain the boundary for that case. wt-core
+does not promise child or hook lease survival after Windows owner death and
+does not use globally inheritable lock handles.
+
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
-
 The lifecycle lock serializes supported mutating `wt` operations, and Git ref
 updates use compare-and-swap checks where a detectable tip race matters. This
 is a cooperation boundary, not an operating-system capability claim: an

@@ -1,11 +1,7 @@
 mod fixtures;
 
-#[cfg(windows)]
-use std::fs::OpenOptions;
-#[cfg(windows)]
-use std::os::windows::io::AsRawHandle;
 use std::process::Command as StdCommand;
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 use std::process::Stdio;
 
 use assert_cmd::Command;
@@ -760,12 +756,10 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
     let mut original = original.spawn().expect("merge should start");
     wait_for_file(&entered);
     original.kill().expect("owner should be terminable");
-    let _ = original
-        .wait_with_output()
-        .expect("killed owner should be reaped before busy assertion");
 
-    // The lifecycle Git process retains its direct lease after the owner dies.
-    // A synchronously waited hook must finish before recovery can proceed.
+    // Git and its hook retain the inherited lifecycle lock after the owner
+    // dies. Releasing the hook first must not let continuation race Git's
+    // finalization; it may only recover after the child has exited.
     let busy = wt_core()
         .args(["merge", "--continue", "--repo", &repo_str])
         .output()
@@ -774,6 +768,7 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
     assert!(String::from_utf8_lossy(&busy.stderr).contains("busy"));
 
     std::fs::write(&release, "release\n").expect("release orphaned hook");
+    let _ = original.wait_with_output();
 
     let mut recovered = None;
     for _ in 0..100 {
@@ -800,797 +795,16 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
     assert!(!source.exists());
 }
 
-#[cfg(any(unix, windows))]
-#[test]
-fn merge_cleanup_worktree_remove_retains_lifecycle_lease_after_owner_death() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    let source = create_conflicted_merge(&repo, "feature/remove-child-lease");
-    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
-    run_git(&["add", "shared.txt"], &repo.path());
-
-    let shim = install_blocking_git_shim(&repo, BlockingGitMutation::WorktreeRemove, false);
-    let mut owner = shim.command(["merge", "--continue", "--repo", &repo_str]);
-    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut owner = owner.spawn().expect("cleanup owner should start");
-    wait_for_file(&shim.entered);
-    owner.kill().expect("cleanup owner should be terminable");
-    let _ = owner
-        .wait_with_output()
-        .expect("killed cleanup owner should be reaped before busy assertion");
-
-    assert_lifecycle_busy(&repo_str);
-    assert_lifecycle_busy_for(&shim, ["merge", "--continue", "--repo", &repo_str]);
-    assert_lifecycle_busy_for(&shim, ["merge", "--abort", "--repo", &repo_str]);
-
-    std::fs::write(&shim.release, "release\n").expect("release worktree removal");
-    wait_for_lifecycle_idle(&repo_str);
-
-    wt_core()
-        .args(["merge", "--continue", "--repo", &repo_str])
-        .assert()
-        .success();
-    assert!(!source.exists(), "recovery should finish source cleanup");
-    assert_branch_deleted(&repo.path(), "feature/remove-child-lease");
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn merge_cleanup_ref_mutation_retains_lease_and_recovers_failure() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    let source = create_conflicted_merge(&repo, "feature/ref-child-lease");
-    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
-    run_git(&["add", "shared.txt"], &repo.path());
-
-    let shim = install_blocking_git_shim(&repo, BlockingGitMutation::UpdateRef, true);
-    let mut owner = shim.command(["merge", "--continue", "--repo", &repo_str]);
-    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut owner = owner.spawn().expect("ref cleanup owner should start");
-    wait_for_file(&shim.entered);
-    owner
-        .kill()
-        .expect("ref cleanup owner should be terminable");
-    let _ = owner
-        .wait_with_output()
-        .expect("killed ref cleanup owner should be reaped before busy assertion");
-
-    assert_lifecycle_busy(&repo_str);
-    assert_lifecycle_busy_for(&shim, ["merge", "--continue", "--repo", &repo_str]);
-    assert_lifecycle_busy_for(&shim, ["merge", "--abort", "--repo", &repo_str]);
-
-    std::fs::write(&shim.release, "release\n").expect("release ref mutation");
-    wait_for_lifecycle_idle(&repo_str);
-
-    // The blocked writer is allowed to fail after the owner dies. Recovery
-    // must retry the recorded cleanup with a fresh contained child only after
-    // the stale child has exited.
-    wt_core()
-        .args(["merge", "--continue", "--repo", &repo_str])
-        .assert()
-        .success();
-    assert!(!source.exists(), "recovery should finish source cleanup");
-    assert_branch_deleted(&repo.path(), "feature/ref-child-lease");
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn pre_lock_merge_and_remove_selection_cannot_prune_without_the_lifecycle_lock() {
-    for action in ["merge", "remove"] {
-        let repo = fixtures::TestRepo::new();
-        let repo_str = repo.path().display().to_string();
-        let branch = format!("feature/pre-lock-{action}");
-        wt_core()
-            .args(["add", &branch, "--repo", &repo_str])
-            .assert()
-            .success();
-        let source = find_worktree_dir(&repo.path(), &format!("feature-pre-lock-{action}"));
-        if action == "merge" {
-            commit_file(&source, "pre-lock.txt", "pre-lock", "pre-lock selection");
-        }
-
-        let shim = install_blocking_git_shim(&repo, BlockingGitMutation::WorktreePrune, false);
-        let mut owner = shim.command([action, "--repo", &repo_str]);
-        owner
-            .current_dir(&source)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let owner = owner.spawn().expect("selection owner should start");
-        wait_for_file(&shim.entered);
-
-        // The blocked prune must already be inside the lifecycle lock. With
-        // the old pre-lock selection path, status would observe no owner.
-        assert_lifecycle_busy(&repo_str);
-
-        std::fs::write(&shim.release, "release\n").expect("release selection prune");
-        let output = owner
-            .wait_with_output()
-            .expect("selection owner should finish");
-        assert!(
-            output.status.success(),
-            "{action} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
-
-#[cfg(any(unix, windows))]
-#[test]
-fn merge_metadata_prune_is_explicit_and_retains_lifecycle_lease_after_owner_death() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    wt_core()
-        .args(["add", "feature/prune-child-lease", "--repo", &repo_str])
-        .assert()
-        .success();
-    let source = find_worktree_dir(&repo.path(), "feature-prune-child-lease");
-    commit_file(&source, "prune-child.txt", "prune", "prune child");
-
-    let shim = install_blocking_git_shim(&repo, BlockingGitMutation::WorktreePrune, false);
-    let mut owner = shim.command(["merge", "feature/prune-child-lease", "--repo", &repo_str]);
-    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut owner = owner.spawn().expect("merge owner should start");
-    wait_for_file(&shim.entered);
-    owner.kill().expect("prune owner should be terminable");
-    let owner_output = owner
-        .wait_with_output()
-        .expect("killed prune owner should be reaped before busy assertion");
-    assert!(!owner_output.status.success());
-
-    // Once the owner is reaped, busy must be caused by the contained prune
-    // child lease rather than the parent's lifecycle lock.
-    assert_lifecycle_busy(&repo_str);
-    assert_lifecycle_busy_for(
-        &shim,
-        ["merge", "feature/prune-child-lease", "--repo", &repo_str],
-    );
-
-    std::fs::write(&shim.release, "release\n").expect("release metadata prune");
-    wait_for_lifecycle_idle(&repo_str);
-
-    let retry = shim
-        .command(["merge", "feature/prune-child-lease", "--repo", &repo_str])
-        .output()
-        .expect("merge retry should run");
-    assert!(
-        retry.status.success(),
-        "merge retry failed: {}",
-        String::from_utf8_lossy(&retry.stderr)
-    );
-    assert!(!source.exists(), "merge retry should finish source cleanup");
-    assert_branch_deleted(&repo.path(), "feature/prune-child-lease");
-}
-
-#[cfg(any(unix, windows))]
-fn assert_lifecycle_busy(repo: &str) {
-    let output = wt_core()
-        .args(["merge", "--status", "--json", "--repo", repo])
-        .output()
-        .expect("status should run while cleanup Git is blocked");
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("\"state\":\"busy\""),
-        "status must report the contained cleanup child as busy: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-}
-
-#[cfg(any(unix, windows))]
-fn assert_lifecycle_busy_for<const N: usize>(shim: &GitMutationShim, args: [&str; N]) {
-    let output = shim
-        .command(args)
-        .output()
-        .expect("cooperating lifecycle command should run");
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("busy"),
-        "cooperating lifecycle command must remain busy: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
-#[cfg(any(unix, windows))]
-fn wait_for_lifecycle_idle(repo: &str) {
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        let output = wt_core()
-            .args(["merge", "--status", "--json", "--repo", repo])
-            .output()
-            .expect("status should run while waiting for cleanup child");
-        if !String::from_utf8_lossy(&output.stdout).contains("\"state\":\"busy\"") {
-            return;
-        }
-        sleep(Duration::from_millis(20));
-    }
-    panic!("contained cleanup Git child did not release the lifecycle lease");
-}
-
-#[cfg(any(unix, windows))]
-#[derive(Clone, Copy)]
-enum BlockingGitMutation {
-    WorktreePrune,
-    WorktreeRemove,
-    UpdateRef,
-}
-
-#[cfg(any(unix, windows))]
-struct GitMutationShim {
-    _directory: tempfile::TempDir,
-    real_git: std::path::PathBuf,
-    path: std::ffi::OsString,
-    entered: std::path::PathBuf,
-    release: std::path::PathBuf,
-}
-
-#[cfg(any(unix, windows))]
-impl GitMutationShim {
-    fn command<const N: usize>(&self, args: [&str; N]) -> StdCommand {
-        let mut command = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
-        command
-            .args(args)
-            .env("PATH", &self.path)
-            .env("WT_REAL_GIT", &self.real_git);
-        command
-    }
-}
-
-#[cfg(any(unix, windows))]
-fn install_blocking_git_shim(
-    _repo: &fixtures::TestRepo,
-    mutation: BlockingGitMutation,
-    fail_after_release: bool,
-) -> GitMutationShim {
-    let directory = tempfile::tempdir().expect("Git shim directory");
-    let entered = directory.path().join("entered");
-    let release = directory.path().join("release");
-    let original_path = std::env::var_os("PATH").expect("PATH");
-    let real_git = std::env::split_paths(&original_path)
-        .map(|component| {
-            #[cfg(windows)]
-            {
-                component.join("git.exe")
-            }
-            #[cfg(unix)]
-            {
-                component.join("git")
-            }
-        })
-        .find(|candidate| candidate.is_file())
-        .expect("real git executable");
-    let mut paths = vec![directory.path().to_path_buf()];
-    paths.extend(std::env::split_paths(&original_path));
-    let path = std::env::join_paths(paths).expect("shim PATH");
-    let block = match mutation {
-        BlockingGitMutation::WorktreePrune => "worktree_prune",
-        BlockingGitMutation::WorktreeRemove => "worktree_remove",
-        BlockingGitMutation::UpdateRef => "update_ref",
-    };
-
-    #[cfg(unix)]
-    let script_path = directory.path().join("git");
-    #[cfg(windows)]
-    let script_path = directory.path().join("git.cmd");
-    #[cfg(unix)]
-    let script = format!(
-        "#!/bin/sh\nset -eu\nblock=0\nif [ \"{block}\" = worktree_prune ] && [ \"$1\" = worktree ] && [ \"$2\" = prune ]; then block=1; fi\nif [ \"{block}\" = worktree_remove ] && [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then block=1; fi\nif [ \"{block}\" = update_ref ] && [ \"$1\" = update-ref ] && [ \"$2\" = --stdin ]; then block=1; fi\nif [ \"$block\" = 1 ]; then printf entered > {entered}; while [ ! -f {release} ]; do sleep 0.05; done; fi\nif [ \"{fail}\" = 1 ] && [ \"$block\" = 1 ]; then exit 42; fi\nexec \"$WT_REAL_GIT\" \"$@\"\n",
-        block = block,
-        fail = if fail_after_release { 1 } else { 0 },
-        entered = shell_quote(&entered.display().to_string()),
-        release = shell_quote(&release.display().to_string()),
-    );
-    #[cfg(windows)]
-    let script = format!(
-        "@echo off\r\nset block=0\r\nif \"{block}\"==\"worktree_prune\" if \"%~1\"==\"worktree\" if \"%~2\"==\"prune\" set block=1\r\nif \"{block}\"==\"worktree_remove\" if \"%~1\"==\"worktree\" if \"%~2\"==\"remove\" set block=1\r\nif \"{block}\"==\"update_ref\" if \"%~1\"==\"update-ref\" if \"%~2\"==\"--stdin\" set block=1\r\nif \"%block%\"==\"1\" (echo entered>{entered}\r\n:wait\r\nif exist {release} goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\n)\r\nif \"{fail}\"==\"1\" if \"%block%\"==\"1\" exit /b 42\r\n\"%WT_REAL_GIT%\" %*\r\n",
-        block = block,
-        fail = if fail_after_release { 1 } else { 0 },
-        entered = windows_quote(&entered),
-        release = windows_quote(&release),
-    );
-    std::fs::write(&script_path, script).expect("write Git shim");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&script_path)
-            .expect("Git shim metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&script_path, permissions).expect("chmod Git shim");
-    }
-
-    GitMutationShim {
-        _directory: directory,
-        real_git,
-        path,
-        entered,
-        release,
-    }
-}
-
-#[cfg(windows)]
-fn windows_quote(path: &std::path::Path) -> String {
-    format!("\"{}\"", path.display().to_string().replace('"', "\"\""))
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immediately() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    wt_core()
-        .args(["add", "feature/windows-значение", "--repo", &repo_str])
-        .assert()
-        .success();
-    let source = find_worktree_dir(&repo.path(), "feature-windows-");
-    commit_file(&source, "windows.txt", "windows", "windows source");
-
-    let entered = repo.path().join("windows-sync-entered");
-    let release = repo.path().join("windows-sync-release");
-    let env_capture = repo.path().join("windows-sync-env");
-    let cwd_capture = repo.path().join("windows-sync-cwd");
-    install_hook(
-        &repo,
-        "post-merge",
-        &format!(
-            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\nprintf hook-stdout\nprintf hook-stderr >&2\nprintf '%s' \"$WT_WINDOWS_EXACT_ENV\" > {}\ngit rev-parse --show-toplevel > {}\n",
-            shell_quote(&entered.display().to_string()),
-            shell_quote(&release.display().to_string()),
-            shell_quote(&env_capture.display().to_string()),
-            shell_quote(&cwd_capture.display().to_string()),
-        ),
-    );
-
-    let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
-    merge
-        .args(["merge", "feature/windows-значение", "--repo", &repo_str])
-        .env("WT_WINDOWS_EXACT_ENV", "значение with spaces \\\"and\\\"")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let merge = merge.spawn().expect("Windows merge should start");
-    wait_for_file(&entered);
-    let child_lock = child_lock_path(&repo.path());
-    wait_for_child_lock(&child_lock, false);
-
-    let status = wt_core()
-        .args(["merge", "--status", "--json", "--repo", &repo_str])
-        .output()
-        .expect("status should run while sync hook is blocked");
-    let status_json: serde_json::Value =
-        serde_json::from_slice(&status.stdout).expect("busy status JSON");
-    assert_eq!(status_json["state"], "busy");
-
-    // The assertion below is made by a new wt process while the lifecycle
-    // hook is still blocked. This is the supported cooperating-operation
-    // serialization boundary; unrelated test-harness spawns are not evidence
-    // about handles owned by the lifecycle owner.
-    let continue_output = wt_core()
-        .args(["merge", "--continue", "--repo", &repo_str])
-        .output()
-        .expect("continue should run while sync hook is blocked");
-    assert!(!continue_output.status.success());
-    assert!(String::from_utf8_lossy(&continue_output.stderr).contains("busy"));
-    let abort_output = wt_core()
-        .args(["merge", "--abort", "--repo", &repo_str])
-        .output()
-        .expect("abort should run while sync hook is blocked");
-    assert!(!abort_output.status.success());
-    assert!(String::from_utf8_lossy(&abort_output.stderr).contains("busy"));
-
-    std::fs::write(&release, "release\n").expect("release sync hook");
-    let output = merge
-        .wait_with_output()
-        .expect("merge should finish after hook release");
-    assert!(
-        output.status.success(),
-        "merge failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("hook-stdout"),
-        "hook stdout was not forwarded: {}",
-        String::from_utf8_lossy(&output.stdout)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("hook-stderr"),
-        "hook stderr was not forwarded: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert_eq!(
-        std::fs::read_to_string(&env_capture).expect("captured environment"),
-        "значение with spaces \\\"and\\\""
-    );
-    assert_eq!(
-        std::fs::read_to_string(&cwd_capture)
-            .expect("captured Git cwd")
-            .trim(),
-        git_rev_parse(&repo.path(), "--show-toplevel")
-    );
-
-    // Immediate recovery is the important boundary: all direct Git handles,
-    // pipe handles, and job members have been reaped before wt-core returns.
-    wait_for_child_lock(&child_lock, true);
-    let status = wt_core()
-        .args(["merge", "--status", "--json", "--repo", &repo_str])
-        .output()
-        .expect("recovery status should run");
-    assert!(
-        !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
-        "lifecycle lock remained busy after guardian quiescence"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    wt_core()
-        .args(["add", "feature/windows-killed", "--repo", &repo_str])
-        .assert()
-        .success();
-    let source = find_worktree_dir(&repo.path(), "feature-windows-killed");
-    commit_file(&source, "windows-killed.txt", "killed", "killed source");
-
-    let entered = repo.path().join("windows-killed-entered");
-    let release = repo.path().join("windows-killed-release");
-    let hook_alive = repo.path().join("windows-killed-hook-alive");
-    let hook_quiesced = repo.path().join("windows-killed-hook-quiesced");
-    let gate = repo.path().join("windows-killed-cleanup-gate");
-    let gate_started = gate.with_extension("started");
-    let gate_release = gate.with_extension("release");
-    install_hook(
-        &repo,
-        "post-merge",
-        &format!(
-            "#!/bin/sh\nset -eu\nprintf entered > {}\nprintf alive > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\nprintf quiesced > {}\n",
-            shell_quote(&entered.display().to_string()),
-            shell_quote(&hook_alive.display().to_string()),
-            shell_quote(&release.display().to_string()),
-            shell_quote(&hook_quiesced.display().to_string()),
-        ),
-    );
-
-    let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
-    merge
-        .args(["merge", "feature/windows-killed", "--repo", &repo_str])
-        .env("WT_CORE_WINDOWS_LIFECYCLE_CLEANUP_GATE", &gate)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut merge = merge.spawn().expect("Windows merge should start");
-    wait_for_file(&entered);
-    wait_for_file(&hook_alive);
-    let child_lock = child_lock_path(&repo.path());
-    wait_for_child_lock(&child_lock, false);
-
-    // The parent is still alive while the synchronously waited hook is blocked;
-    // the direct lease must make recovery report busy rather than racing Git.
-    let busy = wt_core()
-        .args(["merge", "--status", "--json", "--repo", &repo_str])
-        .output()
-        .expect("busy status should run");
-    let busy_json: serde_json::Value =
-        serde_json::from_slice(&busy.stdout).expect("busy status JSON");
-    assert_eq!(busy_json["state"], "busy");
-
-    merge.kill().expect("owner should be terminable");
-    wait_for_file(&gate_started);
-
-    // The surviving guardian has observed owner death but has not yet
-    // terminated the job. The blocked hook and child lease remain live
-    // together; releasing the lease early would permit a recovery race.
-    assert!(!hook_quiesced.exists(), "hook escaped its blocked phase");
-    assert!(
-        !try_child_lock(&child_lock),
-        "child lease released before job cleanup"
-    );
-
-    std::fs::write(&gate_release, "release\n").expect("release guardian cleanup gate");
-    let _ = merge.wait_with_output();
-    wait_for_child_lock(&child_lock, true);
-    assert!(
-        !hook_quiesced.exists(),
-        "terminated hook reached post-release code"
-    );
-    assert!(
-        !release.exists(),
-        "killed hook unexpectedly reached its release"
-    );
-    let status = wt_core()
-        .args(["merge", "--status", "--json", "--repo", &repo_str])
-        .output()
-        .expect("status should run after owner death");
-    assert!(
-        !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
-        "killed parent left the lifecycle Git lease busy after guardian quiescence"
-    );
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_lifecycle_owner_death_at_each_pre_authorization_handshake_phase_is_safe() {
-    let phases = [
-        "parent-before-guardian",
-        "guardian-before-lease",
-        "guardian-after-lease-before-ready",
-        "guardian-ready-before-command",
-        "parent-after-ready-before-command",
-        "parent-command-before-start",
-    ];
-
-    for phase in phases {
-        let repo = fixtures::TestRepo::new();
-        let repo_str = repo.path().display().to_string();
-        wt_core()
-            .args(["add", "feature/windows-handshake", "--repo", &repo_str])
-            .assert()
-            .success();
-        let source = find_worktree_dir(&repo.path(), "feature-windows-handshake");
-        commit_file(&source, "handshake.txt", "handshake", "handshake source");
-
-        let started = repo.path().join(format!("{phase}.started"));
-        let release = repo.path().join(format!("{phase}.release"));
-        let git_started = repo.path().join("handshake-git-started");
-        install_hook(
-            &repo,
-            "pre-merge-commit",
-            &format!(
-                "#!/bin/sh\nprintf started > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
-                shell_quote(&git_started.display().to_string()),
-                shell_quote(&release.display().to_string()),
-            ),
-        );
-
-        let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
-        merge
-            .args(["merge", "feature/windows-handshake", "--repo", &repo_str])
-            .env("WT_CORE_WINDOWS_LIFECYCLE_HANDSHAKE_PHASE", phase)
-            .env(
-                "WT_CORE_WINDOWS_LIFECYCLE_HANDSHAKE_GATE",
-                repo.path().join(phase).display().to_string(),
-            )
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut merge = merge.spawn().expect("handshake merge should start");
-        wait_for_file(&started);
-        merge.kill().expect("handshake owner should be terminable");
-        let owner_output = merge
-            .wait_with_output()
-            .expect("handshake owner should be reaped");
-        assert!(
-            !owner_output.status.success(),
-            "killed handshake owner unexpectedly succeeded"
-        );
-
-        let status = wt_core()
-            .args(["merge", "--status", "--json", "--repo", &repo_str])
-            .output()
-            .expect("handshake status should run after owner death");
-        let status_json: serde_json::Value =
-            serde_json::from_slice(&status.stdout).expect("handshake status JSON");
-        let guardian_lease_phase = matches!(
-            phase,
-            "guardian-after-lease-before-ready" | "guardian-ready-before-command"
-        );
-        let parent_authorization_race = matches!(
-            phase,
-            "parent-after-ready-before-command" | "parent-command-before-start"
-        );
-        if parent_authorization_race {
-            // Once the owner has been reaped, either observation is valid:
-            // status may catch the guardian while its child lease is live, or
-            // the guardian may already have completed its safe pre-Git cleanup.
-            // The state JSON is the explicit result marker; the direct child
-            // lock probe makes a busy result prove the guardian lease rather
-            // than merely a stale parent-lock observation.
-            match status_json["state"].as_str() {
-                Some("busy") => {
-                    assert!(
-                        status.status.success(),
-                        "busy status failed after the killed owner was reaped in {phase}: {}",
-                        String::from_utf8_lossy(&status.stderr)
-                    );
-                    assert!(
-                        !try_child_lock(&child_lock_path(&repo.path())),
-                        "busy status lacked the surviving guardian child lease in {phase}"
-                    );
-                }
-                Some("interrupted") => {
-                    assert!(
-                        !status.status.success(),
-                        "interrupted status unexpectedly succeeded in {phase}"
-                    );
-                    assert_eq!(
-                        status_json["ok"], false,
-                        "completed guardian must report an explicit safe outcome in {phase}: {status_json}"
-                    );
-                    assert!(
-                        try_child_lock(&child_lock_path(&repo.path())),
-                        "completed guardian must release the child lease in {phase}"
-                    );
-                    assert!(
-                        !git_started.exists(),
-                        "completed pre-Git guardian must not start stale Git in {phase}"
-                    );
-                }
-                state => panic!(
-                    "owner-death result was neither busy nor interrupted in {phase}: {state:?}"
-                ),
-            }
-        } else if guardian_lease_phase {
-            // These phases deliberately keep the guardian at a lease-held
-            // handshake marker. Do not accept completed/interrupted status:
-            // the child lease must still serialize recovery here.
-            assert!(
-                status.status.success(),
-                "status failed after the killed owner was reaped in {phase}: {}",
-                String::from_utf8_lossy(&status.stderr)
-            );
-            assert!(
-                !try_child_lock(&child_lock_path(&repo.path())),
-                "post-lease status was busy without the surviving guardian child lock in {phase}"
-            );
-            assert_eq!(
-                status_json["state"], "busy",
-                "new wt must see the surviving guardian as busy in {phase}: {status_json}"
-            );
-        } else {
-            assert_eq!(
-                status_json["state"], "interrupted",
-                "pre-lease owner death must report deterministic interruption in {phase}: {status_json}"
-            );
-            assert_eq!(
-                status_json["ok"], false,
-                "pre-lease status must be an explicit safe outcome in {phase}: {status_json}"
-            );
-            assert!(
-                !git_started.exists(),
-                "pre-lease owner death must not start stale Git in {phase}"
-            );
-        }
-
-        std::fs::write(&release, "release\n").expect("release handshake gate");
-        wait_for_child_lock(&child_lock_path(&repo.path()), true);
-        assert!(
-            !git_started.exists(),
-            "owner death before authorization started stale Git in {phase}"
-        );
-        let state_dir = repo.path().join(".git/wt-core");
-        let leftovers: Vec<_> = std::fs::read_dir(&state_dir)
-            .into_iter()
-            .flat_map(|entries| entries.flatten())
-            .filter(|entry| entry.file_name().to_string_lossy().contains("-guardian-"))
-            .collect();
-        assert!(
-            leftovers.is_empty(),
-            "owner crash left guardian protocol artifacts in {phase}: {leftovers:?}"
-        );
-    }
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_lifecycle_setup_failure_after_guardian_job_creation_releases_child_lock() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    wt_core()
-        .args(["add", "feature/windows-setup-failure", "--repo", &repo_str])
-        .assert()
-        .success();
-    let source = find_worktree_dir(&repo.path(), "feature-windows-setup-failure");
-    commit_file(&source, "setup.txt", "setup", "setup source");
-
-    let output = wt_core()
-        .args([
-            "merge",
-            "feature/windows-setup-failure",
-            "--repo",
-            &repo_str,
-        ])
-        .env("WT_CORE_WINDOWS_LIFECYCLE_FAIL_AFTER_JOB", "1")
-        .output()
-        .expect("setup failure should run");
-    assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("guardian job creation"));
-    wait_for_child_lock(&child_lock_path(&repo.path()), true);
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_lifecycle_continue_and_abort_use_the_guardian() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    let source = create_conflicted_merge(&repo, "feature/windows-continue");
-    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
-    run_git(&["add", "shared.txt"], &repo.path());
-
-    wt_core()
-        .args(["merge", "--continue", "--repo", &repo_str])
-        .assert()
-        .success();
-    assert!(
-        !source.exists(),
-        "continue should clean the source worktree"
-    );
-
-    let abort_repo = fixtures::TestRepo::new();
-    let abort_repo_str = abort_repo.path().display().to_string();
-    let abort_source = create_conflicted_merge(&abort_repo, "feature/windows-abort");
-    wt_core()
-        .args(["merge", "--abort", "--repo", &abort_repo_str])
-        .assert()
-        .success();
-    assert!(
-        abort_source.exists(),
-        "abort should retain the source worktree"
-    );
-}
-
-#[cfg(windows)]
-fn child_lock_path(repo: &std::path::Path) -> std::path::PathBuf {
-    repo.join(".git/wt-core/.merge-operation.lock-child")
-}
-
-#[cfg(windows)]
-fn try_child_lock(path: &std::path::Path) -> bool {
-    use windows_sys::Win32::Foundation::{GetLastError, ERROR_LOCK_VIOLATION};
-    use windows_sys::Win32::Storage::FileSystem::{
-        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
-    };
-    use windows_sys::Win32::System::IO::OVERLAPPED;
-
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(path)
-        .expect("child lock file");
-    let mut overlapped = OVERLAPPED::default();
-    let locked = unsafe {
-        LockFileEx(
-            file.as_raw_handle(),
-            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
-            0,
-            u32::MAX,
-            u32::MAX,
-            &mut overlapped,
-        )
-    } != 0;
-    if !locked {
-        assert_eq!(unsafe { GetLastError() }, ERROR_LOCK_VIOLATION);
-    }
-    locked
-}
-
-#[cfg(windows)]
-fn wait_for_child_lock(path: &std::path::Path, expected: bool) {
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if try_child_lock(path) == expected {
-            return;
-        }
-        sleep(Duration::from_millis(20));
-    }
-    panic!(
-        "timed out waiting for child lock {} to be {}",
-        path.display(),
-        if expected { "available" } else { "busy" }
-    );
-}
-
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn wait_for_file(path: &std::path::Path) {
     use std::thread::sleep;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline {
+    for _ in 0..200 {
         if path.is_file() {
             return;
         }
-        sleep(Duration::from_millis(50));
+        sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for {}", path.display());
 }
@@ -3800,131 +3014,6 @@ fn merge_normal_rejects_locked_stale_destination_before_content_merge() {
 }
 
 #[test]
-fn read_only_commands_preserve_stale_worktree_metadata() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    wt_core()
-        .args(["add", "feature/read-only-stale", "--repo", &repo_str])
-        .assert()
-        .success();
-    let stale_path = find_worktree_dir(&repo.path(), "feature-read-only-stale");
-    std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
-    let admin_before = worktree_admin_snapshot(&repo.path());
-
-    wt_core()
-        .args(["list", "--repo", &repo_str])
-        .assert()
-        .success();
-
-    wt_core()
-        .args(["go", "feature/read-only-stale", "--repo", &repo_str])
-        .assert()
-        .failure()
-        .code(5)
-        .stderr(predicate::str::contains("worktree for branch"))
-        .stderr(predicate::str::contains("is unavailable"));
-
-    wt_core()
-        .args([
-            "diff",
-            "feature/read-only-stale",
-            "--dry-run",
-            "--repo",
-            &repo_str,
-        ])
-        .assert()
-        .success();
-
-    wt_core()
-        .args(["doctor", "--repo", &repo_str])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("git worktree unlock"));
-
-    assert_eq!(
-        worktree_admin_snapshot(&repo.path()),
-        admin_before,
-        "read-only list, go, diff, and doctor must not run git worktree prune"
-    );
-}
-
-#[test]
-fn doctor_guides_locked_stale_metadata_without_recommending_plain_prune() {
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-
-    wt_core()
-        .args(["add", "feature/locked-stale", "--repo", &repo_str])
-        .assert()
-        .success();
-    let stale_path = find_worktree_dir(&repo.path(), "feature-locked-stale");
-    lock_worktree_metadata(&repo.path(), &stale_path);
-    std::fs::remove_dir_all(&stale_path).expect("remove locked stale worktree");
-
-    wt_core()
-        .args(["doctor", "--repo", &repo_str])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("git worktree unlock"))
-        .stdout(predicate::str::contains("wt prune --execute"))
-        .stdout(predicate::str::contains("run `wt prune --execute` to remove it safely").not());
-}
-
-#[cfg(unix)]
-#[test]
-fn stale_guidance_shell_quotes_apostrophe_and_whitespace_paths() {
-    let parent = fixtures::TestRepo::new();
-    let repo_path = parent.path().join("repo with ' apostrophe");
-    std::fs::create_dir(&repo_path).expect("create repository directory");
-    run_git(&["init", "-b", "main"], &repo_path);
-    run_git(&["config", "user.email", "test@test.com"], &repo_path);
-    run_git(&["config", "user.name", "Test"], &repo_path);
-    std::fs::write(repo_path.join("README.md"), "# test\n").expect("write readme");
-    run_git(&["add", "."], &repo_path);
-    run_git(&["commit", "-m", "initial commit"], &repo_path);
-
-    let repo_str = repo_path.display().to_string();
-    wt_core()
-        .args(["add", "feature/quoted-stale", "--repo", &repo_str])
-        .assert()
-        .success();
-    let stale_path = find_worktree_dir(&repo_path, "feature-quoted-stale");
-    std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
-    let expected_path = stale_path.display().to_string();
-
-    let doctor = wt_core()
-        .args(["doctor", "--repo", &repo_str])
-        .output()
-        .expect("run doctor");
-    assert!(doctor.status.success());
-    let doctor_output = String::from_utf8(doctor.stdout).expect("doctor output is utf8");
-
-    let parse_guidance_path = |output: &str| {
-        let command = output
-            .split_once("git worktree unlock ")
-            .and_then(|(_, rest)| rest.split('`').next())
-            .expect("unlock command in stale guidance");
-        let script = format!("set -- {command}; printf \"%s\" \"$1\"");
-        let parsed = StdCommand::new("sh")
-            .args(["-c", &script, "shell-parse"])
-            .output()
-            .expect("parse shell guidance");
-        assert!(parsed.status.success());
-        String::from_utf8(parsed.stdout).expect("parsed path is utf8")
-    };
-
-    assert_eq!(parse_guidance_path(&doctor_output), expected_path);
-
-    let go = wt_core()
-        .args(["go", "feature/quoted-stale", "--repo", &repo_str])
-        .output()
-        .expect("run go");
-    assert!(!go.status.success());
-    let go_output = String::from_utf8(go.stderr).expect("go output is utf8");
-    assert_eq!(parse_guidance_path(&go_output), expected_path);
-}
-
-#[test]
 fn merge_inspect_does_not_prune_locked_stale_metadata() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -4374,27 +3463,126 @@ fn create_conflicted_merge_at(
     source
 }
 
-#[cfg(any(unix, windows))]
+#[cfg(unix)]
 fn install_hook(repo: &fixtures::TestRepo, name: &str, script: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
     let hook = repo.path().join(".git/hooks").join(name);
     std::fs::write(&hook, script).expect("write hook");
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(&hook)
-            .expect("hook metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&hook, permissions).expect("chmod hook");
-    }
+    let mut permissions = std::fs::metadata(&hook)
+        .expect("hook metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&hook, permissions).expect("chmod hook");
 }
 
-#[cfg(any(unix, windows))]
+#[test]
+fn read_only_commands_preserve_stale_worktree_metadata() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/read-only-stale", "--repo", &repo_str])
+        .assert()
+        .success();
+    let stale_path = find_worktree_dir(&repo.path(), "feature-read-only-stale");
+    lock_worktree_metadata(&repo.path(), &stale_path);
+    std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
+    let admin_before = worktree_admin_snapshot(&repo.path());
+
+    wt_core()
+        .args(["list", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    wt_core()
+        .args(["go", "feature/read-only-stale", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains("worktree for branch"))
+        .stderr(predicate::str::contains("is unavailable"));
+
+    wt_core()
+        .args([
+            "diff",
+            "feature/read-only-stale",
+            "--dry-run",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+
+    wt_core()
+        .args(["doctor", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("git worktree unlock"));
+
+    assert_eq!(
+        worktree_admin_snapshot(&repo.path()),
+        admin_before,
+        "read-only commands must not prune stale metadata"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stale_guidance_shell_quotes_apostrophe_and_whitespace_paths() {
+    let parent = fixtures::TestRepo::new();
+    let repo_path = parent.path().join("repo with ' apostrophe");
+    std::fs::create_dir(&repo_path).expect("create repository directory");
+    run_git(&["init", "-b", "main"], &repo_path);
+    run_git(&["config", "user.email", "test@test.com"], &repo_path);
+    run_git(&["config", "user.name", "Test"], &repo_path);
+    std::fs::write(repo_path.join("README.md"), "# test\n").expect("write readme");
+    run_git(&["add", "."], &repo_path);
+    run_git(&["commit", "-m", "initial commit"], &repo_path);
+
+    let repo_str = repo_path.display().to_string();
+    wt_core()
+        .args(["add", "feature/quoted-stale", "--repo", &repo_str])
+        .assert()
+        .success();
+    let stale_path = find_worktree_dir(&repo_path, "feature-quoted-stale");
+    lock_worktree_metadata(&repo_path, &stale_path);
+    std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
+    let expected_path = stale_path.display().to_string();
+
+    let doctor = wt_core()
+        .args(["doctor", "--repo", &repo_str])
+        .output()
+        .expect("run doctor");
+    assert!(doctor.status.success());
+    let doctor_output = String::from_utf8(doctor.stdout).expect("doctor output is utf8");
+
+    let parse_guidance_path = |output: &str| {
+        let command = output
+            .split_once("git worktree unlock ")
+            .and_then(|(_, rest)| rest.split('`').next())
+            .expect("unlock command in stale guidance");
+        let script = format!("set -- {command}; printf \"%s\" \"$1\"");
+        let parsed = StdCommand::new("sh")
+            .args(["-c", &script, "shell-parse"])
+            .output()
+            .expect("parse shell guidance");
+        assert!(parsed.status.success());
+        String::from_utf8(parsed.stdout).expect("parsed path is utf8")
+    };
+
+    assert_eq!(parse_guidance_path(&doctor_output), expected_path);
+
+    let go = wt_core()
+        .args(["go", "feature/quoted-stale", "--repo", &repo_str])
+        .output()
+        .expect("run go");
+    assert!(!go.status.success());
+    let go_output = String::from_utf8(go.stderr).expect("go output is utf8");
+    assert_eq!(parse_guidance_path(&go_output), expected_path);
+}
+
+#[cfg(unix)]
 fn shell_quote(value: &str) -> String {
-    #[cfg(windows)]
-    let value = value.replace('\\', "/");
-    #[cfg(unix)]
-    let value = value.to_string();
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 

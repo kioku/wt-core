@@ -7,20 +7,11 @@
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
-#[cfg(not(windows))]
+#[cfg(unix)]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, Result};
-
-#[cfg(windows)]
-#[path = "windows_lifecycle.rs"]
-mod windows_lifecycle;
-
-#[cfg(windows)]
-pub(crate) fn run_windows_lifecycle_launcher() {
-    windows_lifecycle::run_launcher_if_requested();
-}
 
 /// Lifecycle phase persisted in the managed merge journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -52,19 +43,16 @@ pub(crate) struct MergeProgress {
 
 /// An OS-backed owner for the repository's mutating merge lifecycle.
 ///
-/// The file remains after the process exits, but the OS lock does not. This is
-/// intentional: process death therefore recovers without a PID-based timeout,
-/// while Git and every hook Git synchronously waits for keep the lifecycle
-/// lock. Background/daemonized hook repository mutation is unsupported.
-/// Windows places a surviving guardian outside an atomic kill-on-close job; the
-/// guardian acquires the separate child lease by path and retains it through
-/// job quiescence. Unrelated subprocesses never receive lifecycle handles.
+/// The parent lock serializes cooperating `wt-core` operations. On Unix,
+/// lifecycle Git children acquire a separate lease in `pre_exec`, so an
+/// unrelated subprocess cannot inherit the owner's lock. Windows uses normal
+/// `Command` execution and deliberately does not extend the lock to children;
+/// an abnormal owner termination can therefore release the wt lifecycle lock
+/// before a descendant exits.
 #[derive(Debug)]
 pub(crate) struct MergeLifecycleLock {
-    // The parent handle is intentionally retained for the entire lifecycle.
-    // Its lock is explicitly released on normal Unix drop so a descriptor
-    // inherited by an unrelated child cannot extend the owner lifetime.
     _file: fs::File,
+    #[cfg(unix)]
     child_lock_path: std::path::PathBuf,
     operation_id: String,
 }
@@ -74,91 +62,31 @@ impl MergeLifecycleLock {
         &self.operation_id
     }
 
-    /// Spawn the lifecycle child with a direct lease.
-    ///
-    /// Unix configures inheritance in the forked child, so the parent never
-    /// exposes the descriptor to unrelated concurrent spawns. Windows uses an
-    /// out-of-job guardian that acquires the child lease by path before
-    /// starting atomically job-assigned Git; the guardian owns cleanup after
-    /// parent death.
-    #[cfg(not(windows))]
+    /// Spawn a lifecycle Git child with a separate Unix lease. Windows uses
+    /// the standard `Command` path because its supported contract is limited
+    /// to cooperating `wt-core` parent serialization.
+    #[cfg(unix)]
     pub(crate) fn spawn_child(&self, command: &mut Command) -> io::Result<std::process::Child> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
+        use std::os::unix::process::CommandExt;
 
-            let child_lock_path = self.child_lock_path.clone();
-            // SAFETY: the callback only opens the separate child lock in the
-            // forked child, before it executes the requested program.
-            unsafe {
-                command.pre_exec(move || acquire_child_lock(&child_lock_path));
-            }
-            command.spawn()
+        let child_lock_path = self.child_lock_path.clone();
+        // SAFETY: this callback only opens and locks the private child lease
+        // in the forked child, before it executes the requested program.
+        unsafe {
+            command.pre_exec(move || acquire_child_lock(&child_lock_path));
         }
-
-        #[cfg(not(unix))]
-        {
-            command.spawn()
-        }
+        command.spawn()
     }
 
-    /// Capture a lifecycle child using the same stdio behavior as
-    /// `Command::output`, while retaining the lock in Git and its hooks.
-    #[cfg(not(windows))]
+    /// Capture a lifecycle Git child with the same stdio behavior as
+    /// `Command::output`.
+    #[cfg(unix)]
     pub(crate) fn output(&self, command: &mut Command) -> io::Result<std::process::Output> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.spawn_child(command)?.wait_with_output()
-    }
-
-    /// Capture a lifecycle child whose stdin must receive a Git transaction.
-    #[cfg(not(windows))]
-    pub(crate) fn output_with_stdin(
-        &self,
-        command: &mut Command,
-        input: &[u8],
-    ) -> io::Result<std::process::Output> {
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = self.spawn_child(command)?;
-        let stdin_result = child.stdin.take().map(|mut stdin| stdin.write_all(input));
-        if let Some(Err(error)) = stdin_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(error);
-        }
-        child.wait_with_output()
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn output_git(
-        &self,
-        args: &[&str],
-        cwd: &Path,
-        environment: &[(std::ffi::OsString, std::ffi::OsString)],
-    ) -> io::Result<std::process::Output> {
-        windows_lifecycle::output_git(&self.child_lock_path, args, cwd, environment)
-    }
-
-    #[cfg(windows)]
-    pub(crate) fn output_git_with_stdin(
-        &self,
-        args: &[&str],
-        cwd: &Path,
-        environment: &[(std::ffi::OsString, std::ffi::OsString)],
-        input: &[u8],
-    ) -> io::Result<std::process::Output> {
-        windows_lifecycle::output_git_with_stdin(
-            &self.child_lock_path,
-            args,
-            cwd,
-            environment,
-            input,
-        )
     }
 }
 
@@ -220,9 +148,13 @@ pub(crate) fn lock_is_held(path: &Path) -> Result<bool> {
             .is_some_and(|pid| pid == std::process::id());
         return Ok(!owner_is_current);
     }
-    child_lock_is_held(path)
+    #[cfg(unix)]
+    return child_lock_is_held(path);
+    #[cfg(not(unix))]
+    Ok(false)
 }
 
+#[cfg(unix)]
 fn child_lock_is_held(parent_path: &Path) -> Result<bool> {
     let path = child_lock_path(parent_path);
     match fs::symlink_metadata(&path) {
@@ -275,22 +207,20 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
     })?;
     ensure_private_directory(parent)?;
 
-    let (mut file, created) = open_or_create_private_lock(path).map_err(|error| {
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
         AppError::git(format!(
             "cannot open managed merge lifecycle lock '{}': {error}",
             path.display()
         ))
     })?;
-    let protection = if created {
-        protect_new_file(path)
-    } else {
-        ensure_private_file(path)
-    };
-    if let Err(error) = protection {
-        drop(file);
-        let _ = created.then(|| fs::remove_file(path));
-        return Err(error);
-    }
+    ensure_private_file(path)?;
 
     if !try_lock_exclusive(&file).map_err(|error| {
         AppError::git(format!(
@@ -308,52 +238,41 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
         )));
     }
 
-    let child_lock_path = child_lock_path(path);
-    let (child_file, child_created) = open_child_lock(&child_lock_path).map_err(|error| {
-        release_parent_lock(&file);
-        AppError::git(format!(
-            "cannot open managed merge lifecycle child lock '{}': {error}",
-            child_lock_path.display()
-        ))
-    })?;
-    let child_protection = if child_created {
-        protect_new_file(&child_lock_path)
-    } else {
-        ensure_private_file(&child_lock_path)
-    };
-    if let Err(error) = child_protection {
+    #[cfg(unix)]
+    let child_lock_path = {
+        let child_lock_path = child_lock_path(path);
+        let child_file = open_child_lock(&child_lock_path).map_err(|error| {
+            release_parent_lock(&file);
+            AppError::git(format!(
+                "cannot open managed merge lifecycle child lock '{}': {error}",
+                child_lock_path.display()
+            ))
+        })?;
+        ensure_private_file(&child_lock_path).map_err(|error| {
+            release_parent_lock(&file);
+            error
+        })?;
+        let child_available = try_lock_exclusive(&child_file).map_err(|error| {
+            release_parent_lock(&file);
+            AppError::git(format!(
+                "cannot inspect managed merge lifecycle child lock '{}': {error}",
+                child_lock_path.display()
+            ))
+        })?;
         drop(child_file);
-        let _ = child_created.then(|| fs::remove_file(&child_lock_path));
-        release_parent_lock(&file);
-        return Err(error);
-    }
-    let child_available = try_lock_exclusive(&child_file).map_err(|error| {
-        release_parent_lock(&file);
-        AppError::git(format!(
-            "cannot inspect managed merge lifecycle child lock '{}': {error}",
-            child_lock_path.display()
-        ))
-    })?;
-    drop(child_file);
-    if !child_available {
-        let owner = fs::read_to_string(path)
-            .ok()
-            .map(|contents| contents.trim().replace('\n', "; "))
-            .filter(|contents| !contents.is_empty())
-            .unwrap_or_else(|| "owner details are not yet available".to_string());
-        release_parent_lock(&file);
-        return Err(AppError::conflict(format!(
-            "managed merge lifecycle is busy ({owner}); wait for the live owner to finish, inspect with `wt merge --status`, then retry `wt merge`, `wt merge --continue`, or `wt merge --abort` as appropriate"
-        )));
-    }
-
-    #[cfg(windows)]
-    windows_lifecycle::sweep_stale_protocol_files_for_lock(&child_lock_path).map_err(|error| {
-        release_parent_lock(&file);
-        AppError::git(format!(
-            "cannot sweep managed merge lifecycle guardian protocol: {error}"
-        ))
-    })?;
+        if !child_available {
+            let owner = fs::read_to_string(path)
+                .ok()
+                .map(|contents| contents.trim().replace('\n', "; "))
+                .filter(|contents| !contents.is_empty())
+                .unwrap_or_else(|| "owner details are not yet available".to_string());
+            release_parent_lock(&file);
+            return Err(AppError::conflict(format!(
+                "managed merge lifecycle is busy ({owner}); wait for the live owner to finish, inspect with `wt merge --status`, then retry `wt merge`, `wt merge --continue`, or `wt merge --abort` as appropriate"
+            )));
+        }
+        child_lock_path
+    };
 
     let operation_id = new_operation_id();
     let owner = format!(
@@ -366,7 +285,6 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
         .and_then(|_| file.write_all(owner.as_bytes()))
         .and_then(|_| file.sync_all())
         .map_err(|error| {
-            release_parent_lock(&file);
             AppError::git(format!(
                 "cannot record managed merge lifecycle owner '{}': {error}",
                 path.display()
@@ -375,6 +293,7 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
 
     Ok(MergeLifecycleLock {
         _file: file,
+        #[cfg(unix)]
         child_lock_path,
         operation_id,
     })
@@ -451,10 +370,12 @@ pub(crate) fn try_lock_exclusive(_file: &fs::File) -> io::Result<bool> {
 
 impl Drop for MergeLifecycleLock {
     fn drop(&mut self) {
+        #[cfg(unix)]
         release_parent_lock(&self._file);
     }
 }
 
+#[cfg(unix)]
 fn child_lock_path(path: &Path) -> std::path::PathBuf {
     let name = path
         .file_name()
@@ -463,44 +384,27 @@ fn child_lock_path(path: &Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
-fn open_or_create_private_lock(path: &Path) -> io::Result<(fs::File, bool)> {
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    // Windows opens ordinary file handles non-inheritable by default. Keep
-    // this invariant instead of toggling process-global inheritability during
-    // lifecycle setup.
-    match options.open(path) {
-        Ok(file) => Ok((file, true)),
-        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let mut existing = fs::OpenOptions::new();
-            existing.read(true).write(true);
-            existing.open(path).map(|file| (file, false))
-        }
-        Err(error) => Err(error),
-    }
+#[cfg(unix)]
+fn open_child_lock(path: &Path) -> io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
 }
 
-fn open_child_lock(path: &Path) -> io::Result<(fs::File, bool)> {
-    open_or_create_private_lock(path)
-}
-
+#[cfg(unix)]
 fn release_parent_lock(file: &fs::File) {
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
+    use std::os::fd::AsRawFd;
 
-        // SAFETY: the descriptor belongs to `file` and remains open for the
-        // unlock. Explicitly releasing the parent OFD prevents an unrelated
-        // forked child from extending the lock until its exec.
-        let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
-    }
-    #[cfg(not(unix))]
-    let _ = file;
+    // SAFETY: the descriptor belongs to `file` and remains open for the
+    // unlock. This prevents a forked unrelated child from extending the
+    // parent lease until exec.
+    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
 }
 
 #[cfg(unix)]
@@ -543,37 +447,16 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
             ensure_directory_mode(path)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            // The caller has already validated the parent. Create exactly one
-            // directory so no intermediate path can be left with a default ACL.
-            match fs::create_dir(path) {
-                Ok(()) => {
-                    // New directories may be created with inherited/default
-                    // ACLs. Apply the private policy immediately, then
-                    // validate it read-only. An existing directory never takes
-                    // this path and is never repaired.
-                    let setup = (|| {
-                        set_private_directory_mode(path)?;
-                        protect_new_directory(path)?;
-                        ensure_directory_mode(path)
-                    })();
-                    if let Err(error) = setup {
-                        let _ = fs::remove_dir(path);
-                        return Err(error);
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    // A concurrent creator won the CREATE_DIRECTORY race; it
-                    // is now an existing object and must pass read-only
-                    // validation rather than being repaired.
-                    ensure_directory_mode(path)?;
-                }
-                Err(error) => {
-                    return Err(AppError::git(format!(
-                        "cannot create managed merge state directory '{}': {error}",
-                        path.display()
-                    )))
-                }
-            }
+            fs::create_dir_all(path).map_err(|error| {
+                AppError::git(format!(
+                    "cannot create managed merge state directory '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            // create_dir_all obeys umask, so enforce the mode after creation
+            // and check again for a concurrent replacement.
+            set_private_directory_mode(path)?;
+            ensure_directory_mode(path)?;
         }
         Err(error) => {
             return Err(AppError::git(format!(
@@ -582,42 +465,6 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
             )))
         }
     }
-    Ok(())
-}
-
-/// Apply protection to a file created by this operation, then validate it.
-/// Existing files must use `ensure_private_file` so tampered state is refused,
-/// not silently re-owned or re-permissioned.
-pub(crate) fn protect_new_file(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        AppError::git(format!(
-            "cannot inspect newly-created managed merge state '{}': {error}",
-            path.display()
-        ))
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(AppError::conflict(format!(
-            "managed merge state '{}' is not a private regular file",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o777 != 0o600 {
-            return Err(AppError::conflict(format!(
-                "managed merge state '{}' has insecure permissions (expected 0600)",
-                path.display()
-            )));
-        }
-    }
-    #[cfg(windows)]
-    windows_lifecycle::protect_private_file_windows(path).map_err(|error| {
-        AppError::conflict(format!(
-            "new managed merge state '{}' could not be protected: {error}",
-            path.display()
-        ))
-    })?;
     Ok(())
 }
 
@@ -646,13 +493,6 @@ pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {
             )));
         }
     }
-    #[cfg(windows)]
-    windows_lifecycle::ensure_private_file_windows(path).map_err(|error| {
-        AppError::conflict(format!(
-            "managed merge state '{}' has insecure Windows ACL: {error}",
-            path.display()
-        ))
-    })?;
     Ok(())
 }
 
@@ -672,17 +512,7 @@ fn ensure_directory_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(windows)]
-fn ensure_directory_mode(path: &Path) -> Result<()> {
-    windows_lifecycle::ensure_private_directory_windows(path).map_err(|error| {
-        AppError::conflict(format!(
-            "managed merge state directory '{}' has insecure Windows ACL: {error}",
-            path.display()
-        ))
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
+#[cfg(not(unix))]
 fn ensure_directory_mode(_path: &Path) -> Result<()> {
     Ok(())
 }
@@ -700,19 +530,6 @@ fn set_private_directory_mode(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_private_directory_mode(_path: &Path) -> Result<()> {
-    Ok(())
-}
-
-fn protect_new_directory(path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    windows_lifecycle::protect_private_directory_windows(path).map_err(|error| {
-        AppError::conflict(format!(
-            "new managed merge state directory '{}' could not be protected: {error}",
-            path.display()
-        ))
-    })?;
-    #[cfg(not(windows))]
-    let _ = path;
     Ok(())
 }
 
@@ -801,39 +618,10 @@ mod tests {
         drop(second);
     }
 
-    #[cfg(not(windows))]
-    #[test]
-    fn failed_child_spawn_releases_the_child_lock() {
-        let repository = tempfile::tempdir().expect("temporary repository");
-        let lock_path = repository.path().join("wt-core/merge-operation.lock");
-        let lifecycle_lock =
-            acquire_merge_lifecycle_lock(&lock_path).expect("lifecycle lock should be available");
-        let missing_program = repository.path().join("missing-lifecycle-child");
-        let mut command = Command::new(missing_program);
-
-        assert!(lifecycle_lock.spawn_child(&mut command).is_err());
-        drop(lifecycle_lock);
-        let recovered = acquire_merge_lifecycle_lock(&lock_path)
-            .expect("a failed child spawn must release its child lock");
-        drop(recovered);
-    }
-
     #[cfg(unix)]
     fn blocking_child() -> Command {
-        let mut command = {
-            #[cfg(unix)]
-            {
-                let mut command = Command::new("sh");
-                command.args(["-c", "printf 'ready\n'; cat >/dev/null"]);
-                command
-            }
-            #[cfg(windows)]
-            {
-                let mut command = Command::new("cmd.exe");
-                command.args(["/C", "echo ready&more"]);
-                command
-            }
-        };
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'ready\n'; cat >/dev/null"]);
         command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -847,8 +635,6 @@ mod tests {
 
         #[cfg(unix)]
         let mut ready = [0; 6];
-        #[cfg(windows)]
-        let mut ready = [0; 7];
         child
             .stdout
             .take()
@@ -857,8 +643,6 @@ mod tests {
             .expect("blocking child should report readiness");
         #[cfg(unix)]
         assert_eq!(&ready, b"ready\n");
-        #[cfg(windows)]
-        assert_eq!(&ready, b"ready\r\n");
     }
 
     #[cfg(unix)]
@@ -869,7 +653,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn lifecycle_lock_is_retained_only_by_the_intended_child() {
+    fn lifecycle_child_lease_is_scoped_to_the_intended_child() {
         let unrelated_repo = tempfile::tempdir().expect("unrelated repository");
         let unrelated_path = unrelated_repo.path().join("wt-core/merge-operation.lock");
         let unrelated_lock = acquire_merge_lifecycle_lock(&unrelated_path).expect("unrelated lock");
