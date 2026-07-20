@@ -1053,9 +1053,59 @@ fn windows_lifecycle_owner_death_at_each_pre_authorization_handshake_phase_is_sa
             .expect("handshake status should run after owner death");
         let status_json: serde_json::Value =
             serde_json::from_slice(&status.stdout).expect("handshake status JSON");
-        let lease_phase =
-            phase.contains("after-lease") || phase.contains("ready") || phase.contains("command");
-        if lease_phase {
+        let guardian_lease_phase = matches!(
+            phase,
+            "guardian-after-lease-before-ready" | "guardian-ready-before-command"
+        );
+        let parent_authorization_race = matches!(
+            phase,
+            "parent-after-ready-before-command" | "parent-command-before-start"
+        );
+        if parent_authorization_race {
+            // Once the owner has been reaped, either observation is valid:
+            // status may catch the guardian while its child lease is live, or
+            // the guardian may already have completed its safe pre-Git cleanup.
+            // The state JSON is the explicit result marker; the direct child
+            // lock probe makes a busy result prove the guardian lease rather
+            // than merely a stale parent-lock observation.
+            match status_json["state"].as_str() {
+                Some("busy") => {
+                    assert!(
+                        status.status.success(),
+                        "busy status failed after the killed owner was reaped in {phase}: {}",
+                        String::from_utf8_lossy(&status.stderr)
+                    );
+                    assert!(
+                        !try_child_lock(&child_lock_path(&repo.path())),
+                        "busy status lacked the surviving guardian child lease in {phase}"
+                    );
+                }
+                Some("interrupted") => {
+                    assert!(
+                        !status.status.success(),
+                        "interrupted status unexpectedly succeeded in {phase}"
+                    );
+                    assert_eq!(
+                        status_json["ok"], false,
+                        "completed guardian must report an explicit safe outcome in {phase}: {status_json}"
+                    );
+                    assert!(
+                        try_child_lock(&child_lock_path(&repo.path())),
+                        "completed guardian must release the child lease in {phase}"
+                    );
+                    assert!(
+                        !git_started.exists(),
+                        "completed pre-Git guardian must not start stale Git in {phase}"
+                    );
+                }
+                state => panic!(
+                    "owner-death result was neither busy nor interrupted in {phase}: {state:?}"
+                ),
+            }
+        } else if guardian_lease_phase {
+            // These phases deliberately keep the guardian at a lease-held
+            // handshake marker. Do not accept completed/interrupted status:
+            // the child lease must still serialize recovery here.
             assert!(
                 status.status.success(),
                 "status failed after the killed owner was reaped in {phase}: {}",
