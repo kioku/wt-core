@@ -2379,9 +2379,9 @@ pub fn merge_preflight(
 }
 
 /// Abort the merge marker created by this invocation, if any.
-fn abort_created_merge(path: &Path) {
+fn abort_created_merge(path: &Path, lifecycle_lock: &operation_state::MergeLifecycleLock) {
     if git::merge_in_progress(path) {
-        git::merge_abort(path);
+        git::merge_abort(path, lifecycle_lock);
     }
 }
 
@@ -2629,8 +2629,9 @@ fn finish_push(
     state: &mut MergeOperationState,
     destination: &Worktree,
     warnings: &mut Vec<String>,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> bool {
-    match git::push(&destination.path, &state.destination) {
+    match git::push(&destination.path, &state.destination, lifecycle_lock) {
         Ok(()) => {
             state.progress.push_done = true;
             match write_operation_state(repo, state) {
@@ -2673,6 +2674,7 @@ fn finish_committed_operation(
     repo: &RepoRoot,
     state: &mut MergeOperationState,
     warnings: &mut Vec<String>,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Option<PathBuf> {
     let _destination = match validate_committed_destination(repo, state) {
         Ok(destination) => destination,
@@ -2702,7 +2704,7 @@ fn finish_committed_operation(
 
     let push_recorded = match (state.push, state.progress.push_done) {
         (true, false) => match validate_committed_destination(repo, state) {
-            Ok(destination) => finish_push(repo, state, &destination, warnings),
+            Ok(destination) => finish_push(repo, state, &destination, warnings, lifecycle_lock),
             Err(error) => {
                 warnings.push(partial_success_warning(
                     "destination push",
@@ -2870,6 +2872,7 @@ fn continue_merge_commit(
     state: &mut MergeOperationState,
     preflight: &MergePreflight,
     report: &MergeOperationReport,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     if !matches!(report.state.as_str(), "ready") {
         return Err(AppError::conflict(format!(
@@ -2923,7 +2926,7 @@ fn continue_merge_commit(
 
     git::detach_head(&state.destination_path, &state.destination_head)?;
     let mut head_guard = DetachedHeadGuard::new(&state.destination_path, &destination_branch);
-    if let Err(error) = git::merge_continue(&state.destination_path) {
+    if let Err(error) = git::merge_continue(&state.destination_path, lifecycle_lock) {
         return Err(AppError {
             code: error.code,
             message: format!(
@@ -2975,7 +2978,7 @@ fn continue_merge_commit(
 
 /// Continue a managed merge after its conflicts have been resolved.
 pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
-    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
+    let lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     let (_, mut state) = load_valid_merge_state(repo)?;
     git::recover_branch_ref_lock(
         &state.destination_path,
@@ -3000,11 +3003,11 @@ pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
 
     let preflight = operation_preflight(&state);
     if state.phase != MergePhase::Committed {
-        continue_merge_commit(repo, &mut state, &preflight, &report)?;
+        continue_merge_commit(repo, &mut state, &preflight, &report, &lifecycle_lock)?;
     }
 
     let mut warnings = Vec::new();
-    let removed_path = finish_committed_operation(repo, &mut state, &mut warnings);
+    let removed_path = finish_committed_operation(repo, &mut state, &mut warnings, &lifecycle_lock);
 
     Ok(merge_result_from_operation(
         repo,
@@ -3017,7 +3020,7 @@ pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
 
 /// Abort a managed merge and clear only the matching operation record.
 pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
-    let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
+    let lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     let (_, mut state) = load_valid_merge_state(repo)?;
     git::recover_branch_ref_lock(
         &state.destination_path,
@@ -3049,9 +3052,11 @@ pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
         ));
     }
 
-    git::merge_abort_checked(&state.destination_path).map_err(|error| AppError {
-        code: error.code,
-        message: format!("managed merge abort failed; state was preserved\n{error}"),
+    git::merge_abort_checked(&state.destination_path, &lifecycle_lock).map_err(|error| {
+        AppError {
+            code: error.code,
+            message: format!("managed merge abort failed; state was preserved\n{error}"),
+        }
     })?;
     if git::merge_in_progress(&state.destination_path)
         || git::head_commit(&state.destination_path)? != state.destination_head
@@ -3089,11 +3094,12 @@ fn handle_merge_failure(
     destination_path: &Path,
     target_branch: &BranchName,
     operation: &mut MergeOperationState,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
     error: AppError,
 ) -> MergeFailure {
     let failure = classify_merge_failure(destination_path, target_branch, error);
     if failure.kind != MergeFailureKind::ContentConflict {
-        abort_created_merge(destination_path);
+        abort_created_merge(destination_path, lifecycle_lock);
         let _ = clear_operation_state(repo, operation);
         return failure;
     }
@@ -3101,12 +3107,12 @@ fn handle_merge_failure(
     match record_conflicted_merge_state(repo, destination_path, operation) {
         Ok(true) => failure,
         Ok(false) => {
-            abort_created_merge(destination_path);
+            abort_created_merge(destination_path, lifecycle_lock);
             let _ = clear_operation_state(repo, operation);
             failure
         }
         Err(state_error) => {
-            abort_created_merge(destination_path);
+            abort_created_merge(destination_path, lifecycle_lock);
             MergeFailure {
                 kind: MergeFailureKind::GitFailure,
                 error: AppError::conflict(format!(
@@ -3198,12 +3204,14 @@ pub(crate) fn merge_with_preflight(
     }
 
     // Attempt the merge from the selected destination worktree's context.
-    if let Err(error) = git::merge_no_ff(&destination_path, target_branch.as_str()) {
+    if let Err(error) = git::merge_no_ff(&destination_path, target_branch.as_str(), lifecycle_lock)
+    {
         return Err(handle_merge_failure(
             repo,
             &destination_path,
             &target_branch,
             &mut operation,
+            lifecycle_lock,
             error,
         ));
     }
@@ -3236,7 +3244,8 @@ pub(crate) fn merge_with_preflight(
     }
 
     let mut warnings = Vec::new();
-    let removed_path = finish_committed_operation(repo, &mut operation, &mut warnings);
+    let removed_path =
+        finish_committed_operation(repo, &mut operation, &mut warnings, lifecycle_lock);
     Ok(merge_result_from_operation(
         repo,
         &operation,

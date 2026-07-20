@@ -53,13 +53,33 @@ pub(crate) fn sanitize_git_environment(cmd: &mut Cmd) {
 /// Clears inherited `GIT_*` environment variables that could redirect
 /// operations to the wrong repository (common when invoked from git hooks).
 fn git(args: &[&str], cwd: &Path) -> Result<String> {
+    git_command(args, cwd, None)
+}
+
+/// Run a lifecycle Git command whose hooks must retain the lifecycle lock if
+/// `wt-core` is terminated while Git is still running.
+fn git_with_lifecycle_lock(
+    args: &[&str],
+    cwd: &Path,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<String> {
+    git_command(args, cwd, Some(lifecycle_lock))
+}
+
+fn git_command(
+    args: &[&str],
+    cwd: &Path,
+    lifecycle_lock: Option<&operation_state::MergeLifecycleLock>,
+) -> Result<String> {
     let mut cmd = Cmd::new("git");
     cmd.args(args).current_dir(cwd);
     sanitize_git_environment(&mut cmd);
 
-    let output = cmd
-        .output()
-        .map_err(|e| AppError::git(format!("failed to run git: {e}")))?;
+    let output = match lifecycle_lock {
+        Some(lock) => lock.output(&mut cmd),
+        None => cmd.output(),
+    }
+    .map_err(|e| AppError::git(format!("failed to run git: {e}")))?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1622,8 +1642,12 @@ pub fn merge_head(path: &Path) -> Result<Option<String>> {
 /// `path` identifies the worktree whose checked-out branch is the merge
 /// destination. Returns `Ok(())` on a clean merge or an error if conflicts
 /// arise (or any other git failure).
-pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
-    git(
+pub fn merge_no_ff(
+    path: &Path,
+    branch: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    git_with_lifecycle_lock(
         &[
             "merge",
             "--no-ff",
@@ -1632,6 +1656,7 @@ pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
             &format!("Merge branch '{branch}'"),
         ],
         path,
+        lifecycle_lock,
     )?;
     Ok(())
 }
@@ -1639,7 +1664,10 @@ pub fn merge_no_ff(path: &Path, branch: &str) -> Result<()> {
 /// Continue an in-progress merge through Git's normal commit and hook path.
 /// Worktree orchestration reserves the destination ref and handles the
 /// detached-HEAD/CAS boundary around this Git invocation.
-pub fn merge_continue(path: &Path) -> Result<()> {
+pub fn merge_continue(
+    path: &Path,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
     let mut cmd = Cmd::new("git");
     cmd.args(["merge", "--continue"]).current_dir(path);
     if std::env::var_os("GIT_EDITOR").is_none() {
@@ -1649,8 +1677,8 @@ pub fn merge_continue(path: &Path) -> Result<()> {
         cmd.env("GIT_EDITOR", "true");
     }
     sanitize_git_environment(&mut cmd);
-    let output = cmd
-        .output()
+    let output = lifecycle_lock
+        .output(&mut cmd)
         .map_err(|error| AppError::git(format!("failed to run git merge --continue: {error}")))?;
     if !output.status.success() {
         return Err(classify_git_error(
@@ -1661,8 +1689,11 @@ pub fn merge_continue(path: &Path) -> Result<()> {
 }
 
 /// Abort an in-progress merge and report failures to managed callers.
-pub fn merge_abort_checked(path: &Path) -> Result<()> {
-    git(&["merge", "--abort"], path)?;
+pub fn merge_abort_checked(
+    path: &Path,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    git_with_lifecycle_lock(&["merge", "--abort"], path, lifecycle_lock)?;
     Ok(())
 }
 
@@ -1670,8 +1701,8 @@ pub fn merge_abort_checked(path: &Path) -> Result<()> {
 ///
 /// Best-effort: if there is no merge to abort, git returns an error that
 /// we silently ignore.
-pub fn merge_abort(path: &Path) {
-    let _ = merge_abort_checked(path);
+pub fn merge_abort(path: &Path, lifecycle_lock: &operation_state::MergeLifecycleLock) {
+    let _ = merge_abort_checked(path, lifecycle_lock);
 }
 
 /// Location of wt-core's repository-local managed merge state.
@@ -1883,8 +1914,15 @@ fn run_difftool(mut cmd: Cmd) -> Result<()> {
 }
 
 /// Push a branch to `origin` from the worktree where it is checked out.
-pub fn push(path: &Path, branch: &str) -> Result<()> {
-    git(&["push", "origin", branch], path)?;
+///
+/// The pre-push hook is part of the managed lifecycle, so it receives the
+/// lock through the same scoped child-spawn path as merge hooks.
+pub fn push(
+    path: &Path,
+    branch: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    git_with_lifecycle_lock(&["push", "origin", branch], path, lifecycle_lock)?;
     Ok(())
 }
 
