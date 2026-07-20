@@ -17,6 +17,11 @@ use crate::error::{AppError, Result};
 #[path = "windows_lifecycle.rs"]
 mod windows_lifecycle;
 
+#[cfg(windows)]
+pub(crate) fn run_windows_lifecycle_launcher() {
+    windows_lifecycle::run_launcher_if_requested();
+}
+
 /// Lifecycle phase persisted in the managed merge journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,8 +56,9 @@ pub(crate) struct MergeProgress {
 /// intentional: process death therefore recovers without a PID-based timeout,
 /// while Git and every hook Git synchronously waits for keep the lifecycle
 /// lock. Background/daemonized hook repository mutation is unsupported.
-/// Windows places lifecycle Git in an atomic kill-on-close job and passes it a
-/// direct lease; unrelated subprocesses never receive that lease.
+/// Windows places an internal launcher in an atomic kill-on-close job and
+/// duplicates a non-inheritable direct lease into it; unrelated subprocesses
+/// never receive that lease.
 #[derive(Debug)]
 pub(crate) struct MergeLifecycleLock {
     // The parent handle is intentionally retained for the entire lifecycle.
@@ -71,10 +77,10 @@ impl MergeLifecycleLock {
     /// Spawn the lifecycle child with a direct lease.
     ///
     /// Unix configures inheritance in the forked child, so the parent never
-    /// exposes the descriptor to unrelated concurrent spawns. Windows uses
-    /// `CreateProcessW` with atomic job-list and handle-list attributes. The
-    /// job's kill-on-close policy closes the setup gap that could otherwise
-    /// leave a suspended Git process alive after its owner dies.
+    /// exposes the descriptor to unrelated concurrent spawns. Windows creates
+    /// a suspended internal launcher in a job, duplicates a non-inheritable
+    /// lease into it, and resumes it only after the transfer succeeds. The
+    /// job's kill-on-close policy closes every parent-death setup gap.
     #[cfg(not(windows))]
     pub(crate) fn spawn_child(&self, command: &mut Command) -> io::Result<std::process::Child> {
         #[cfg(unix)]
@@ -410,10 +416,10 @@ fn open_child_lock(path: &Path) -> io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    let file = options.open(path)?;
-    #[cfg(windows)]
-    clear_handle_inheritance(&file)?;
-    Ok(file)
+    // Windows opens ordinary file handles non-inheritable by default. Keep
+    // this invariant instead of toggling process-global inheritability during
+    // lifecycle setup.
+    options.open(path)
 }
 
 fn release_parent_lock(file: &fs::File) {
@@ -450,20 +456,6 @@ fn acquire_child_lock(path: &Path) -> io::Result<()> {
         // SAFETY: descriptor was opened successfully above.
         unsafe { libc::close(descriptor) };
         return Err(error);
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn clear_handle_inheritance(file: &fs::File) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
-
-    // The parent keeps this handle non-inheritable between lifecycle starts.
-    // The atomic Windows launcher temporarily enables it only for the
-    // CreateProcessW call and supplies an explicit HANDLE_LIST.
-    if unsafe { SetHandleInformation(file.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
-        return Err(io::Error::last_os_error());
     }
     Ok(())
 }

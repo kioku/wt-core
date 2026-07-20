@@ -14,6 +14,9 @@ use std::process;
 use clap::Parser;
 
 fn main() -> process::ExitCode {
+    #[cfg(windows)]
+    operation_state::run_windows_lifecycle_launcher();
+
     let cli = cli::Cli::parse();
 
     match commands::run(cli) {

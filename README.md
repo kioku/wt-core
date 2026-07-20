@@ -230,16 +230,20 @@ all durable journal/cleanup updates; its lock state is released safely by the
 OS after process death. A live owner makes a new merge, `--continue`, or
 `--abort` fail with recovery guidance, while `--status` remains read-only.
 
-On Windows, lifecycle Git is created atomically in a private kill-on-close
-Job Object and receives a direct child-lease handle through an explicit
-`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. Job assignment and lease transfer happen
-as part of the same `CreateProcessW` call: there is no suspended-process setup
-window, and unrelated subprocesses cannot inherit the lease. The job also
-contains Git's descendants and terminates any remaining members before wt-core
-releases the lease. Git hooks that Git synchronously waits for are supported;
-a hook that daemonizes, detaches, or otherwise mutates the repository after
-Git exits is unsupported and must not be used for lifecycle repository
-mutation.
+On Windows 10 and Windows Server 2016 or newer, lifecycle Git is contained
+by an internal launcher. wt-core atomically creates that launcher suspended in
+a private kill-on-close Job Object with `PROC_THREAD_ATTRIBUTE_JOB_LIST`, then
+uses `DuplicateHandle` to place a non-inheritable lease and private stdio/event
+handles in the suspended target. It resumes the launcher only after the
+transfer is complete. No parent handle is made inheritable, so unrelated
+spawns from the owner cannot inherit a lifecycle lease or pipe. The launcher
+runs Git with the exact args, environment, working directory, stdio, and
+supported creation flags, keeps the lease until the parent terminates and
+waits the job, and cannot break away from that job. Older Windows versions are
+not supported for lifecycle Git. Git hooks that Git synchronously waits for
+are supported; hooks that daemonize, detach, or mutate the repository after
+Git exits are outside the supported contract and must not be used for lifecycle
+repository mutation.
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
 

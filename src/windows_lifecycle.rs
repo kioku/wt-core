@@ -1,23 +1,30 @@
-//! Atomic Windows containment for lifecycle Git.
+//! Windows containment for lifecycle Git.
 //!
-//! Lifecycle Git is created directly in a private kill-on-close Job Object.
-//! Job-list and handle-list process attributes make containment and direct
-//! lease transfer part of CreateProcessW; there is no suspended-process
-//! handoff for a cleanup thread to lose.
+//! Windows 10 and Windows Server 2016 introduced `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
+//! The lifecycle path requires that API: it creates an internal launcher suspended
+//! in a kill-on-close job, then duplicates non-inheritable handles into that
+//! already-created process. No parent handle is made inheritable, so an unrelated
+//! concurrent spawn cannot observe a lifecycle lease or a lifecycle pipe.
+//!
+//! The launcher keeps the child lease until the parent has terminated the job and
+//! waited for every member. Git and hooks that Git synchronously waits for are
+//! supported; daemonized hooks that mutate the repository after Git returns are
+//! outside the contract.
 
 use std::ffi::{OsStr, OsString};
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, GetLastError, SetHandleInformation, GENERIC_READ, HANDLE, HANDLE_FLAG_INHERIT,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
+    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -29,21 +36,26 @@ use windows_sys::Win32::System::JobObjects::{
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
-    CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
-    InitializeProcThreadAttributeList, UpdateProcThreadAttribute, WaitForSingleObject,
-    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW,
+    CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, SetEvent,
+    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const INTERNAL_LAUNCHER_ARG: &str = "--__wt-core-windows-lifecycle-launcher";
+const INTERNAL_INHERIT_PROBE_ARG: &str = "--__wt-core-windows-inherit-probe";
+const INHERIT_PROBE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_INHERIT_PROBE";
+static BOOTSTRAP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Run Git with captured stdout/stderr while retaining the direct child lease.
 ///
 /// Git and every hook Git synchronously waits for remain inside the supported
 /// lifecycle boundary. Background/daemonized hook repository mutation is
-/// unsupported; the job nevertheless terminates leftover members before this
-/// function releases the lease, so they cannot mutate during recovery.
+/// unsupported; the job terminates leftover members before this function
+/// releases either copy of the child lease.
 pub(crate) fn output_git(
     child_lock_path: &Path,
     args: &[&str],
@@ -53,12 +65,12 @@ pub(crate) fn output_git(
     output_git_with_creation_flags(child_lock_path, args, cwd, environment, 0)
 }
 
-/// Run Git with caller-provided creation flags without replacing them.
+/// Run Git with caller-provided creation flags.
 ///
-/// The lifecycle production path currently needs no extra flags. Keeping the
-/// flags explicit prevents containment from silently discarding flags such as
-/// CREATE_NO_WINDOW or CREATE_NEW_PROCESS_GROUP when another caller supplies
-/// them.
+/// `CREATE_SUSPENDED` cannot be preserved: the internal launcher must resume
+/// its own suspended bootstrap process, and passing that flag to Git would
+/// leave Git suspended while the launcher waits. `CREATE_BREAKAWAY_FROM_JOB`
+/// is also rejected because no lifecycle process may leave its job.
 pub(crate) fn output_git_with_creation_flags(
     child_lock_path: &Path,
     args: &[&str],
@@ -66,6 +78,8 @@ pub(crate) fn output_git_with_creation_flags(
     environment: &[(OsString, OsString)],
     creation_flags: u32,
 ) -> io::Result<Output> {
+    validate_creation_flags(creation_flags)?;
+
     let child_lock = open_child_lock(child_lock_path)?;
     if !super::try_lock_exclusive(&child_lock)? {
         return Err(io::Error::new(
@@ -74,127 +88,173 @@ pub(crate) fn output_git_with_creation_flags(
         ));
     }
 
-    let job = Job::new()?;
+    // The declaration order is deliberate. If any setup path returns early,
+    // Job's Drop waits for quiescence before child_lock is dropped.
+    let mut job = Job::new()?;
     let mut stdio = StdioHandles::new()?;
-    let mut command_line = command_line("git", args)?;
+    let mut bootstrap = BootstrapFile::new(child_lock_path)?;
+    let done_event = OwnedHandle::new(create_event()?);
+    let gate_event = OwnedHandle::new(create_event()?);
+    let current_exe = std::env::current_exe()?;
+    let current_exe_wide = wide_path(current_exe.as_os_str())?;
     let current_directory = wide_path(cwd.as_os_str())?;
     let environment_block = environment_block(environment)?;
-    let mut attributes = AttributeList::new(2)?;
-    let inherited_handles = [
-        stdio.stdin.raw(),
-        stdio.stdout.write.raw(),
-        stdio.stderr.write.raw(),
-        raw_handle(&child_lock),
-    ];
 
+    // Only the job attribute is used for the atomic launcher creation. In
+    // particular, there is no HANDLE_LIST and no inherited lifecycle handle.
+    let mut attributes = AttributeList::new(1)?;
+    let job_handle = job.raw();
     attributes.update(
         PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-        (&job.raw() as *const HANDLE).cast(),
+        (&job_handle as *const HANDLE).cast(),
         size_of::<HANDLE>(),
     )?;
-    attributes.update(
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-        inherited_handles.as_ptr().cast(),
-        size_of::<HANDLE>() * inherited_handles.len(),
-    )?;
 
-    // HANDLE_LIST requires inheritable handles. The list is atomically applied
-    // by CreateProcessW, so no unrelated child receives this lease. The flags
-    // are cleared immediately after this one OS call returns.
-    for handle in &inherited_handles {
-        if let Err(error) = set_inheritable(*handle, true) {
-            for handle in &inherited_handles {
-                let _ = set_inheritable(*handle, false);
-            }
-            return Err(error);
-        }
-    }
-
+    let mut launcher_args = vec![
+        OsString::from(INTERNAL_LAUNCHER_ARG),
+        bootstrap.path().as_os_str().to_os_string(),
+    ];
+    launcher_args.extend(args.iter().map(OsString::from));
+    let mut command_line = command_line_os(current_exe.as_os_str(), &launcher_args)?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = stdio.stdin.raw();
-    startup.StartupInfo.hStdOutput = stdio.stdout.write.raw();
-    startup.StartupInfo.hStdError = stdio.stderr.write.raw();
     startup.lpAttributeList = attributes.raw();
 
+    // This opt-in probe is used only by the Windows integration test. It is
+    // deliberately an ordinary spawn from the lifecycle owner, at the exact
+    // point where the old implementation made its parent handles inheritable.
+    // The returned Child is kept alive until lifecycle Git returns so the test
+    // can detect any accidentally inherited lease after owner cleanup.
+    let _inheritance_probe = spawn_inheritance_probe(child_lock_path)?;
+
     let mut process_info = PROCESS_INFORMATION::default();
+    // The launcher is an internal implementation detail. Only CREATE_NO_WINDOW
+    // is copied to it; all other supported caller flags are applied unchanged
+    // to the Git process by the launcher.
+    let launcher_flags = CREATE_NO_WINDOW & creation_flags;
     // SAFETY: all pointers reference live, NUL-terminated buffers or valid
     // handles owned by this function for the duration of CreateProcessW.
     let created = unsafe {
         CreateProcessW(
-            std::ptr::null(),
+            current_exe_wide.as_ptr(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
-            1,
-            creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            0,
+            launcher_flags
+                | CREATE_SUSPENDED
+                | EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT,
             environment_block.as_ptr().cast(),
             current_directory.as_ptr(),
             (&startup as *const STARTUPINFOEXW).cast(),
             &mut process_info,
         )
     } != 0;
-
-    // The parent must never retain inheritable copies after CreateProcessW.
-    let mut clear_error = None;
-    for handle in &inherited_handles {
-        if let Err(error) = set_inheritable(*handle, false) {
-            clear_error = Some(error);
-        }
-    }
     if !created {
-        return Err(clear_error.unwrap_or_else(last_error));
+        return Err(last_error());
     }
-    if let Some(error) = clear_error {
-        // A process that was created but whose parent handles could not be
-        // made private is not safe to return. Kill and reap the whole job
-        // before closing the direct lease and reporting setup failure.
-        // SAFETY: job is the live owned containment handle.
-        let _ = unsafe { TerminateJobObject(job.raw(), 1) };
-        let _ = wait_for_process(job.raw());
-        close_raw(process_info.hProcess);
-        close_raw(process_info.hThread);
+
+    let process = OwnedHandle::new(process_info.hProcess);
+    let launcher_thread = OwnedHandle::new(process_info.hThread);
+
+    // DuplicateHandle writes directly into the suspended launcher's handle
+    // table. Every target copy is explicitly non-inheritable. The source
+    // handles in this parent were never inheritable either.
+    let target_handles = match duplicate_launcher_handles(
+        process.raw(),
+        raw_handle(&child_lock),
+        stdio.stdin.raw(),
+        stdio.stdout.write.raw(),
+        stdio.stderr.write.raw(),
+        done_event.raw(),
+        gate_event.raw(),
+    ) {
+        Ok(handles) => handles,
+        Err(error) => {
+            stdio.close_child_writes();
+            let _ = job.terminate_and_wait();
+            let _ = wait_for_process(process.raw());
+            return Err(error);
+        }
+    };
+
+    // The target handle values are intentionally sent after the suspended
+    // process exists. Before ResumeThread, parent death can only leave a
+    // suspended job member, which kill-on-close terminates.
+    if let Err(error) = bootstrap.write(&target_handles, creation_flags) {
         stdio.close_child_writes();
-        drop(child_lock);
+        let _ = job.terminate_and_wait();
+        let _ = wait_for_process(process.raw());
         return Err(error);
     }
 
-    // The thread handle is not needed after creation. The process and job are
-    // now owned by this function; every failure path below terminates and
-    // waits the job before dropping the direct lease.
-    close_raw(process_info.hThread);
-    stdio.close_child_writes();
-    drop(child_lock);
+    // The only possible setup window after handle duplication is the suspended
+    // launcher. ResumeThread is the handoff point: the target now owns a lease,
+    // and the parent continues to own the job until it proves quiescence.
+    // SAFETY: launcher_thread was created suspended and remains valid until
+    // after this call. The job already contains the target before it resumes.
+    if unsafe { ResumeThread(launcher_thread.raw()) } == u32::MAX {
+        stdio.close_child_writes();
+        let resume_error = last_error();
+        let _ = job.terminate_and_wait();
+        let _ = wait_for_process(process.raw());
+        return Err(resume_error);
+    }
+    drop(launcher_thread);
 
-    let process = OwnedHandle::new(process_info.hProcess);
+    // Close the parent's copies of the child ends before reading. The target
+    // launcher owns its duplicates, and Git owns the final explicit copies.
+    stdio.close_child_writes();
     let stdout = stdio.stdout.take_read();
     let stderr = stdio.stderr.take_read();
     let stdout_reader = thread::spawn(move || read_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_pipe(stderr));
 
-    let wait_result = wait_for_process(process.raw());
-    let exit_code = wait_result.and_then(|()| get_exit_code(process.raw()));
-
-    // Git normally waits for its hooks. If a daemonized hook survives Git,
-    // terminate the job before joining readers and releasing the lease. A job
-    // object becomes signaled only after all its members have exited.
+    let completion = wait_for_done_or_process(done_event.raw(), process.raw());
+    // Completion means Git has synchronously returned and the launcher is
+    // waiting on its gate. Terminating the job then closes the launcher lease;
+    // it also removes any unsupported daemon descendants before the wait.
     let cleanup_result = job.terminate_and_wait();
-    if cleanup_result.is_err() {
-        // KILL_ON_JOB_CLOSE is the last-resort cleanup if an explicit
-        // termination or job wait failed; do it before joining pipe readers.
-        drop(job);
-    }
+    let process_wait_result = wait_for_process(process.raw());
     let stdout = join_reader(stdout_reader);
     let stderr = join_reader(stderr_reader);
 
-    let exit_code = exit_code?;
+    let completion = completion?;
     cleanup_result?;
+    process_wait_result?;
+    let exit_code = if completion {
+        read_launcher_result(bootstrap.path())?
+    } else {
+        return Err(io::Error::other(
+            "lifecycle launcher exited before Git completion",
+        ));
+    };
+    let stdout = stdout?;
+    let stderr = stderr?;
+    drop(bootstrap);
+    drop(child_lock);
     Ok(Output {
         status: exit_status_from_raw(exit_code),
-        stdout: stdout?,
-        stderr: stderr?,
+        stdout,
+        stderr,
     })
+}
+
+fn validate_creation_flags(creation_flags: u32) -> io::Result<()> {
+    if creation_flags & CREATE_SUSPENDED != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CREATE_SUSPENDED is incompatible with lifecycle Git containment",
+        ));
+    }
+    if creation_flags & CREATE_BREAKAWAY_FROM_JOB != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CREATE_BREAKAWAY_FROM_JOB is incompatible with lifecycle Git containment",
+        ));
+    }
+    Ok(())
 }
 
 fn raw_handle(file: &File) -> HANDLE {
@@ -205,18 +265,394 @@ fn raw_handle(file: &File) -> HANDLE {
 fn open_child_lock(path: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
-    let file = options.open(path)?;
-    set_inheritable(raw_handle(&file), false)?;
-    Ok(file)
+    // Rust opens this handle non-inheritable. Do not toggle process-global
+    // inheritability: that is exactly the race this launcher architecture
+    // avoids.
+    options.open(path)
 }
 
-fn set_inheritable(handle: HANDLE, inheritable: bool) -> io::Result<()> {
-    let flags = if inheritable { HANDLE_FLAG_INHERIT } else { 0 };
-    // SAFETY: callers pass live handles owned by the surrounding RAII value.
-    if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, flags) } == 0 {
+fn create_event() -> io::Result<HANDLE> {
+    // Null SECURITY_ATTRIBUTES makes the event handle non-inheritable.
+    // SAFETY: null attributes/name request a private manual-reset event.
+    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if event.is_null() {
         Err(last_error())
     } else {
+        Ok(event)
+    }
+}
+
+fn duplicate_launcher_handles(
+    target_process: HANDLE,
+    child_lock: HANDLE,
+    stdin: HANDLE,
+    stdout: HANDLE,
+    stderr: HANDLE,
+    done_event: HANDLE,
+    gate_event: HANDLE,
+) -> io::Result<LauncherHandles> {
+    Ok(LauncherHandles {
+        lease: duplicate_into(target_process, child_lock)?,
+        stdin: duplicate_into(target_process, stdin)?,
+        stdout: duplicate_into(target_process, stdout)?,
+        stderr: duplicate_into(target_process, stderr)?,
+        done_event: duplicate_into(target_process, done_event)?,
+        gate_event: duplicate_into(target_process, gate_event)?,
+    })
+}
+
+fn duplicate_into(target_process: HANDLE, source: HANDLE) -> io::Result<HANDLE> {
+    let mut target = std::ptr::null_mut();
+    // SAFETY: source is a live handle owned by this process and target_process
+    // is the live suspended launcher. bInheritHandle is explicitly false.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            source,
+            target_process,
+            &mut target,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        Err(last_error())
+    } else {
+        Ok(target)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct LauncherHandles {
+    lease: HANDLE,
+    stdin: HANDLE,
+    stdout: HANDLE,
+    stderr: HANDLE,
+    done_event: HANDLE,
+    gate_event: HANDLE,
+}
+
+struct BootstrapFile {
+    path: PathBuf,
+    file: Option<File>,
+}
+
+impl BootstrapFile {
+    fn new(child_lock_path: &Path) -> io::Result<Self> {
+        let directory = child_lock_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed merge lifecycle child lock has no parent",
+            )
+        })?;
+        let stem = child_lock_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| std::borrow::Cow::Borrowed("merge-operation-child.lock"));
+        let sequence = BOOTSTRAP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        for attempt in 0..32u32 {
+            let path = directory.join(format!(
+                ".{stem}-launcher-{}-{sequence}-{attempt}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        path,
+                        file: Some(file),
+                    })
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not allocate a unique lifecycle launcher bootstrap file",
+        ))
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn write(&mut self, handles: &LauncherHandles, creation_flags: u32) -> io::Result<()> {
+        let file = self.file.as_mut().expect("bootstrap file is open");
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        writeln!(file, "{:x}", handles.lease as usize)?;
+        writeln!(file, "{:x}", handles.stdin as usize)?;
+        writeln!(file, "{:x}", handles.stdout as usize)?;
+        writeln!(file, "{:x}", handles.stderr as usize)?;
+        writeln!(file, "{:x}", handles.done_event as usize)?;
+        writeln!(file, "{:x}", handles.gate_event as usize)?;
+        writeln!(file, "{creation_flags:x}")?;
+        file.sync_all()?;
+        drop(self.file.take());
         Ok(())
+    }
+}
+
+impl Drop for BootstrapFile {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+fn read_bootstrap(path: &Path) -> io::Result<(LauncherHandles, u32)> {
+    let contents = fs::read_to_string(path)?;
+    let mut lines = contents.lines();
+    let handles = LauncherHandles {
+        lease: parse_handle(lines.next())?,
+        stdin: parse_handle(lines.next())?,
+        stdout: parse_handle(lines.next())?,
+        stderr: parse_handle(lines.next())?,
+        done_event: parse_handle(lines.next())?,
+        gate_event: parse_handle(lines.next())?,
+    };
+    let flags = lines
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher flags missing"))?
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "launcher flags invalid"))?;
+    if lines.next().is_some() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "launcher bootstrap has trailing data",
+        ));
+    }
+    Ok((handles, flags))
+}
+
+fn parse_handle(value: Option<&str>) -> io::Result<HANDLE> {
+    let value = value
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher handle missing"))?
+        .trim();
+    let raw = usize::from_str_radix(value, 16)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "launcher handle invalid"))?;
+    let handle = raw as HANDLE;
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "launcher handle is null",
+        ));
+    }
+    Ok(handle)
+}
+
+/// Handle the private launcher command before Clap parses normal CLI input.
+/// The launcher is the same executable so no extra binary or inherited control
+/// channel is required. Test binaries do not invoke this entry point; their
+/// Windows coverage exercises the public CLI integration path instead.
+pub(crate) fn run_launcher_if_requested() {
+    let mut args = std::env::args_os();
+    let _argv0 = args.next();
+    match args.next().as_deref() {
+        Some(value) if value == OsStr::new(INTERNAL_LAUNCHER_ARG) => {
+            let code = match args.next() {
+                Some(path) => launcher_main(PathBuf::from(path), args.collect()),
+                None => 1,
+            };
+            std::process::exit(code as i32);
+        }
+        Some(value) if value == OsStr::new(INTERNAL_INHERIT_PROBE_ARG) => {
+            let code = match (args.next(), args.next(), args.next()) {
+                (Some(lock), Some(started), Some(release)) => probe_main(
+                    PathBuf::from(lock),
+                    PathBuf::from(started),
+                    PathBuf::from(release),
+                ),
+                _ => 1,
+            };
+            std::process::exit(code);
+        }
+        _ => {}
+    }
+}
+
+fn spawn_inheritance_probe(child_lock_path: &Path) -> io::Result<Option<std::process::Child>> {
+    let Some(root) = std::env::var_os(INHERIT_PROBE_ENV) else {
+        return Ok(None);
+    };
+    let root = PathBuf::from(root);
+    let started = root.join("owner-spawn-helper-started");
+    let release = root.join("owner-spawn-helper-release");
+    let executable = std::env::current_exe()?;
+    let child = std::process::Command::new(executable)
+        .arg(INTERNAL_INHERIT_PROBE_ARG)
+        .arg(child_lock_path)
+        .arg(&started)
+        .arg(&release)
+        .env_remove(INHERIT_PROBE_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+    Ok(Some(child))
+}
+
+fn probe_main(_child_lock_path: PathBuf, started: PathBuf, release: PathBuf) -> i32 {
+    if fs::write(&started, "started\n").is_err() {
+        return 1;
+    }
+    while !release.is_file() {
+        thread::sleep(std::time::Duration::from_millis(25));
+    }
+    let finished = started.with_file_name("owner-spawn-helper-finished");
+    if fs::write(finished, "finished\n").is_err() {
+        return 1;
+    }
+    0
+}
+
+fn read_launcher_result(path: &Path) -> io::Result<u32> {
+    let result = fs::read_to_string(path)?;
+    let line = result
+        .lines()
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher result missing"))?;
+    let code = line
+        .strip_prefix("exit=")
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher result invalid"))?
+        .parse::<u32>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "launcher exit code invalid"))?;
+    Ok(code)
+}
+
+fn launcher_main(bootstrap_path: PathBuf, git_args: Vec<OsString>) -> u32 {
+    let (handles, creation_flags) = match read_bootstrap(&bootstrap_path) {
+        Ok(value) => value,
+        Err(_) => return 1,
+    };
+    // Remove the setup record as soon as the suspended-target handoff has been
+    // consumed. The same path is recreated only for the completion result.
+    let _ = fs::remove_file(&bootstrap_path);
+
+    let exit_code = launch_git_from_launcher(handles, &git_args, creation_flags).unwrap_or(1);
+
+    // The result is written and closed before the parent is notified. The
+    // launcher then waits on an unsignaled gate; the parent terminates the job
+    // and waits for quiescence, so the lease cannot be released early.
+    let _ = fs::write(&bootstrap_path, format!("exit={exit_code}\n"));
+    if unsafe { SetEvent(handles.done_event) } == 0 {
+        return 1;
+    }
+    // The parent deliberately never signals this event. Terminating the job
+    // closes the launcher and its lease after all remaining members are gone.
+    let _ = wait_for_process(handles.gate_event);
+    1
+}
+
+fn launch_git_from_launcher(
+    handles: LauncherHandles,
+    args: &[OsString],
+    creation_flags: u32,
+) -> io::Result<u32> {
+    validate_creation_flags(creation_flags)?;
+
+    // The copies in the launcher are non-inheritable. Create only private,
+    // inheritable duplicates immediately for Git's explicit HANDLE_LIST; no
+    // parent process can race this local launcher with an unrelated spawn.
+    let stdin = duplicate_in_launcher(handles.stdin, true)?;
+    let stdout = match duplicate_in_launcher(handles.stdout, true) {
+        Ok(handle) => handle,
+        Err(error) => {
+            close_raw(stdin);
+            return Err(error);
+        }
+    };
+    let stderr = match duplicate_in_launcher(handles.stderr, true) {
+        Ok(handle) => handle,
+        Err(error) => {
+            close_raw(stdin);
+            close_raw(stdout);
+            return Err(error);
+        }
+    };
+    let inherited_handles = [stdin, stdout, stderr];
+    let mut attributes = match AttributeList::new(1) {
+        Ok(attributes) => attributes,
+        Err(error) => {
+            close_handles(&inherited_handles);
+            return Err(error);
+        }
+    };
+    if let Err(error) = attributes.update(
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+        inherited_handles.as_ptr().cast(),
+        size_of::<HANDLE>() * inherited_handles.len(),
+    ) {
+        close_handles(&inherited_handles);
+        return Err(error);
+    }
+
+    let mut command_line = match command_line_os(OsStr::new("git"), args) {
+        Ok(command_line) => command_line,
+        Err(error) => {
+            close_handles(&inherited_handles);
+            return Err(error);
+        }
+    };
+    let mut startup = STARTUPINFOEXW::default();
+    startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+    startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startup.StartupInfo.hStdInput = stdin;
+    startup.StartupInfo.hStdOutput = stdout;
+    startup.StartupInfo.hStdError = stderr;
+    startup.lpAttributeList = attributes.raw();
+
+    let mut process_info = PROCESS_INFORMATION::default();
+    // Null environment and current directory intentionally inherit the
+    // launcher's exact environment/cwd, supplied by the parent at creation.
+    // The launcher itself does not mutate either value.
+    let created = unsafe {
+        CreateProcessW(
+            std::ptr::null(),
+            command_line.as_mut_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            1,
+            creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            (&startup as *const STARTUPINFOEXW).cast(),
+            &mut process_info,
+        )
+    } != 0;
+
+    close_handles(&inherited_handles);
+    if !created {
+        return Err(last_error());
+    }
+
+    close_raw(process_info.hThread);
+    let process = OwnedHandle::new(process_info.hProcess);
+    wait_for_process(process.raw())?;
+    get_exit_code(process.raw())
+}
+
+fn duplicate_in_launcher(source: HANDLE, inheritable: bool) -> io::Result<HANDLE> {
+    let mut target = std::ptr::null_mut();
+    // SAFETY: source is a valid handle duplicated into this launcher. The
+    // inheritable copy is restricted to the one explicit Git CreateProcessW.
+    if unsafe {
+        DuplicateHandle(
+            GetCurrentProcess(),
+            source,
+            GetCurrentProcess(),
+            &mut target,
+            0,
+            if inheritable { 1 } else { 0 },
+            DUPLICATE_SAME_ACCESS,
+        )
+    } == 0
+    {
+        Err(last_error())
+    } else {
+        Ok(target)
     }
 }
 
@@ -224,6 +660,12 @@ fn close_raw(handle: HANDLE) {
     if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
         // SAFETY: this function is called only for owned Win32 handles.
         unsafe { CloseHandle(handle) };
+    }
+}
+
+fn close_handles(handles: &[HANDLE]) {
+    for &handle in handles {
+        close_raw(handle);
     }
 }
 
@@ -250,7 +692,10 @@ impl Drop for OwnedHandle {
     }
 }
 
-struct Job(OwnedHandle);
+struct Job {
+    handle: OwnedHandle,
+    quiesced: bool,
+}
 
 impl Job {
     fn new() -> io::Result<Self> {
@@ -261,6 +706,8 @@ impl Job {
         }
 
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        // BREAKAWAY_OK and SILENT_BREAKAWAY_OK are intentionally absent. A
+        // launcher or Git descendant therefore cannot escape this job.
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
         // SAFETY: handle is owned above and limits remains live for the call.
         if unsafe {
@@ -275,14 +722,17 @@ impl Job {
             close_raw(handle);
             return Err(last_error());
         }
-        Ok(Self(OwnedHandle::new(handle)))
+        Ok(Self {
+            handle: OwnedHandle::new(handle),
+            quiesced: false,
+        })
     }
 
     fn raw(&self) -> HANDLE {
-        self.0.raw()
+        self.handle.raw()
     }
 
-    fn terminate_and_wait(&self) -> io::Result<()> {
+    fn terminate_and_wait(&mut self) -> io::Result<()> {
         // SAFETY: the job handle is owned by self and remains live here.
         let termination_error = if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
             Some(last_error())
@@ -290,8 +740,23 @@ impl Job {
             None
         };
         match wait_for_process(self.raw()) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                self.quiesced = true;
+                Ok(())
+            }
             Err(wait_error) => Err(termination_error.unwrap_or(wait_error)),
+        }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        if !self.quiesced {
+            // A cleanup failure must not turn into an un-waited handle close.
+            // This is a last-resort retry; normal paths call
+            // terminate_and_wait and record quiescence explicitly.
+            let _ = unsafe { TerminateJobObject(self.raw(), 1) };
+            let _ = wait_for_process(self.raw());
         }
     }
 }
@@ -367,21 +832,18 @@ struct Pipe {
 
 impl Pipe {
     fn new() -> io::Result<Self> {
+        // bInheritHandle=0 is essential: the parent never creates a temporary
+        // inheritable pipe end, even while another thread may spawn a child.
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
-            bInheritHandle: 1,
+            bInheritHandle: 0,
         };
         let mut read = std::ptr::null_mut();
         let mut write = std::ptr::null_mut();
         // SAFETY: output pointers and security attributes remain live for the call.
         if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
             return Err(last_error());
-        }
-        if let Err(error) = set_inheritable(read, false) {
-            close_raw(read);
-            close_raw(write);
-            return Err(error);
         }
         Ok(Self {
             read: Some(OwnedHandle::new(read)),
@@ -412,7 +874,7 @@ impl StdioHandles {
         let stdin = unsafe {
             CreateFileW(
                 nul.as_ptr(),
-                GENERIC_READ,
+                windows_sys::Win32::Foundation::GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 std::ptr::null(),
                 OPEN_EXISTING,
@@ -422,10 +884,6 @@ impl StdioHandles {
         };
         if stdin == INVALID_HANDLE_VALUE || stdin.is_null() {
             return Err(last_error());
-        }
-        if let Err(error) = set_inheritable(stdin, true) {
-            close_raw(stdin);
-            return Err(error);
         }
         Ok(Self {
             stdin: OwnedHandle::new(stdin),
@@ -443,11 +901,28 @@ impl StdioHandles {
 }
 
 fn wait_for_process(handle: HANDLE) -> io::Result<()> {
-    // SAFETY: handle is an owned process or job synchronization handle.
+    // SAFETY: handle is an owned process, event, or job synchronization handle.
     if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
         Err(last_error())
     } else {
         Ok(())
+    }
+}
+
+fn wait_for_done_or_process(done: HANDLE, process: HANDLE) -> io::Result<bool> {
+    let handles = [done, process];
+    // SAFETY: both handles remain live for the duration of this wait.
+    let result = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
+    if result == WAIT_OBJECT_0 {
+        Ok(true)
+    } else if result == WAIT_OBJECT_0 + 1 {
+        Ok(false)
+    } else if result == WAIT_FAILED {
+        Err(last_error())
+    } else {
+        Err(io::Error::other(
+            "unexpected lifecycle launcher wait result",
+        ))
     }
 }
 
@@ -483,40 +958,45 @@ fn wide_path(path: &OsStr) -> io::Result<Vec<u16>> {
     Ok(path.encode_wide().chain(Some(0)).collect())
 }
 
-fn command_line(program: &str, args: &[&str]) -> io::Result<Vec<u16>> {
-    let mut values = Vec::with_capacity(args.len() + 1);
-    values.push(OsString::from(program));
-    values.extend(args.iter().map(OsString::from));
-    let mut line = String::new();
-    for (index, value) in values.iter().enumerate() {
-        if index != 0 {
-            line.push(' ');
-        }
-        quote_windows_arg(&mut line, &value.to_string_lossy());
+fn command_line_os(program: &OsStr, args: &[OsString]) -> io::Result<Vec<u16>> {
+    let mut line = Vec::new();
+    quote_windows_arg(&mut line, program)?;
+    for value in args {
+        line.push(' ' as u16);
+        quote_windows_arg(&mut line, value)?;
     }
-    wide_path(OsStr::new(&line))
+    line.push(0);
+    Ok(line)
 }
 
-fn quote_windows_arg(output: &mut String, value: &str) {
-    output.push('"');
-    let mut backslashes = 0;
-    for character in value.chars() {
-        match character {
-            '\\' => backslashes += 1,
-            '"' => {
-                output.push_str(&"\\".repeat(backslashes * 2 + 1));
-                output.push('"');
+fn quote_windows_arg(output: &mut Vec<u16>, value: &OsStr) -> io::Result<()> {
+    let units: Vec<u16> = value.encode_wide().collect();
+    if units.contains(&0) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Windows process argument contains NUL",
+        ));
+    }
+    output.push('"' as u16);
+    let mut backslashes = 0usize;
+    for unit in units {
+        match unit {
+            92 => backslashes += 1,
+            34 => {
+                output.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2 + 1));
+                output.push(b'"' as u16);
                 backslashes = 0;
             }
-            _ => {
-                output.push_str(&"\\".repeat(backslashes));
-                output.push(character);
+            unit => {
+                output.extend(std::iter::repeat(b'\\' as u16).take(backslashes));
+                output.push(unit);
                 backslashes = 0;
             }
         }
     }
-    output.push_str(&"\\".repeat(backslashes * 2));
-    output.push('"');
+    output.extend(std::iter::repeat(b'\\' as u16).take(backslashes * 2));
+    output.push('"' as u16);
+    Ok(())
 }
 
 fn environment_block(environment: &[(OsString, OsString)]) -> io::Result<Vec<u16>> {
@@ -537,7 +1017,12 @@ fn environment_block(environment: &[(OsString, OsString)]) -> io::Result<Vec<u16
         block.extend_from_slice(&wide[..wide.len() - 1]);
         block.push(0);
     }
-    block.push(0);
+    if block.is_empty() {
+        // CreateProcessW requires two NUL code units even for an empty block.
+        block.extend_from_slice(&[0, 0]);
+    } else {
+        block.push(0);
+    }
     Ok(block)
 }
 
@@ -549,57 +1034,46 @@ fn exit_status_from_raw(code: u32) -> ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::operation_state::acquire_merge_lifecycle_lock;
 
-    fn environment() -> Vec<(OsString, OsString)> {
-        crate::git::sanitized_git_environment()
+    #[test]
+    fn empty_environment_is_double_nul_terminated() {
+        assert_eq!(
+            environment_block(&[]).expect("empty environment"),
+            vec![0, 0]
+        );
     }
 
     #[test]
-    fn lifecycle_git_preserves_stdio_and_creation_flags() {
-        let repository = tempfile::tempdir().expect("temporary repository");
-        let lock_path = repository.path().join("merge-operation.lock");
-        fs::File::create(&lock_path).expect("child lease file");
-        let output = output_git_with_creation_flags(
-            &lock_path,
-            &["--version"],
-            repository.path(),
-            &environment(),
-            windows_sys::Win32::System::Threading::CREATE_NO_WINDOW
-                | windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP,
-        )
-        .expect("Git should start in the contained process");
-
-        assert!(output.status.success());
-        assert!(!output.stdout.is_empty(), "stdout was not captured");
-
-        let output = output_git(
-            &lock_path,
-            &["--not-a-real-option"],
-            repository.path(),
-            &environment(),
-        )
-        .expect("Git should report an argument error through stderr");
-        assert!(!output.status.success());
-        assert!(!output.stderr.is_empty(), "stderr was not captured");
+    fn nonempty_environment_is_sorted_and_double_terminated() {
+        let block = environment_block(&[
+            (OsString::from("z-key"), OsString::from("z")),
+            (OsString::from("A-key"), OsString::from("a")),
+        ])
+        .expect("environment block");
+        assert!(block.ends_with(&[0, 0]));
+        assert!(block
+            .windows(2)
+            .any(|entry| entry == [b'A' as u16, b'-' as u16]));
     }
 
     #[test]
-    fn setup_failure_does_not_leave_a_child_lease_or_process() {
-        let repository = tempfile::tempdir().expect("temporary repository");
-        let missing_lock = repository.path().join("missing/merge-operation.lock");
-        assert!(output_git(
-            &missing_lock,
-            &["--version"],
-            repository.path(),
-            &environment()
-        )
-        .is_err());
+    fn command_line_quotes_backslashes_quotes_and_unicode() {
+        let args = vec![
+            OsString::from(r#"path with spaces\"#),
+            OsString::from("значение"),
+            OsString::from(""),
+        ];
+        let line = command_line_os(OsStr::new("git"), &args).expect("command line");
+        assert!(line
+            .windows(4)
+            .any(|window| window == [0x0437, 0x043d, 0x0430, 0x0447]));
+        assert_eq!(line.last(), Some(&0));
+    }
 
-        let lock_path = repository.path().join("merge-operation.lock");
-        let lifecycle = acquire_merge_lifecycle_lock(&lock_path).expect("lock should recover");
-        drop(lifecycle);
-        let recovered = acquire_merge_lifecycle_lock(&lock_path).expect("lock should be reusable");
-        drop(recovered);
+    #[test]
+    fn incompatible_creation_flags_are_rejected() {
+        assert!(validate_creation_flags(CREATE_SUSPENDED).is_err());
+        assert!(validate_creation_flags(CREATE_BREAKAWAY_FROM_JOB).is_err());
+        assert!(validate_creation_flags(0).is_ok());
     }
 }
