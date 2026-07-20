@@ -7,9 +7,10 @@
 //! concurrent spawn cannot observe a lifecycle lease or a lifecycle pipe.
 //!
 //! The launcher keeps the child lease until the parent has terminated the job and
-//! waited for every member. Git and hooks that Git synchronously waits for are
-//! supported; daemonized hooks that mutate the repository after Git returns are
-//! outside the contract.
+//! waited for every member. Cleanup failure retains the job handle and lease
+//! instead of relying on an unproven kill-on-close. Git and hooks that Git
+//! synchronously waits for are supported; daemonized hooks that mutate the
+//! repository after Git returns are outside the contract.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
@@ -18,7 +19,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::process::{ExitStatus, Output};
+use std::process::{Child, ExitStatus, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
@@ -46,8 +47,11 @@ use windows_sys::Win32::System::Threading::{
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const INTERNAL_LAUNCHER_ARG: &str = "--__wt-core-windows-lifecycle-launcher";
-const INTERNAL_INHERIT_PROBE_ARG: &str = "--__wt-core-windows-inherit-probe";
-const INHERIT_PROBE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_INHERIT_PROBE";
+// This protocol is intentionally opt-in and bounded. It is a kernel-observable
+// test of the no-inheritance invariant, not a production lifecycle mechanism.
+const INTERNAL_LOCK_PROBE_ARG: &str = "--__wt-core-windows-lifecycle-lock-probe";
+const LOCK_PROBE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_LOCK_PROBE";
+const LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 static BOOTSTRAP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 /// Run Git with captured stdout/stderr while retaining the direct child lease.
@@ -55,7 +59,9 @@ static BOOTSTRAP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Git and every hook Git synchronously waits for remain inside the supported
 /// lifecycle boundary. Background/daemonized hook repository mutation is
 /// unsupported; the job terminates leftover members before this function
-/// releases either copy of the child lease.
+/// releases either copy of the child lease. If termination or the job wait
+/// fails, the job handle is retained and this call returns an error without
+/// dropping the last lease.
 pub(crate) fn output_git(
     child_lock_path: &Path,
     args: &[&str],
@@ -88,8 +94,9 @@ pub(crate) fn output_git_with_creation_flags(
         ));
     }
 
-    // The declaration order is deliberate. If any setup path returns early,
-    // Job's Drop waits for quiescence before child_lock is dropped.
+    // The declaration order is deliberate. Setup failures before launcher
+    // creation close an empty job; failures after creation retain the job and
+    // lease rather than dropping them without a quiescence proof.
     let mut job = Job::new()?;
     let mut stdio = StdioHandles::new()?;
     let mut bootstrap = BootstrapFile::new(child_lock_path)?;
@@ -120,12 +127,12 @@ pub(crate) fn output_git_with_creation_flags(
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.lpAttributeList = attributes.raw();
 
-    // This opt-in probe is used only by the Windows integration test. It is
-    // deliberately an ordinary spawn from the lifecycle owner, at the exact
-    // point where the old implementation made its parent handles inheritable.
-    // The returned Child is kept alive until lifecycle Git returns so the test
-    // can detect any accidentally inherited lease after owner cleanup.
-    let _inheritance_probe = spawn_inheritance_probe(child_lock_path)?;
+    // This opt-in helper is an ordinary spawn from the lifecycle owner at the
+    // old inheritance-sensitive phase. It only probes whether the child lock
+    // becomes acquirable after this function releases it. The helper has a
+    // 60-second deadline and is reaped on every path; it cannot orphan a test
+    // process when setup fails.
+    let mut lock_probe = LockProbe::spawn(child_lock_path)?;
 
     let mut process_info = PROCESS_INFORMATION::default();
     // The launcher is an internal implementation detail. Only CREATE_NO_WINDOW
@@ -154,6 +161,7 @@ pub(crate) fn output_git_with_creation_flags(
     if !created {
         return Err(last_error());
     }
+    job.launcher_created = true;
 
     let process = OwnedHandle::new(process_info.hProcess);
     let launcher_thread = OwnedHandle::new(process_info.hThread);
@@ -173,8 +181,8 @@ pub(crate) fn output_git_with_creation_flags(
         Ok(handles) => handles,
         Err(error) => {
             stdio.close_child_writes();
-            let _ = job.terminate_and_wait();
-            let _ = wait_for_process(process.raw());
+            let (error, retain_lease) = cleanup_setup_failure(&mut job, process.raw(), error);
+            retain_or_release_child_lease(child_lock, retain_lease);
             return Err(error);
         }
     };
@@ -184,8 +192,8 @@ pub(crate) fn output_git_with_creation_flags(
     // suspended job member, which kill-on-close terminates.
     if let Err(error) = bootstrap.write(&target_handles, creation_flags) {
         stdio.close_child_writes();
-        let _ = job.terminate_and_wait();
-        let _ = wait_for_process(process.raw());
+        let (error, retain_lease) = cleanup_setup_failure(&mut job, process.raw(), error);
+        retain_or_release_child_lease(child_lock, retain_lease);
         return Err(error);
     }
 
@@ -197,9 +205,9 @@ pub(crate) fn output_git_with_creation_flags(
     if unsafe { ResumeThread(launcher_thread.raw()) } == u32::MAX {
         stdio.close_child_writes();
         let resume_error = last_error();
-        let _ = job.terminate_and_wait();
-        let _ = wait_for_process(process.raw());
-        return Err(resume_error);
+        let (error, retain_lease) = cleanup_setup_failure(&mut job, process.raw(), resume_error);
+        retain_or_release_child_lease(child_lock, retain_lease);
+        return Err(error);
     }
     drop(launcher_thread);
 
@@ -214,14 +222,24 @@ pub(crate) fn output_git_with_creation_flags(
     let completion = wait_for_done_or_process(done_event.raw(), process.raw());
     // Completion means Git has synchronously returned and the launcher is
     // waiting on its gate. Terminating the job then closes the launcher lease;
-    // it also removes any unsupported daemon descendants before the wait.
+    // the lease is not released until the job wait proves every member gone.
     let cleanup_result = job.terminate_and_wait();
-    let process_wait_result = wait_for_process(process.raw());
-    let stdout = join_reader(stdout_reader);
-    let stderr = join_reader(stderr_reader);
+    if let Err(error) = cleanup_result {
+        // The launcher may still own the only remaining child lease. Do not
+        // join readers whose pipes can still be live: Job's Drop deliberately
+        // leaks its handle on this path. Retain the parent's lease too, so a
+        // wait failure cannot accidentally release the last lease if the
+        // launcher happened to terminate concurrently.
+        drop(stdout_reader);
+        drop(stderr_reader);
+        std::mem::forget(child_lock);
+        return Err(error);
+    }
 
     let completion = completion?;
-    cleanup_result?;
+    let process_wait_result = wait_for_process(process.raw());
+    let stdout = join_reader(stdout_reader)?;
+    let stderr = join_reader(stderr_reader)?;
     process_wait_result?;
     let exit_code = if completion {
         read_launcher_result(bootstrap.path())?
@@ -230,15 +248,42 @@ pub(crate) fn output_git_with_creation_flags(
             "lifecycle launcher exited before Git completion",
         ));
     };
-    let stdout = stdout?;
-    let stderr = stderr?;
     drop(bootstrap);
     drop(child_lock);
+    if let Some(probe) = lock_probe.as_mut() {
+        probe.finish_after_lease_release()?;
+    }
     Ok(Output {
         status: exit_status_from_raw(exit_code),
         stdout,
         stderr,
     })
+}
+
+fn retain_or_release_child_lease(child_lock: File, retain: bool) {
+    if retain {
+        std::mem::forget(child_lock);
+    }
+}
+
+fn cleanup_setup_failure(job: &mut Job, process: HANDLE, original: io::Error) -> (io::Error, bool) {
+    match job.terminate_and_wait() {
+        Ok(()) => match wait_for_process(process) {
+            Ok(()) => (original, false),
+            Err(wait_error) => (
+                io::Error::other(format!(
+                    "{original}; lifecycle launcher cleanup completed but process reap failed: {wait_error}"
+                )),
+                false,
+            ),
+        },
+        Err(cleanup_error) => (
+            io::Error::other(format!(
+                "{original}; lifecycle cleanup failed and the child lease was retained: {cleanup_error}"
+            )),
+            true,
+        ),
+    }
 }
 
 fn validate_creation_flags(creation_flags: u32) -> io::Result<()> {
@@ -458,12 +503,12 @@ pub(crate) fn run_launcher_if_requested() {
             };
             std::process::exit(code as i32);
         }
-        Some(value) if value == OsStr::new(INTERNAL_INHERIT_PROBE_ARG) => {
+        Some(value) if value == OsStr::new(INTERNAL_LOCK_PROBE_ARG) => {
             let code = match (args.next(), args.next(), args.next()) {
-                (Some(lock), Some(started), Some(release)) => probe_main(
+                (Some(lock), Some(started), Some(acquired)) => lock_probe_main(
                     PathBuf::from(lock),
                     PathBuf::from(started),
-                    PathBuf::from(release),
+                    PathBuf::from(acquired),
                 ),
                 _ => 1,
             };
@@ -473,39 +518,147 @@ pub(crate) fn run_launcher_if_requested() {
     }
 }
 
-fn spawn_inheritance_probe(child_lock_path: &Path) -> io::Result<Option<std::process::Child>> {
-    let Some(root) = std::env::var_os(INHERIT_PROBE_ENV) else {
-        return Ok(None);
-    };
-    let root = PathBuf::from(root);
-    let started = root.join("owner-spawn-helper-started");
-    let release = root.join("owner-spawn-helper-release");
-    let executable = std::env::current_exe()?;
-    let child = std::process::Command::new(executable)
-        .arg(INTERNAL_INHERIT_PROBE_ARG)
-        .arg(child_lock_path)
-        .arg(&started)
-        .arg(&release)
-        .env_remove(INHERIT_PROBE_ENV)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(Some(child))
+/// A bounded helper used only by Windows integration tests. It is spawned by
+/// the lifecycle owner, not by the test runner, and attempts to acquire the
+/// child lock after the owner drops it. If the owner accidentally lends the
+/// lock handle to this unrelated process, acquisition never succeeds; the
+/// helper times out and is reaped instead of waiting on an unbounded release
+/// file.
+struct LockProbe {
+    child: Option<Child>,
+    acquired: PathBuf,
 }
 
-fn probe_main(_child_lock_path: PathBuf, started: PathBuf, release: PathBuf) -> i32 {
+impl LockProbe {
+    fn spawn(child_lock_path: &Path) -> io::Result<Option<Self>> {
+        // Integration tests run the debug binary. Keep this internal protocol
+        // out of release builds even if an inherited environment is hostile.
+        if !cfg!(debug_assertions) {
+            return Ok(None);
+        }
+        let Some(root) = std::env::var_os(LOCK_PROBE_ENV) else {
+            return Ok(None);
+        };
+        let root = PathBuf::from(root);
+        let started = root.join("owner-lock-probe-started");
+        let acquired = root.join("owner-lock-probe-acquired");
+        let executable = std::env::current_exe()?;
+        let child = std::process::Command::new(executable)
+            .arg(INTERNAL_LOCK_PROBE_ARG)
+            .arg(child_lock_path)
+            .arg(&started)
+            .arg(&acquired)
+            .env_remove(LOCK_PROBE_ENV)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()?;
+        Ok(Some(Self {
+            child: Some(child),
+            acquired,
+        }))
+    }
+
+    fn finish_after_lease_release(&mut self) -> io::Result<()> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| io::Error::other("lifecycle lock probe was already reaped"))?;
+        let deadline = std::time::Instant::now() + LOCK_PROBE_TIMEOUT;
+        loop {
+            if child.try_wait()?.is_some() {
+                let output = child.wait_with_output()?;
+                return validate_lock_probe_output(output, &self.acquired);
+            }
+            if std::time::Instant::now() >= deadline {
+                kill_and_reap_probe(&mut child);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "lifecycle lock probe exceeded its 60-second deadline",
+                ));
+            }
+            thread::sleep(std::time::Duration::from_millis(25));
+        }
+    }
+}
+
+fn kill_and_reap_probe(child: &mut Child) {
+    if let Err(error) = child.kill() {
+        eprintln!("failed to terminate Windows lifecycle test helper: {error}");
+    }
+    if let Err(error) = child.wait() {
+        eprintln!("failed to reap Windows lifecycle test helper: {error}");
+    }
+}
+
+fn validate_lock_probe_output(output: Output, acquired: &Path) -> io::Result<()> {
+    if !output.status.success()
+        || !fs::read_to_string(acquired)
+            .map(|contents| contents == "acquired\n")
+            .unwrap_or(false)
+    {
+        return Err(io::Error::other(format!(
+            "lifecycle lock probe failed: stdout={:?}, stderr={:?}",
+            output.stdout, output.stderr
+        )));
+    }
+    Ok(())
+}
+
+impl Drop for LockProbe {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let deadline = std::time::Instant::now() + LOCK_PROBE_TIMEOUT;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    thread::sleep(std::time::Duration::from_millis(25));
+                }
+                Ok(None) => {
+                    kill_and_reap_probe(&mut child);
+                    return;
+                }
+                Err(error) => {
+                    eprintln!("failed to poll Windows lifecycle test helper: {error}");
+                    kill_and_reap_probe(&mut child);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn lock_probe_main(child_lock_path: PathBuf, started: PathBuf, acquired: PathBuf) -> i32 {
     if fs::write(&started, "started\n").is_err() {
         return 1;
     }
-    while !release.is_file() {
-        thread::sleep(std::time::Duration::from_millis(25));
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(child_lock_path)
+    {
+        Ok(lock) => lock,
+        Err(_) => return 1,
+    };
+    let deadline = std::time::Instant::now() + LOCK_PROBE_TIMEOUT;
+    loop {
+        match super::try_lock_exclusive(&lock) {
+            Ok(true) => {
+                // Publish only after the successful lock handle is dropped;
+                // the marker is therefore an explicit lease-release event.
+                drop(lock);
+                return i32::from(fs::write(acquired, "acquired\n").is_err());
+            }
+            Ok(false) if std::time::Instant::now() < deadline => {
+                thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Ok(false) => return 2,
+            Err(_) => return 1,
+        }
     }
-    let finished = started.with_file_name("owner-spawn-helper-finished");
-    if fs::write(finished, "finished\n").is_err() {
-        return 1;
-    }
-    0
 }
 
 fn read_launcher_result(path: &Path) -> io::Result<u32> {
@@ -695,7 +848,20 @@ impl Drop for OwnedHandle {
 struct Job {
     handle: OwnedHandle,
     quiesced: bool,
+    launcher_created: bool,
+    #[cfg(test)]
+    cleanup_failure: Option<CleanupFailure>,
 }
+
+#[cfg(test)]
+#[derive(Clone, Copy)]
+enum CleanupFailure {
+    Terminate,
+    Wait,
+}
+
+#[cfg(test)]
+static RETAINED_JOB_HANDLES: AtomicU64 = AtomicU64::new(0);
 
 impl Job {
     fn new() -> io::Result<Self> {
@@ -725,7 +891,17 @@ impl Job {
         Ok(Self {
             handle: OwnedHandle::new(handle),
             quiesced: false,
+            launcher_created: false,
+            #[cfg(test)]
+            cleanup_failure: None,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_cleanup_failure(failure: CleanupFailure) -> io::Result<Self> {
+        let mut job = Self::new()?;
+        job.cleanup_failure = Some(failure);
+        Ok(job)
     }
 
     fn raw(&self) -> HANDLE {
@@ -733,31 +909,54 @@ impl Job {
     }
 
     fn terminate_and_wait(&mut self) -> io::Result<()> {
-        // SAFETY: the job handle is owned by self and remains live here.
-        let termination_error = if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
-            Some(last_error())
-        } else {
-            None
-        };
-        match wait_for_process(self.raw()) {
-            Ok(()) => {
-                self.quiesced = true;
-                Ok(())
+        #[cfg(test)]
+        match self.cleanup_failure.take() {
+            Some(CleanupFailure::Terminate) => {
+                return Err(io::Error::other("injected TerminateJobObject failure"));
             }
-            Err(wait_error) => Err(termination_error.unwrap_or(wait_error)),
+            Some(CleanupFailure::Wait) => {
+                // Exercise the same fail-closed state as a real WAIT_FAILED
+                // without relying on a race or an invalid kernel handle.
+                // Termination still happens below, but quiescence is withheld.
+                // The injected error is returned after the call.
+                if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
+                    return Err(last_error());
+                }
+                return Err(io::Error::other("injected WaitForSingleObject failure"));
+            }
+            None => {}
         }
+
+        // SAFETY: the job handle is owned by self and remains live here.
+        if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
+            return Err(last_error());
+        }
+        // A successful wait is the proof that no job member can retain the
+        // duplicated lease. Neither a TerminateJobObject failure nor a wait
+        // failure may mark this job quiesced.
+        wait_for_process(self.raw())?;
+        self.quiesced = true;
+        Ok(())
     }
 }
 
 impl Drop for Job {
     fn drop(&mut self) {
-        if !self.quiesced {
-            // A cleanup failure must not turn into an un-waited handle close.
-            // This is a last-resort retry; normal paths call
-            // terminate_and_wait and record quiescence explicitly.
-            let _ = unsafe { TerminateJobObject(self.raw(), 1) };
-            let _ = wait_for_process(self.raw());
+        if self.quiesced || !self.launcher_created {
+            return;
         }
+
+        // Drop cannot report an OS error. Closing this handle would activate
+        // kill-on-close without proving that the launcher and Git are gone,
+        // allowing the last child lease to disappear before quiescence. Leave
+        // the job handle open instead: a live launcher retains the child lease
+        // and blocks recovery; process exit closes the handle and lets the job
+        // kill its remaining members. This intentional leak is the fail-closed
+        // fallback for every unexpected cleanup failure.
+        let leaked = std::mem::replace(&mut self.handle, OwnedHandle(std::ptr::null_mut()));
+        std::mem::forget(leaked);
+        #[cfg(test)]
+        RETAINED_JOB_HANDLES.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1034,6 +1233,7 @@ fn exit_status_from_raw(code: u32) -> ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
     #[test]
     fn empty_environment_is_double_nul_terminated() {
@@ -1075,5 +1275,101 @@ mod tests {
         assert!(validate_creation_flags(CREATE_SUSPENDED).is_err());
         assert!(validate_creation_flags(CREATE_BREAKAWAY_FROM_JOB).is_err());
         assert!(validate_creation_flags(0).is_ok());
+    }
+
+    #[test]
+    fn cleanup_failures_retain_an_unquiesced_job_handle() {
+        let before = RETAINED_JOB_HANDLES.load(Ordering::Relaxed);
+        for failure in [CleanupFailure::Terminate, CleanupFailure::Wait] {
+            let mut job = Job::new_with_cleanup_failure(failure).expect("test job");
+            // Model the post-CreateProcess state in which the job owns the
+            // launcher and therefore owns the only safe cleanup boundary.
+            job.launcher_created = true;
+            assert!(job.terminate_and_wait().is_err());
+            assert!(!job.quiesced);
+            drop(job);
+        }
+        assert_eq!(
+            RETAINED_JOB_HANDLES.load(Ordering::Relaxed),
+            before + 2,
+            "cleanup failures must use the retaining Drop path"
+        );
+    }
+
+    #[test]
+    fn setup_failure_does_not_leave_a_child_lease() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let environment = crate::git::sanitized_git_environment();
+        let missing = repository.path().join("missing/merge-operation.lock");
+        assert!(output_git(&missing, &["--version"], repository.path(), &environment).is_err());
+
+        let lock_path = repository.path().join("merge-operation.lock");
+        fs::File::create(&lock_path).expect("child lease file");
+        let lock = open_child_lock(&lock_path).expect("child lock remains usable");
+        assert!(crate::operation_state::try_lock_exclusive(&lock).expect("child lock probe"));
+    }
+
+    #[test]
+    fn lifecycle_git_captures_exact_output_with_unicode_args_cwd_and_env() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let cwd = repository.path().join("рабочая папка");
+        fs::create_dir(&cwd).expect("unicode cwd");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&cwd)
+            .status()
+            .expect("git init")
+            .success());
+
+        let lock_path = repository.path().join("merge-operation.lock");
+        fs::File::create(&lock_path).expect("child lease file");
+        let exact_value = r#"значение with spaces "and" \ trailing"#;
+        let config = format!("wt.lifecycle={exact_value}");
+        let mut environment = crate::git::sanitized_git_environment();
+        environment.push((
+            OsString::from("WT_WINDOWS_EXACT_ENV"),
+            OsString::from(exact_value),
+        ));
+        let output = output_git_with_creation_flags(
+            &lock_path,
+            &["-c", &config, "config", "--get", "wt.lifecycle"],
+            &cwd,
+            &environment,
+            CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+        )
+        .expect("Git config should run");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, format!("{exact_value}\n").as_bytes());
+        assert_eq!(output.stderr, b"");
+
+        let expected = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(environment.iter().map(|(key, value)| (key, value)))
+            .output()
+            .expect("reference Git invocation");
+        let actual = output_git(
+            &lock_path,
+            &["rev-parse", "--show-toplevel"],
+            &cwd,
+            &environment,
+        )
+        .expect("contained Git invocation");
+        assert_eq!(actual.stdout, expected.stdout);
+        assert_eq!(actual.stderr, expected.stderr);
+
+        let failed = output_git(
+            &lock_path,
+            &["config", "--get", "wt.missing"],
+            &cwd,
+            &environment,
+        )
+        .expect("Git failures are returned as Output");
+        assert!(!failed.status.success());
+        assert_eq!(failed.stdout, b"");
+        assert_eq!(failed.stderr, b"");
+        let lock = open_child_lock(&lock_path).expect("child lock remains");
+        assert!(crate::operation_state::try_lock_exclusive(&lock).expect("child lock probe"));
     }
 }

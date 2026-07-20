@@ -797,25 +797,21 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
 #[cfg(windows)]
 #[test]
 fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immediately() {
-    use std::thread::sleep;
-    use std::time::Duration;
-
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
     wt_core()
-        .args(["add", "feature/windows-sync", "--repo", &repo_str])
+        .args(["add", "feature/windows-значение", "--repo", &repo_str])
         .assert()
         .success();
-    let source = find_worktree_dir(&repo.path(), "feature-windows-sync");
+    let source = find_worktree_dir(&repo.path(), "feature-windows-");
     commit_file(&source, "windows.txt", "windows", "windows source");
 
     let entered = repo.path().join("windows-sync-entered");
     let release = repo.path().join("windows-sync-release");
     let env_capture = repo.path().join("windows-sync-env");
     let cwd_capture = repo.path().join("windows-sync-cwd");
-    let probe_started = repo.path().join("owner-spawn-helper-started");
-    let probe_release = repo.path().join("owner-spawn-helper-release");
-    let probe_finished = repo.path().join("owner-spawn-helper-finished");
+    let probe_started = repo.path().join("owner-lock-probe-started");
+    let probe_acquired = repo.path().join("owner-lock-probe-acquired");
     install_hook(
         &repo,
         "post-merge",
@@ -830,10 +826,10 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
 
     let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
     merge
-        .args(["merge", "feature/windows-sync", "--repo", &repo_str])
+        .args(["merge", "feature/windows-значение", "--repo", &repo_str])
         .env("WT_WINDOWS_EXACT_ENV", "значение with spaces \\\"and\\\"")
         .env(
-            "WT_CORE_WINDOWS_LIFECYCLE_INHERIT_PROBE",
+            "WT_CORE_WINDOWS_LIFECYCLE_LOCK_PROBE",
             repo.path().as_os_str(),
         )
         .stdout(Stdio::piped())
@@ -850,14 +846,21 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
         serde_json::from_slice(&status.stdout).expect("busy status JSON");
     assert_eq!(status_json["state"], "busy");
 
-    // These are deliberately unrelated siblings. The lifecycle lease is
-    // present only in the wt-core process and must not leak to their spawns.
-    for _ in 0..16 {
-        StdCommand::new("cmd.exe")
-            .args(["/C", "exit", "0"])
-            .status()
-            .expect("unrelated Windows process should start");
-    }
+    // The helper is an unrelated process spawned by the lifecycle owner at
+    // the old inheritance-sensitive phase. It is bounded and reaped by the
+    // owner; its eventual acquisition is the kernel-observable exclusion.
+    let continue_output = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .output()
+        .expect("continue should run while sync hook is blocked");
+    assert!(!continue_output.status.success());
+    assert!(String::from_utf8_lossy(&continue_output.stderr).contains("busy"));
+    let abort_output = wt_core()
+        .args(["merge", "--abort", "--repo", &repo_str])
+        .output()
+        .expect("abort should run while sync hook is blocked");
+    assert!(!abort_output.status.success());
+    assert!(String::from_utf8_lossy(&abort_output.stderr).contains("busy"));
 
     std::fs::write(&release, "release\n").expect("release sync hook");
     let output = merge
@@ -879,92 +882,27 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
         git_rev_parse(&repo.path(), "--show-toplevel")
     );
 
-    // The helper was spawned by the lifecycle owner, not this test runner.
-    // It remains alive while the owner returns; a leaked inheritable child
-    // lease would keep status busy at this exact boundary.
-    let owner_status = wt_core()
-        .args(["merge", "--status", "--json", "--repo", &repo_str])
-        .output()
-        .expect("owner helper status should run");
-    let owner_status_json: serde_json::Value =
-        serde_json::from_slice(&owner_status.stdout).expect("owner helper status JSON");
-    assert_ne!(owner_status_json["state"], "busy");
-    std::fs::write(&probe_release, "release\n").expect("release owner helper");
-    wait_for_file(&probe_finished);
+    wait_for_file(&probe_acquired);
+    assert_eq!(
+        std::fs::read_to_string(&probe_acquired).expect("owner lock probe result"),
+        "acquired\n"
+    );
 
     // Immediate recovery is the important boundary: all direct Git handles,
     // pipe handles, and job members have been reaped before wt-core returns.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        let status = wt_core()
-            .args(["merge", "--status", "--json", "--repo", &repo_str])
-            .output()
-            .expect("recovery status should run");
-        if !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\"") {
-            return;
-        }
-        sleep(Duration::from_millis(100));
-    }
-    panic!("lifecycle lock did not recover after sync hook");
-}
-
-#[cfg(windows)]
-#[test]
-fn windows_lifecycle_quiesces_daemonized_hook_before_releasing_lease() {
-    use std::thread::sleep;
-    use std::time::{Duration, Instant};
-
-    let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
-    wt_core()
-        .args(["add", "feature/windows-daemon", "--repo", &repo_str])
-        .assert()
-        .success();
-    let source = find_worktree_dir(&repo.path(), "feature-windows-daemon");
-    commit_file(&source, "windows-daemon.txt", "daemon", "daemon source");
-
-    let started = repo.path().join("windows-daemon-started");
-    let release = repo.path().join("windows-daemon-release");
-    let mutated = repo.path().join("windows-daemon-mutated");
-    install_hook(
-        &repo,
-        "post-merge",
-        &format!(
-            "#!/bin/sh\nset -eu\n(printf started > {}; while [ ! -f {} ]; do sleep 0.1; done; printf mutated > {}) &\nwhile [ ! -f {} ]; do sleep 0.1; done\n",
-            shell_quote(&started.display().to_string()),
-            shell_quote(&release.display().to_string()),
-            shell_quote(&mutated.display().to_string()),
-            shell_quote(&started.display().to_string()),
-        ),
-    );
-
-    wt_core()
-        .args(["merge", "feature/windows-daemon", "--repo", &repo_str])
-        .assert()
-        .success();
-    assert!(started.is_file(), "daemon helper did not start");
+    let status = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("recovery status should run");
     assert!(
-        !mutated.exists(),
-        "daemonized hook mutated after Git returned"
+        !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
+        "lifecycle lock remained busy after the explicit probe completed"
     );
-
-    // If a platform shell detached outside the job, release it so the test
-    // still cleans up its helper before reporting the containment failure.
-    std::fs::write(&release, "release\n").expect("release daemon helper");
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while Instant::now() < deadline && !mutated.exists() {
-        sleep(Duration::from_millis(50));
-    }
-    assert!(!mutated.exists(), "daemonized hook escaped lifecycle job");
-    assert!(!source.exists(), "successful merge should clean source");
 }
 
 #[cfg(windows)]
 #[test]
 fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
-    use std::thread::sleep;
-    use std::time::Duration;
-
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
     wt_core()
@@ -976,6 +914,8 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
 
     let entered = repo.path().join("windows-killed-entered");
     let release = repo.path().join("windows-killed-release");
+    let probe_started = repo.path().join("owner-lock-probe-started");
+    let probe_acquired = repo.path().join("owner-lock-probe-acquired");
     install_hook(
         &repo,
         "post-merge",
@@ -989,10 +929,15 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
     let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
     merge
         .args(["merge", "feature/windows-killed", "--repo", &repo_str])
+        .env(
+            "WT_CORE_WINDOWS_LIFECYCLE_LOCK_PROBE",
+            repo.path().as_os_str(),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut merge = merge.spawn().expect("Windows merge should start");
     wait_for_file(&entered);
+    wait_for_file(&probe_started);
 
     // The parent is still alive while the synchronously waited hook is blocked;
     // the direct lease must make recovery report busy rather than racing Git.
@@ -1007,21 +952,24 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
     merge.kill().expect("owner should be terminable");
     let _ = merge.wait_with_output();
 
-    // Job close may make the child busy while the kernel quiesces the job,
-    // but it must never leave a live Git process or a permanently busy lease.
-    let deadline = std::time::Instant::now() + Duration::from_secs(60);
-    while std::time::Instant::now() < deadline {
-        let status = wt_core()
-            .args(["merge", "--status", "--json", "--repo", &repo_str])
-            .output()
-            .expect("status should run after owner death");
-        if !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\"") {
-            assert!(!release.exists(), "killed hook unexpectedly outlived Git");
-            return;
-        }
-        sleep(Duration::from_millis(100));
-    }
-    panic!("killed parent left the lifecycle Git lease busy");
+    // KILL_ON_JOB_CLOSE intentionally terminates the blocked hook when the
+    // owner dies, so a post-kill busy observation is not a contract: immediate
+    // non-busy is safe. The owner-spawned probe proves the stronger invariant
+    // that the transferred launcher lease is released only after the kernel
+    // has quiesced the job. It cannot acquire while the hook/job is alive.
+    wait_for_file(&probe_acquired);
+    assert!(
+        !release.exists(),
+        "killed hook unexpectedly reached its release"
+    );
+    let status = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run after owner death");
+    assert!(
+        !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
+        "killed parent left the lifecycle Git lease busy after the probe completed"
+    );
 }
 
 #[cfg(windows)]

@@ -239,11 +239,16 @@ transfer is complete. No parent handle is made inheritable, so unrelated
 spawns from the owner cannot inherit a lifecycle lease or pipe. The launcher
 runs Git with the exact args, environment, working directory, stdio, and
 supported creation flags, keeps the lease until the parent terminates and
-waits the job, and cannot break away from that job. Older Windows versions are
-not supported for lifecycle Git. Git hooks that Git synchronously waits for
-are supported; hooks that daemonize, detach, or mutate the repository after
-Git exits are outside the supported contract and must not be used for lifecycle
-repository mutation.
+waits the job, and cannot break away from that job. Cleanup is fail-closed: a
+failed termination or job wait never closes the last job/lease; the job handle
+is retained so recovery remains busy rather than racing a live member. Older
+Windows versions are not supported for lifecycle Git. Git hooks that Git
+synchronously waits for are supported; hooks that daemonize, detach, or mutate
+the repository after Git exits are outside the supported contract and must not
+be used for lifecycle repository mutation. When the owner process dies,
+`KILL_ON_JOB_CLOSE` intentionally tears down the blocked hook; therefore
+post-death `busy` is not promised, but the transferred lease remains until the
+kernel has quiesced the job.
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
 
