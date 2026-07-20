@@ -3870,6 +3870,60 @@ fn doctor_guides_locked_stale_metadata_without_recommending_plain_prune() {
         .stdout(predicate::str::contains("run `wt prune --execute` to remove it safely").not());
 }
 
+#[cfg(unix)]
+#[test]
+fn stale_guidance_shell_quotes_apostrophe_and_whitespace_paths() {
+    let parent = fixtures::TestRepo::new();
+    let repo_path = parent.path().join("repo with ' apostrophe");
+    std::fs::create_dir(&repo_path).expect("create repository directory");
+    run_git(&["init", "-b", "main"], &repo_path);
+    run_git(&["config", "user.email", "test@test.com"], &repo_path);
+    run_git(&["config", "user.name", "Test"], &repo_path);
+    std::fs::write(repo_path.join("README.md"), "# test\n").expect("write readme");
+    run_git(&["add", "."], &repo_path);
+    run_git(&["commit", "-m", "initial commit"], &repo_path);
+
+    let repo_str = repo_path.display().to_string();
+    wt_core()
+        .args(["add", "feature/quoted-stale", "--repo", &repo_str])
+        .assert()
+        .success();
+    let stale_path = find_worktree_dir(&repo_path, "feature-quoted-stale");
+    std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
+    let expected_path = stale_path.display().to_string();
+
+    let doctor = wt_core()
+        .args(["doctor", "--repo", &repo_str])
+        .output()
+        .expect("run doctor");
+    assert!(doctor.status.success());
+    let doctor_output = String::from_utf8(doctor.stdout).expect("doctor output is utf8");
+
+    let parse_guidance_path = |output: &str| {
+        let command = output
+            .split_once("git worktree unlock ")
+            .and_then(|(_, rest)| rest.split('`').next())
+            .expect("unlock command in stale guidance");
+        let script = format!("set -- {command}; printf \"%s\" \"$1\"");
+        let parsed = StdCommand::new("sh")
+            .args(["-c", &script, "shell-parse"])
+            .output()
+            .expect("parse shell guidance");
+        assert!(parsed.status.success());
+        String::from_utf8(parsed.stdout).expect("parsed path is utf8")
+    };
+
+    assert_eq!(parse_guidance_path(&doctor_output), expected_path);
+
+    let go = wt_core()
+        .args(["go", "feature/quoted-stale", "--repo", &repo_str])
+        .output()
+        .expect("run go");
+    assert!(!go.status.success());
+    let go_output = String::from_utf8(go.stderr).expect("go output is utf8");
+    assert_eq!(parse_guidance_path(&go_output), expected_path);
+}
+
 #[test]
 fn merge_inspect_does_not_prune_locked_stale_metadata() {
     let repo = fixtures::TestRepo::new();

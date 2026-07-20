@@ -39,6 +39,11 @@ fn resolve_branch_from_cwd(worktrees: &[Worktree]) -> Result<BranchName> {
     }
 }
 
+/// Quote a path for copy/paste in a POSIX-compatible shell command.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 /// Result of a successful `add` operation.
 pub struct AddResult {
     pub worktree_path: PathBuf,
@@ -290,12 +295,13 @@ pub fn go(repo: &RepoRoot, branch: &BranchName) -> Result<GoResult> {
             branch: branch.clone(),
             repo_root: repo.to_path_buf(),
         }),
-        Some(wt) => Err(AppError::conflict(format!(
-            "worktree for branch '{branch}' is unavailable at {}; inspect its Git metadata; if it is locked, run `git worktree unlock '{}'` when safe, then run `wt prune --execute` or `git worktree remove --force '{}'`",
-            wt.path.display(),
-            wt.path.display(),
-            wt.path.display()
-        ))),
+        Some(wt) => {
+            let quoted_path = shell_quote(&wt.path.display().to_string());
+            Err(AppError::conflict(format!(
+                "worktree for branch '{branch}' is unavailable at {}; inspect its Git metadata; if it is locked, run `git worktree unlock {quoted_path}` when safe, then run `wt prune --execute` or `git worktree remove --force {quoted_path}",
+                wt.path.display()
+            )))
+        }
         None => Err(AppError::usage(format!(
             "no worktree found for branch '{branch}'"
         ))),
@@ -1159,10 +1165,11 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
         }
         if !wt.path.is_dir() {
             let path = wt.path.display().to_string();
+            let quoted_path = shell_quote(&path);
             diags.push(Diagnostic {
                 level: DiagLevel::Warn,
                 message: format!(
-                    "stale worktree metadata for {path} (inspect its Git metadata; if it is locked, run `git worktree unlock '{path}'` when safe, then run `wt prune --execute` or `git worktree remove --force '{path}'`)"
+                    "stale worktree metadata for {path} (inspect its Git metadata; if it is locked, run `git worktree unlock {quoted_path}` when safe, then run `wt prune --execute` or `git worktree remove --force {quoted_path}`)"
                 ),
             });
         }
