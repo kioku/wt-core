@@ -35,16 +35,38 @@ pub(crate) fn sanitize_git_environment(cmd: &mut Cmd) {
         cmd.env_remove(var);
     }
     for (key, _) in std::env::vars_os() {
-        let name = key.to_string_lossy();
-        #[cfg(windows)]
-        let is_config_override = name
-            .get(.."GIT_CONFIG_".len())
-            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"));
-        #[cfg(not(windows))]
-        let is_config_override = name.starts_with("GIT_CONFIG_");
-        if is_config_override {
+        if is_git_config_override(&key) {
             cmd.env_remove(key);
         }
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn sanitized_git_environment() -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    std::env::vars_os()
+        .filter(|(key, _)| !is_git_environment_override(key))
+        .collect()
+}
+
+#[cfg(windows)]
+fn is_git_environment_override(key: &std::ffi::OsStr) -> bool {
+    let name = key.to_string_lossy();
+    GIT_ENV_OVERRIDES
+        .iter()
+        .any(|override_name| name.eq_ignore_ascii_case(override_name))
+        || is_git_config_override(key)
+}
+
+fn is_git_config_override(key: &std::ffi::OsStr) -> bool {
+    let name = key.to_string_lossy();
+    #[cfg(windows)]
+    {
+        name.get(.."GIT_CONFIG_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"))
+    }
+    #[cfg(not(windows))]
+    {
+        name.starts_with("GIT_CONFIG_")
     }
 }
 
@@ -56,8 +78,9 @@ fn git(args: &[&str], cwd: &Path) -> Result<String> {
     git_command(args, cwd, None)
 }
 
-/// Run a lifecycle Git command whose hooks must retain the lifecycle lock if
-/// `wt-core` is terminated while Git is still running.
+/// Run a lifecycle Git command whose direct lease remains held while Git and
+/// every hook Git synchronously waits for are still running. Daemonized hook
+/// repository mutation is outside the supported lifecycle contract.
 fn git_with_lifecycle_lock(
     args: &[&str],
     cwd: &Path,
@@ -76,6 +99,9 @@ fn git_command(
     sanitize_git_environment(&mut cmd);
 
     let output = match lifecycle_lock {
+        #[cfg(windows)]
+        Some(lock) => lock.output_git(args, cwd, &sanitized_git_environment()),
+        #[cfg(not(windows))]
         Some(lock) => lock.output(&mut cmd),
         None => cmd.output(),
     }
@@ -1677,6 +1703,16 @@ pub fn merge_continue(
         cmd.env("GIT_EDITOR", "true");
     }
     sanitize_git_environment(&mut cmd);
+    #[cfg(windows)]
+    let output = {
+        let mut environment = sanitized_git_environment();
+        if std::env::var_os("GIT_EDITOR").is_none() {
+            environment.push(("GIT_EDITOR".into(), "true".into()));
+        }
+        lifecycle_lock.output_git(&["merge", "--continue"], path, &environment)
+    }
+    .map_err(|error| AppError::git(format!("failed to run git merge --continue: {error}")))?;
+    #[cfg(not(windows))]
     let output = lifecycle_lock
         .output(&mut cmd)
         .map_err(|error| AppError::git(format!("failed to run git merge --continue: {error}")))?;
@@ -1915,8 +1951,9 @@ fn run_difftool(mut cmd: Cmd) -> Result<()> {
 
 /// Push a branch to `origin` from the worktree where it is checked out.
 ///
-/// The pre-push hook is part of the managed lifecycle, so it receives the
-/// lock through the same scoped child-spawn path as merge hooks.
+/// The pre-push hook is part of the managed lifecycle. Git synchronously
+/// waits for it before this direct lifecycle lease is released; daemonized
+/// repository mutation remains unsupported.
 pub fn push(
     path: &Path,
     branch: &str,

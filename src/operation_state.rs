@@ -7,10 +7,15 @@
 use std::fs;
 use std::io::{self, Seek, SeekFrom, Write};
 use std::path::Path;
+#[cfg(not(windows))]
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::{AppError, Result};
+
+#[cfg(windows)]
+#[path = "windows_lifecycle.rs"]
+mod windows_lifecycle;
 
 /// Lifecycle phase persisted in the managed merge journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -44,10 +49,10 @@ pub(crate) struct MergeProgress {
 ///
 /// The file remains after the process exits, but the OS lock does not. This is
 /// intentional: process death therefore recovers without a PID-based timeout,
-/// while a paused Git hook keeps the lock until Git and its hook descendants
-/// finish. The lifecycle Git child receives a separate inheritable lock
-/// handle, so unrelated subprocesses cannot delay recovery after this owner
-/// drops the parent lock.
+/// while Git and every hook Git synchronously waits for keep the lifecycle
+/// lock. Background/daemonized hook repository mutation is unsupported.
+/// Windows places lifecycle Git in an atomic kill-on-close job and passes it a
+/// direct lease; unrelated subprocesses never receive that lease.
 #[derive(Debug)]
 pub(crate) struct MergeLifecycleLock {
     // The parent handle is intentionally retained for the entire lifecycle.
@@ -63,17 +68,14 @@ impl MergeLifecycleLock {
         &self.operation_id
     }
 
-    /// Spawn the one child process that is allowed to retain this lifecycle
-    /// lock. Unix configures inheritance in the forked child, so the parent
-    /// never exposes the descriptor to unrelated concurrent spawns.
+    /// Spawn the lifecycle child with a direct lease.
     ///
-    /// Windows has no stable `std::process::Command` API for a restricted
-    /// inherited-handle list. Instead, the child is created suspended with
-    /// the lock handle explicitly non-inheritable. The locked file handle is
-    /// duplicated directly into that suspended process, marked inheritable
-    /// there, and only then is its primary thread resumed. This keeps the
-    /// lock out of every other process creation window while preserving all
-    /// of `Command`'s argument, environment, cwd, stdio, and error handling.
+    /// Unix configures inheritance in the forked child, so the parent never
+    /// exposes the descriptor to unrelated concurrent spawns. Windows uses
+    /// `CreateProcessW` with atomic job-list and handle-list attributes. The
+    /// job's kill-on-close policy closes the setup gap that could otherwise
+    /// leave a suspended Git process alive after its owner dies.
+    #[cfg(not(windows))]
     pub(crate) fn spawn_child(&self, command: &mut Command) -> io::Result<std::process::Child> {
         #[cfg(unix)]
         {
@@ -88,37 +90,7 @@ impl MergeLifecycleLock {
             command.spawn()
         }
 
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            use windows_sys::Win32::System::Threading::CREATE_SUSPENDED;
-
-            let child_file = open_child_lock(&self.child_lock_path)?;
-            if !try_lock_exclusive(&child_file)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "managed merge lifecycle child lock is busy",
-                ));
-            }
-
-            command.creation_flags(CREATE_SUSPENDED);
-            let mut child = command.spawn()?;
-            if let Err(error) = duplicate_handle_into_child(&child_file, &child)
-                .and_then(|()| resume_suspended_child(&child))
-            {
-                // The child is still suspended if either setup step failed.
-                // Terminating and waiting before returning closes any target
-                // handle that may already have been duplicated.
-                let _ = child.kill();
-                let _ = child.wait();
-                drop(child_file);
-                return Err(error);
-            }
-            drop(child_file);
-            Ok(child)
-        }
-
-        #[cfg(not(any(unix, windows)))]
+        #[cfg(not(unix))]
         {
             command.spawn()
         }
@@ -126,12 +98,23 @@ impl MergeLifecycleLock {
 
     /// Capture a lifecycle child using the same stdio behavior as
     /// `Command::output`, while retaining the lock in Git and its hooks.
+    #[cfg(not(windows))]
     pub(crate) fn output(&self, command: &mut Command) -> io::Result<std::process::Output> {
         command
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         self.spawn_child(command)?.wait_with_output()
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn output_git(
+        &self,
+        args: &[&str],
+        cwd: &Path,
+        environment: &[(std::ffi::OsString, std::ffi::OsString)],
+    ) -> io::Result<std::process::Output> {
+        windows_lifecycle::output_git(&self.child_lock_path, args, cwd, environment)
     }
 }
 
@@ -476,126 +459,11 @@ fn clear_handle_inheritance(file: &fs::File) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
 
-    // The lock handle must not be visible to the CreateProcess call below.
-    // It is introduced into the suspended target with DuplicateHandle only
-    // after that call has completed.
-    // SAFETY: the handle belongs to `file` and remains valid for the call.
+    // The parent keeps this handle non-inheritable between lifecycle starts.
+    // The atomic Windows launcher temporarily enables it only for the
+    // CreateProcessW call and supplies an explicit HANDLE_LIST.
     if unsafe { SetHandleInformation(file.as_raw_handle(), HANDLE_FLAG_INHERIT, 0) } == 0 {
         return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn duplicate_handle_into_child(file: &fs::File, child: &std::process::Child) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
-
-    let mut target_handle = std::ptr::null_mut();
-    // The target was created suspended, so introducing this inheritable handle
-    // cannot race a hook or an unrelated process creation. The target handle
-    // is closed automatically when the target exits.
-    // SAFETY: all handles are valid for the duration of the call; the target
-    // handle is requested inheritable so Git can pass it to its hooks.
-    if unsafe {
-        DuplicateHandle(
-            GetCurrentProcess(),
-            file.as_raw_handle(),
-            child.as_raw_handle(),
-            &mut target_handle,
-            0,
-            1,
-            DUPLICATE_SAME_ACCESS,
-        )
-    } == 0
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn open_suspended_child_thread(
-    thread_id: u32,
-) -> io::Result<windows_sys::Win32::Foundation::HANDLE> {
-    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_SUSPEND_RESUME};
-
-    let handle = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
-    if handle.is_null() {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(handle)
-    }
-}
-
-#[cfg(windows)]
-fn find_suspended_child_thread(
-    snapshot: windows_sys::Win32::Foundation::HANDLE,
-    process_id: u32,
-) -> io::Result<windows_sys::Win32::Foundation::HANDLE> {
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        Thread32First, Thread32Next, THREADENTRY32,
-    };
-
-    let mut entry = THREADENTRY32 {
-        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
-        ..Default::default()
-    };
-    if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    loop {
-        if entry.th32OwnerProcessID == process_id {
-            return open_suspended_child_thread(entry.th32ThreadID);
-        }
-        if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
-            break;
-        }
-    }
-    Err(io::Error::new(
-        io::ErrorKind::NotFound,
-        "could not find the suspended child primary thread",
-    ))
-}
-
-#[cfg(windows)]
-fn resume_suspended_child(child: &std::process::Child) -> io::Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD,
-    };
-    use windows_sys::Win32::System::Threading::{GetProcessId, ResumeThread};
-
-    let process = child.as_raw_handle();
-    let process_id = unsafe { GetProcessId(process) };
-    if process_id == 0 {
-        return Err(io::Error::last_os_error());
-    }
-
-    // CREATE_SUSPENDED guarantees that the process has not run user code and
-    // therefore still has only its primary thread. Discover that thread via
-    // the documented Toolhelp API; the stable Rust API does not expose the
-    // primary thread handle on the project's minimum Rust version.
-    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    if snapshot == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let thread = find_suspended_child_thread(snapshot, process_id);
-    // SAFETY: the snapshot was successfully created above.
-    unsafe { CloseHandle(snapshot) };
-    let thread = thread?;
-    let previous_count = unsafe { ResumeThread(thread) };
-    // SAFETY: this handle was opened by OpenThread above.
-    unsafe { CloseHandle(thread) };
-    if previous_count == u32::MAX {
-        return Err(io::Error::last_os_error());
-    }
-    if previous_count != 1 {
-        return Err(io::Error::other(format!(
-            "unexpected suspended child thread count: {previous_count}"
-        )));
     }
     Ok(())
 }
@@ -787,6 +655,7 @@ mod tests {
         drop(second);
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn failed_child_spawn_releases_the_child_lock() {
         let repository = tempfile::tempdir().expect("temporary repository");
@@ -803,7 +672,7 @@ mod tests {
         drop(recovered);
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     fn blocking_child() -> Command {
         let mut command = {
             #[cfg(unix)]
@@ -826,7 +695,7 @@ mod tests {
         command
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     fn wait_for_child_ready(child: &mut std::process::Child) {
         use std::io::Read;
 
@@ -846,15 +715,15 @@ mod tests {
         assert_eq!(&ready, b"ready\r\n");
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     fn finish_blocking_child(mut child: std::process::Child) {
         drop(child.stdin.take());
         child.wait().expect("blocking child should exit");
     }
 
-    #[cfg(any(unix, windows))]
+    #[cfg(unix)]
     #[test]
-    fn lifecycle_lock_inheritance_is_scoped_to_the_intended_child() {
+    fn lifecycle_lock_is_retained_only_by_the_intended_child() {
         let unrelated_repo = tempfile::tempdir().expect("unrelated repository");
         let unrelated_path = unrelated_repo.path().join("wt-core/merge-operation.lock");
         let unrelated_lock = acquire_merge_lifecycle_lock(&unrelated_path).expect("unrelated lock");

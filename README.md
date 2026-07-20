@@ -229,6 +229,17 @@ OS-backed lock is held from preflight through Git subprocess finalization and
 all durable journal/cleanup updates; its lock state is released safely by the
 OS after process death. A live owner makes a new merge, `--continue`, or
 `--abort` fail with recovery guidance, while `--status` remains read-only.
+
+On Windows, lifecycle Git is created atomically in a private kill-on-close
+Job Object and receives a direct child-lease handle through an explicit
+`PROC_THREAD_ATTRIBUTE_HANDLE_LIST`. Job assignment and lease transfer happen
+as part of the same `CreateProcessW` call: there is no suspended-process setup
+window, and unrelated subprocesses cannot inherit the lease. The job also
+contains Git's descendants and terminates any remaining members before wt-core
+releases the lease. Git hooks that Git synchronously waits for are supported;
+a hook that daemonizes, detaches, or otherwise mutates the repository after
+Git exits is unsupported and must not be used for lifecycle repository
+mutation.
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
 

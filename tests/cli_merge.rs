@@ -1,7 +1,7 @@
 mod fixtures;
 
 use std::process::Command as StdCommand;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::process::Stdio;
 
 use assert_cmd::Command;
@@ -757,9 +757,8 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
     wait_for_file(&entered);
     original.kill().expect("owner should be terminable");
 
-    // Git and its hook retain the inherited lifecycle lock after the owner
-    // dies. Releasing the hook first must not let continuation race Git's
-    // finalization; it may only recover after the child has exited.
+    // The lifecycle Git process retains its direct lease after the owner dies.
+    // A synchronously waited hook must finish before recovery can proceed.
     let busy = wt_core()
         .args(["merge", "--continue", "--repo", &repo_str])
         .output()
@@ -795,7 +794,137 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
     assert!(!source.exists());
 }
 
-#[cfg(unix)]
+#[cfg(windows)]
+#[test]
+fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immediately() {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/windows-sync", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-windows-sync");
+    commit_file(&source, "windows.txt", "windows", "windows source");
+
+    let entered = repo.path().join("windows-sync-entered");
+    let release = repo.path().join("windows-sync-release");
+    install_hook(
+        &repo,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\nprintf hook-stdout\nprintf hook-stderr >&2\n",
+            shell_quote(&entered.display().to_string()),
+            shell_quote(&release.display().to_string()),
+        ),
+    );
+
+    let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+    merge
+        .args(["merge", "feature/windows-sync", "--repo", &repo_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let merge = merge.spawn().expect("Windows merge should start");
+    wait_for_file(&entered);
+
+    let status = wt_core()
+        .args(["merge", "--status", "--json", "--repo", &repo_str])
+        .output()
+        .expect("status should run while sync hook is blocked");
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("busy status JSON");
+    assert_eq!(status_json["state"], "busy");
+
+    // These are deliberately unrelated siblings. The lifecycle lease is
+    // present only in the wt-core process and must not leak to their spawns.
+    for _ in 0..16 {
+        StdCommand::new("cmd.exe")
+            .args(["/C", "exit", "0"])
+            .status()
+            .expect("unrelated Windows process should start");
+    }
+
+    std::fs::write(&release, "release\n").expect("release sync hook");
+    let output = merge
+        .wait_with_output()
+        .expect("merge should finish after hook release");
+    assert!(
+        output.status.success(),
+        "merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Immediate recovery is the important boundary: all direct Git handles,
+    // pipe handles, and job members have been reaped before wt-core returns.
+    for _ in 0..100 {
+        let status = wt_core()
+            .args(["merge", "--status", "--json", "--repo", &repo_str])
+            .output()
+            .expect("recovery status should run");
+        if !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\"") {
+            return;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    panic!("lifecycle lock did not recover immediately after sync hook");
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/windows-killed", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-windows-killed");
+    commit_file(&source, "windows-killed.txt", "killed", "killed source");
+
+    let entered = repo.path().join("windows-killed-entered");
+    let release = repo.path().join("windows-killed-release");
+    install_hook(
+        &repo,
+        "post-merge",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            shell_quote(&entered.display().to_string()),
+            shell_quote(&release.display().to_string()),
+        ),
+    );
+
+    let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+    merge
+        .args(["merge", "feature/windows-killed", "--repo", &repo_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut merge = merge.spawn().expect("Windows merge should start");
+    wait_for_file(&entered);
+    merge.kill().expect("owner should be terminable");
+    let _ = merge.wait_with_output();
+
+    // Job close may make the child busy for a short kernel scheduling window,
+    // but it must never leave a live Git process or a permanently busy lease.
+    for _ in 0..200 {
+        let status = wt_core()
+            .args(["merge", "--status", "--json", "--repo", &repo_str])
+            .output()
+            .expect("status should run after owner death");
+        if !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\"") {
+            assert!(!release.exists(), "killed hook unexpectedly outlived Git");
+            return;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    panic!("killed parent left the lifecycle Git lease busy");
+}
+
+#[cfg(any(unix, windows))]
 fn wait_for_file(path: &std::path::Path) {
     use std::thread::sleep;
     use std::time::Duration;
@@ -3463,21 +3592,27 @@ fn create_conflicted_merge_at(
     source
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn install_hook(repo: &fixtures::TestRepo, name: &str, script: &str) {
-    use std::os::unix::fs::PermissionsExt;
-
     let hook = repo.path().join(".git/hooks").join(name);
     std::fs::write(&hook, script).expect("write hook");
-    let mut permissions = std::fs::metadata(&hook)
-        .expect("hook metadata")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&hook, permissions).expect("chmod hook");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&hook)
+            .expect("hook metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&hook, permissions).expect("chmod hook");
+    }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn shell_quote(value: &str) -> String {
+    #[cfg(windows)]
+    let value = value.replace('\\', "/");
+    #[cfg(unix)]
+    let value = value.to_string();
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
