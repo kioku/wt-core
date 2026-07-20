@@ -539,6 +539,52 @@ fn remove_keep_branch_failed_retry_preserves_marker_for_later_prune() {
 }
 
 #[test]
+fn remove_keep_branch_failed_retry_does_not_restore_stale_marker() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let branch = "feature/stale-retry-marker";
+
+    wt_core()
+        .args(["add", branch, "--repo", &repo_str])
+        .assert()
+        .success();
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .success();
+    let marker_ref = "refs/wt-core/preserved/feature/stale-retry-marker";
+    let old_marker = git_ref_hash(&repo.path(), marker_ref).expect("marker should exist");
+
+    let reattached = repo.path().join("stale-retry-marker-reattached");
+    run_git(
+        &["worktree", "add", &reattached.display().to_string(), branch],
+        &repo.path(),
+    );
+    fixtures::commit_file(&reattached, "advanced.txt", "advanced", "advance branch");
+    std::fs::write(reattached.join("uncommitted.txt"), "dirty")
+        .expect("failed to make reattached worktree dirty");
+    assert_ne!(
+        Some(old_marker),
+        git_ref_hash(&repo.path(), "refs/heads/feature/stale-retry-marker")
+    );
+
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert!(
+        reattached.exists(),
+        "failed removal must preserve the worktree"
+    );
+    assert!(
+        git_ref_hash(&repo.path(), marker_ref).is_none(),
+        "rollback must clear a marker whose old OID no longer matches the branch"
+    );
+}
+
+#[test]
 fn remove_keep_branch_print_paths_preserves_legacy_protocol() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();

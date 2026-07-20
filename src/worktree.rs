@@ -411,14 +411,14 @@ fn remove_with_branch_context(
         &planned_branch_oid,
         "remove",
     ) {
-        rollback_preservation_if_requested(
+        let rollback = rollback_preservation_if_requested(
             keep_branch,
             repo,
             &target_branch,
             &planned_branch_oid,
             previous_marker.as_deref(),
         );
-        return Err(error);
+        return Err(with_preservation_rollback_error(error, rollback));
     }
 
     // Retain Git's native worktree removal for its cross-platform metadata and
@@ -426,14 +426,14 @@ fn remove_with_branch_context(
     // commands, while validation and the branch OID CAS fail closed on
     // detectable changes.
     if let Err(error) = git::remove_worktree(repo, &removed_path, force) {
-        rollback_preservation_if_requested(
+        let rollback = rollback_preservation_if_requested(
             keep_branch,
             repo,
             &target_branch,
             &planned_branch_oid,
             previous_marker.as_deref(),
         );
-        return Err(error);
+        return Err(with_preservation_rollback_error(error, rollback));
     }
     let (branch_deleted, warning) = if keep_branch {
         (false, None)
@@ -478,23 +478,39 @@ fn rollback_preservation_if_requested(
     branch: &BranchName,
     planned_oid: &str,
     previous_marker: Option<&str>,
-) {
+) -> Result<()> {
     if !keep_branch {
-        return;
+        return Ok(());
     }
-    if git::preserved_branch_oid(repo, branch)
-        .ok()
-        .flatten()
-        .as_deref()
-        != Some(planned_oid)
-    {
-        return;
+    if git::preserved_branch_oid(repo, branch)?.as_deref() != Some(planned_oid) {
+        return Err(AppError::conflict(format!(
+            "preservation marker for branch '{}' changed during removal; leaving the replacement marker untouched",
+            branch.as_str()
+        )));
     }
-    let result = match previous_marker {
-        Some(previous) => git::restore_preserved_branch_at_cas(repo, branch, previous, planned_oid),
-        None => git::clear_preserved_branch_at_cas(repo, branch, planned_oid),
-    };
-    let _ = result;
+
+    // A prior marker is safe to restore only when it still names the current
+    // branch incarnation. Otherwise clear the marker installed by this failed
+    // attempt instead of reviving stale lifecycle state for an old branch tip.
+    let branch_head = git::branch_oid(repo, branch);
+    match previous_marker {
+        Some(previous) if branch_head.as_deref() == Some(previous) => {
+            git::restore_preserved_branch_at_cas(repo, branch, previous, planned_oid)
+        }
+        _ => git::clear_preserved_branch_at_cas(repo, branch, planned_oid),
+    }
+}
+
+fn with_preservation_rollback_error(error: AppError, rollback: Result<()>) -> AppError {
+    match rollback {
+        Ok(()) => error,
+        Err(rollback_error) => AppError {
+            code: error.code,
+            message: format!(
+                "{error}; preservation marker rollback failed and requires repair: {rollback_error}"
+            ),
+        },
+    }
 }
 
 /// How a branch was detected as integrated into mainline.
@@ -2730,9 +2746,9 @@ fn merge_result_from_operation(
 }
 
 /// Restore a destination that was left detached by a terminated continuation.
-/// If the detached HEAD is the exact merge result, first install that result
-/// with the recorded destination-head CAS; otherwise reattach the original
-/// branch and let normal stale-state validation refuse any unsafe cleanup.
+/// Only the recorded destination HEAD and the exact expected merge result are
+/// recoverable. An unknown detached OID must remain detached so no later
+/// cleanup can mistake an unrecognized state for a successful continuation.
 fn recover_detached_destination_head(repo: &RepoRoot, state: &MergeOperationState) -> Result<()> {
     let worktrees = git::list_worktrees_readonly(repo)?;
     let destination = worktrees
@@ -2759,6 +2775,8 @@ fn recover_detached_destination_head(repo: &RepoRoot, state: &MergeOperationStat
     }
 
     let actual_head = git::head_commit(&state.destination_path)?;
+    let destination_branch = BranchName::new(&state.destination);
+    let destination_ref_head = git::branch_oid(repo, &destination_branch);
     let merge_source = state
         .merge_head
         .as_deref()
@@ -2771,44 +2789,48 @@ fn recover_detached_destination_head(repo: &RepoRoot, state: &MergeOperationStat
             &state.destination_head,
             merge_source,
         )?);
-    let mut install_error = None;
-    if expected_result.as_deref() == Some(actual_head.as_str())
-        && git::branch_oid(repo, &BranchName::new(&state.destination)).as_deref()
-            == Some(state.destination_head.as_str())
-    {
-        install_error = match git::acquire_branch_ref_lock(
-            &state.destination_path,
-            &BranchName::new(&state.destination),
-            &state.destination_head,
-        ) {
-            Ok(lock) => {
-                drop(lock);
-                git::update_branch_ref_cas(
-                    &state.destination_path,
-                    &BranchName::new(&state.destination),
-                    &actual_head,
-                    &state.destination_head,
-                )
-                .err()
-            }
-            Err(error) => Some(error),
-        };
+
+    let at_recorded_destination = actual_head == state.destination_head
+        && destination_ref_head.as_deref() == Some(state.destination_head.as_str());
+    let at_expected_result = expected_result.as_deref() == Some(actual_head.as_str())
+        && (destination_ref_head.as_deref() == Some(state.destination_head.as_str())
+            || destination_ref_head.as_deref() == Some(actual_head.as_str()));
+    if !at_recorded_destination && !at_expected_result {
+        return Err(AppError::conflict(format!(
+            "destination HEAD '{}' is detached and is neither the recorded destination '{}' nor the expected merge result '{}'; managed state was preserved for manual recovery",
+            actual_head,
+            state.destination_head,
+            expected_result.as_deref().unwrap_or("unavailable"),
+        )));
     }
 
-    let restore_error = git::restore_head(
-        &state.destination_path,
-        &BranchName::new(&state.destination),
-    )
-    .err();
-    match (install_error, restore_error) {
-        (Some(error), _) => Err(AppError::conflict(format!(
-            "destination merge result could not be recovered safely; managed state was preserved: {error}"
-        ))),
-        (None, Some(error)) => Err(AppError::conflict(format!(
-            "destination HEAD could not be restored after continuation: {error}"
-        ))),
-        (None, None) => Ok(()),
+    if at_expected_result
+        && destination_ref_head.as_deref() == Some(state.destination_head.as_str())
+    {
+        let lock = git::acquire_branch_ref_lock(
+            &state.destination_path,
+            &destination_branch,
+            &state.destination_head,
+        )?;
+        drop(lock);
+        git::update_branch_ref_cas(
+            &state.destination_path,
+            &destination_branch,
+            &actual_head,
+            &state.destination_head,
+        )
+        .map_err(|error| {
+            AppError::conflict(format!(
+                "destination merge result could not be recovered safely; managed state was preserved: {error}"
+            ))
+        })?;
     }
+
+    git::restore_head(&state.destination_path, &destination_branch).map_err(|error| {
+        AppError::conflict(format!(
+            "destination HEAD could not be restored after continuation: {error}"
+        ))
+    })
 }
 
 struct DetachedHeadGuard {

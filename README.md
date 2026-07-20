@@ -239,7 +239,7 @@ untrusted same-user process can still swap a filesystem path or mount between
 syscalls, and Git provides no atomic API that closes that gap. wt-core fails
 closed when its registration, identity, ref, or HEAD checks detect a change,
 Removal deliberately has no separate filesystem quarantine or deletion
-journal; it retains native `git worktree remove` for Git's cross-platform
+journal. It retains native `git worktree remove` for Git's cross-platform
 cleanup behavior. A successful `wt merge --continue` also consumes the private
 navigation record in each shell binding, so callers are moved out of a source
 worktree that was removed; successful stderr warnings remain visible in

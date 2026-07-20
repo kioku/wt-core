@@ -1054,6 +1054,164 @@ fn merge_continue_recovers_ref_lock_and_symbolic_head_after_kill() {
     assert_branch_deleted(&repo.path(), "feature/continue-kill");
 }
 
+#[test]
+fn merge_continue_recovers_recorded_detached_destination_head() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-recorded-head");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    run_git(
+        &["update-ref", "--no-deref", "HEAD", &destination_head],
+        &repo.path(),
+    );
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(
+        git_rev_parse(&repo.path(), "main"),
+        git_rev_parse(&repo.path(), "HEAD")
+    );
+    assert!(
+        !source.exists(),
+        "recorded detached HEAD should be recovered"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-recorded-head");
+}
+
+#[test]
+fn merge_continue_recovers_detached_expected_result_before_ref_update() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-result-head");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    let source_head = git_rev_parse(&repo.path(), "MERGE_HEAD");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    let tree = git_output(&["write-tree"], &repo.path());
+    let result = git_output(
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &destination_head,
+            "-p",
+            &source_head,
+            "-m",
+            "recovered merge",
+        ],
+        &repo.path(),
+    );
+    run_git(&["update-ref", "--no-deref", "HEAD", &result], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(git_rev_parse(&repo.path(), "main"), result);
+    assert!(
+        !source.exists(),
+        "expected merge result should be recovered"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-result-head");
+}
+
+#[test]
+fn merge_continue_recovers_detached_expected_result_after_ref_update() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-result-ref");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    let source_head = git_rev_parse(&repo.path(), "MERGE_HEAD");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    let tree = git_output(&["write-tree"], &repo.path());
+    let result = git_output(
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &destination_head,
+            "-p",
+            &source_head,
+            "-m",
+            "recovered merge",
+        ],
+        &repo.path(),
+    );
+    run_git(
+        &["update-ref", "refs/heads/main", &result, &destination_head],
+        &repo.path(),
+    );
+    run_git(&["update-ref", "--no-deref", "HEAD", &result], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(git_rev_parse(&repo.path(), "main"), result);
+    assert!(
+        !source.exists(),
+        "updated expected result should be recovered"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-result-ref");
+}
+
+#[test]
+fn merge_continue_rejects_an_unrecognized_detached_head() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-unrelated-head");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    let tree = git_rev_parse(&repo.path(), "HEAD^{tree}");
+    let unrelated = git_output(
+        &["commit-tree", &tree, "-m", "unrelated detached state"],
+        &repo.path(),
+    );
+    assert_ne!(unrelated, destination_head);
+    run_git(
+        &["update-ref", "--no-deref", "HEAD", &unrelated],
+        &repo.path(),
+    );
+
+    let output = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .output()
+        .expect("continuation should run");
+    assert!(
+        !output.status.success(),
+        "unrecognized HEAD must be refused"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("neither the recorded destination"));
+    assert!(
+        !git_allow_failure(&["symbolic-ref", "--quiet", "HEAD"], &repo.path())
+            .status
+            .success(),
+        "unrecognized HEAD must remain detached"
+    );
+    assert_eq!(
+        git_rev_parse(&repo.path(), "refs/heads/main"),
+        destination_head
+    );
+    assert!(
+        source.exists(),
+        "unrecognized HEAD must preserve the source"
+    );
+    assert_branch_exists(&repo.path(), "feature/continue-unrelated-head");
+    assert!(
+        repo.path()
+            .join(".git/wt-core/merge-operation.json")
+            .is_file(),
+        "unrecognized HEAD must preserve the lifecycle journal"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn merge_continue_hook_failure_preserves_merge_for_retry() {
@@ -3380,6 +3538,21 @@ fn git_rev_parse(repo: &std::path::Path, revision: &str) -> String {
     assert!(
         output.status.success(),
         "git rev-parse {revision} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string()
+}
+
+/// Run Git and return its trimmed stdout for tests that need an object ID.
+fn git_output(args: &[&str], cwd: &std::path::Path) -> String {
+    let output = git_allow_failure(args, cwd);
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)

@@ -419,6 +419,17 @@ impl Drop for BranchRefLock {
 
 const BRANCH_LOCK_HEADER: &str = "wt-core-branch-lock\n";
 
+fn valid_branch_lock_owner(contents: &str) -> bool {
+    let mut lines = contents.split('\n');
+    let header = lines.next() == Some(BRANCH_LOCK_HEADER.trim_end_matches('\n'));
+    let pid = lines
+        .next()
+        .and_then(|line| line.strip_prefix("pid="))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .is_some_and(|pid| pid > 0);
+    header && pid && lines.next() == Some("") && lines.next().is_none()
+}
+
 pub fn acquire_branch_ref_lock(
     path: &Path,
     branch: &BranchName,
@@ -493,10 +504,15 @@ fn open_recoverable_branch_lock(path: &Path) -> Result<fs::File> {
                     path.display()
                 )));
             }
-            let contents = fs::read_to_string(path).unwrap_or_default();
-            if !contents.is_empty() && !contents.starts_with(BRANCH_LOCK_HEADER) {
+            let contents = fs::read_to_string(path).map_err(|inspect| {
+                AppError::conflict(format!(
+                    "cannot inspect destination branch lock '{}': {inspect}",
+                    path.display()
+                ))
+            })?;
+            if !valid_branch_lock_owner(&contents) {
                 return Err(AppError::conflict(format!(
-                    "destination branch lock '{}' belongs to another Git writer; refusing to remove it",
+                    "destination branch lock '{}' is not a valid wt-core lock; refusing to remove a native Git lock",
                     path.display()
                 )));
             }
@@ -1948,6 +1964,29 @@ mod tests {
         assert!(preserved_branch_oid(&root, &branch)
             .expect("marker lookup should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn branch_ref_lock_rejects_empty_native_lock() {
+        let repo = test_repo();
+        let branch = BranchName::new("main");
+        let expected = test_git(repo.path(), &["rev-parse", "main"]);
+        let lock_path =
+            git_path(repo.path(), "refs/heads/main.lock").expect("branch lock path should resolve");
+        fs::write(&lock_path, "").expect("native lock should be created");
+
+        let result = acquire_branch_ref_lock(repo.path(), &branch, &expected);
+        let error = match result {
+            Ok(_) => panic!("empty native Git lock must not be recovered"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, crate::error::ExitCode::Conflict);
+        assert!(error.message.contains("not a valid wt-core lock"));
+        assert!(
+            lock_path.is_file(),
+            "native lock must remain for Git recovery"
+        );
+        assert_eq!(fs::read_to_string(lock_path).expect("read native lock"), "");
     }
 
     #[test]
