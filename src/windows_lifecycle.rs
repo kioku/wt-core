@@ -30,14 +30,17 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AclSizeInformation, AddAccessAllowedAce, EqualSid, GetAce, GetAclInformation,
-    GetSecurityDescriptorDacl, GetTokenInformation, InitializeAcl, TokenUser, ACCESS_ALLOWED_ACE,
-    ACL, ACL_REVISION, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
-    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CreateWellKnownSid, EqualSid, GetAce,
+    GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    GetTokenInformation, InitializeAcl, IsValidSid, IsWellKnownSid, MapGenericMask, TokenUser,
+    WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
+    ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERITED_ACE,
+    OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING,
+    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -1034,6 +1037,13 @@ fn validate_protocol_path(path: &Path) -> io::Result<()> {
 }
 
 pub(crate) fn ensure_private_directory_windows(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian protocol directory is not a private directory",
+        ));
+    }
     ensure_windows_owner_only(path)
 }
 
@@ -1052,35 +1062,30 @@ fn ensure_protocol_file_private(path: &Path) -> io::Result<()> {
     ensure_windows_owner_only(path)
 }
 
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+const PRIVATE_ACE_FLAGS: u8 = 0;
+const PRIVATE_ACCESS: u32 = FILE_ALL_ACCESS;
+
+/// Apply the private lifecycle policy and then inspect the descriptor Windows
+/// actually installed.  The explicit DACL contains only the owner and the two
+/// machine principals that are safe for local lifecycle state: SYSTEM and the
+/// built-in Administrators group.  It is protected so an inherited ACE from a
+/// runner's temp directory cannot silently widen the policy.
 fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
     use std::ptr::null_mut;
-    use windows_sys::Win32::Security::ACE_HEADER;
 
-    let sid = current_user_sid()?;
-    let acl_size =
-        size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid.len();
-    let mut acl = vec![0u8; acl_size];
-    if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl.len() as u32, ACL_REVISION) } == 0 {
-        return Err(last_error());
-    }
-    if unsafe {
-        AddAccessAllowedAce(
-            acl.as_mut_ptr().cast(),
-            ACL_REVISION,
-            FILE_ALL_ACCESS,
-            sid.as_ptr().cast_mut().cast(),
-        )
-    } == 0
-    {
-        return Err(last_error());
-    }
+    let owner_sid = current_user_sid()?;
+    let acl = private_acl(&owner_sid)?;
     let wide = wide_path(path.as_os_str())?;
     let error = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
-            sid.as_ptr().cast_mut().cast(),
+            OWNER_SECURITY_INFORMATION
+                | DACL_SECURITY_INFORMATION
+                | PROTECTED_DACL_SECURITY_INFORMATION,
+            owner_sid.as_ptr().cast_mut().cast(),
             null_mut(),
             acl.as_ptr().cast(),
             null_mut(),
@@ -1090,10 +1095,85 @@ fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(error as i32));
     }
 
-    // Re-read the descriptor rather than trusting SetNamedSecurityInfoW. This
-    // validates both the owner and the effective default DACL used by every
-    // protocol file. SYSTEM can still administer the machine, but no broad or
-    // unowned trustee may read/replace bootstrap or handoff contents.
+    inspect_private_windows_acl(path, &owner_sid)
+}
+
+fn private_acl(owner_sid: &[u8]) -> io::Result<Vec<u8>> {
+    let system_sid = well_known_sid(WinLocalSystemSid)?;
+    let administrators_sid = well_known_sid(WinBuiltinAdministratorsSid)?;
+    let mut trustees: Vec<&[u8]> = Vec::with_capacity(3);
+    for sid in [&system_sid[..], &administrators_sid[..], owner_sid] {
+        if !trustees.iter().any(|existing| sid_equal(existing, sid)) {
+            trustees.push(sid);
+        }
+    }
+
+    let acl_size = size_of::<ACL>()
+        + trustees
+            .iter()
+            .map(|sid| size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid.len())
+            .sum::<usize>();
+    let mut acl = vec![0u8; acl_size];
+    if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl.len() as u32, ACL_REVISION) } == 0 {
+        return Err(last_error());
+    }
+    for sid in trustees {
+        if unsafe {
+            AddAccessAllowedAce(
+                acl.as_mut_ptr().cast(),
+                ACL_REVISION,
+                PRIVATE_ACCESS,
+                sid.as_ptr().cast_mut().cast(),
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+    }
+    Ok(acl)
+}
+
+fn well_known_sid(kind: i32) -> io::Result<Vec<u8>> {
+    use std::ptr::null_mut;
+
+    let mut length = 0;
+    let first_error = unsafe {
+        CreateWellKnownSid(kind, null_mut(), null_mut(), &mut length);
+        GetLastError()
+    };
+    if length == 0 && first_error != ERROR_INSUFFICIENT_BUFFER {
+        return Err(io::Error::from_raw_os_error(first_error as i32));
+    }
+    let mut sid = vec![0u8; length as usize];
+    if unsafe { CreateWellKnownSid(kind, null_mut(), sid.as_mut_ptr().cast(), &mut length) } == 0 {
+        return Err(last_error());
+    }
+    sid.truncate(length as usize);
+    Ok(sid)
+}
+
+fn sid_equal(left: &[u8], right: &[u8]) -> bool {
+    !left.is_empty()
+        && !right.is_empty()
+        && unsafe {
+            EqualSid(
+                left.as_ptr().cast_mut().cast(),
+                right.as_ptr().cast_mut().cast(),
+            )
+        } != 0
+}
+
+fn sid_matches_pointer(pointer: windows_sys::Win32::Security::PSID, expected: &[u8]) -> bool {
+    !pointer.is_null()
+        && !expected.is_empty()
+        && unsafe { EqualSid(pointer, expected.as_ptr().cast_mut().cast()) } != 0
+}
+
+fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Security::ACE_HEADER;
+
+    let wide = wide_path(path.as_os_str())?;
     let mut owner: windows_sys::Win32::Security::PSID = null_mut();
     let mut dacl: *mut ACL = null_mut();
     let mut descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = null_mut();
@@ -1112,26 +1192,43 @@ fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
     if error != 0 {
         return Err(io::Error::from_raw_os_error(error as i32));
     }
+
     let result = (|| {
-        if owner.is_null() || unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
+        if owner.is_null()
+            || unsafe { IsValidSid(owner) } == 0
+            || !sid_matches_pointer(owner, owner_sid)
+        {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "guardian protocol owner does not match the current user",
             ));
         }
+
+        let mut control = 0;
+        let mut revision = 0;
+        if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
+            return Err(last_error());
+        }
+        if control & SE_DACL_PROTECTED == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol DACL is inheritable",
+            ));
+        }
+
         let mut present = 0;
         let mut defaulted = 0;
-        if dacl.is_null()
-            || unsafe {
-                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
-            } == 0
+        if unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            == 0
             || present == 0
+            || dacl.is_null()
         {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "guardian protocol has no explicit DACL",
             ));
         }
+
         let mut size = ACL_SIZE_INFORMATION::default();
         if unsafe {
             GetAclInformation(
@@ -1144,30 +1241,102 @@ fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
         {
             return Err(last_error());
         }
-        if size.AceCount != 1 {
+
+        let mut owner_allow = false;
+        for index in 0..size.AceCount {
+            let mut ace = null_mut();
+            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
+                return Err(last_error());
+            }
+            let header = unsafe { &*(ace as *const ACE_HEADER) };
+            if header.AceSize < size_of::<ACCESS_ALLOWED_ACE>() as u16 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains a truncated ACE",
+                ));
+            }
+            if header.AceFlags & INHERITED_ACE as u8 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains an inherited ACE",
+                ));
+            }
+            if header.AceType == ACCESS_DENIED_ACE_TYPE {
+                // A deny ACE is not an allow entry. Reject it explicitly rather
+                // than interpreting its layout as ACCESS_ALLOWED_ACE.
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains a deny ACE",
+                ));
+            }
+            if header.AceType != ACCESS_ALLOWED_ACE_TYPE || header.AceFlags != PRIVATE_ACE_FLAGS {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains an unsupported ACE",
+                ));
+            }
+
+            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+            let sid = unsafe {
+                (ace as *const u8)
+                    .add(size_of::<ACE_HEADER>() + size_of::<u32>())
+                    .cast_mut()
+            };
+            if unsafe { IsValidSid(sid.cast()) } == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains an invalid trustee SID",
+                ));
+            }
+            let sid_length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid.cast()) };
+            if sid_length as usize
+                > header.AceSize as usize - size_of::<ACE_HEADER>() - size_of::<u32>()
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains a truncated trustee SID",
+                ));
+            }
+            let trusted = sid_matches_pointer(sid.cast(), owner_sid)
+                || unsafe { IsWellKnownSid(sid.cast(), WinLocalSystemSid) } != 0
+                || unsafe { IsWellKnownSid(sid.cast(), WinBuiltinAdministratorsSid) } != 0;
+            if !trusted {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains an untrusted trustee",
+                ));
+            }
+
+            let mut mask = allowed.Mask;
+            let mapping = file_generic_mapping();
+            unsafe { MapGenericMask(&mut mask, &mapping) };
+            if mask & PRIVATE_ACCESS != PRIVATE_ACCESS {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL does not grant required rights",
+                ));
+            }
+            if sid_matches_pointer(sid.cast(), owner_sid) {
+                owner_allow = true;
+            }
+        }
+        if !owner_allow {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "guardian protocol DACL is not owner-only",
+                "guardian protocol DACL does not grant rights to the owner",
             ));
         }
-        let mut ace = null_mut();
-        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
-            return Err(last_error());
+
+        let token = current_process_token()?;
+        let owner_access = access_check(descriptor, token, PRIVATE_ACCESS);
+        unsafe {
+            CloseHandle(token);
         }
-        let header = unsafe { &*(ace as *const ACE_HEADER) };
-        let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-        if header.AceType != 0
-            || header.AceFlags != 0
-            || unsafe {
-                EqualSid(
-                    (&allowed.SidStart as *const u32).cast_mut().cast(),
-                    sid.as_ptr().cast_mut().cast(),
-                )
-            } == 0
-        {
+        let owner_access = owner_access?;
+        if !owner_access {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "guardian protocol DACL contains a non-owner ACE",
+                "guardian protocol owner cannot access its private object",
             ));
         }
         Ok(())
@@ -1176,6 +1345,66 @@ fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
         LocalFree(descriptor);
     }
     result
+}
+
+fn file_generic_mapping() -> GENERIC_MAPPING {
+    GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    }
+}
+
+fn current_process_token() -> io::Result<HANDLE> {
+    let mut token = std::ptr::null_mut();
+    if unsafe {
+        windows_sys::Win32::System::Threading::OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY,
+            &mut token,
+        )
+    } == 0
+    {
+        Err(last_error())
+    } else {
+        Ok(token)
+    }
+}
+
+fn access_check(
+    descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR,
+    token: HANDLE,
+    desired_access: u32,
+) -> io::Result<bool> {
+    let mapping = file_generic_mapping();
+    let mut privileges = vec![0u8; size_of::<PRIVILEGE_SET>()];
+    loop {
+        let mut privilege_length = privileges.len() as u32;
+        let mut granted_access = 0;
+        let mut access_status = 0;
+        let result = unsafe {
+            AccessCheck(
+                descriptor,
+                token,
+                desired_access,
+                &mapping,
+                privileges.as_mut_ptr().cast(),
+                &mut privilege_length,
+                &mut granted_access,
+                &mut access_status,
+            )
+        };
+        if result != 0 {
+            return Ok(access_status != 0 && granted_access & desired_access == desired_access);
+        }
+        let error = unsafe { GetLastError() };
+        if error == ERROR_INSUFFICIENT_BUFFER && privilege_length as usize > privileges.len() {
+            privileges.resize(privilege_length as usize, 0);
+            continue;
+        }
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
 }
 
 fn current_user_sid() -> io::Result<Vec<u8>> {
@@ -1226,6 +1455,12 @@ fn current_user_sid() -> io::Result<Vec<u8>> {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "current user has no SID",
+        ));
+    }
+    if unsafe { IsValidSid(sid) } == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "current user has an invalid SID",
         ));
     }
     let length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid) } as usize;
@@ -2400,7 +2635,104 @@ fn exit_status_from_raw(code: u32) -> std::process::ExitStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows_sys::Win32::Security::{
+        CreateRestrictedToken, WinRestrictedCodeSid, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
+    };
     use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
+
+    fn access_check_object(path: &Path, token: HANDLE) -> io::Result<bool> {
+        use std::ptr::null_mut;
+
+        let wide = wide_path(path.as_os_str())?;
+        let mut descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = null_mut();
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let result = access_check(descriptor, token, PRIVATE_ACCESS);
+        unsafe {
+            LocalFree(descriptor);
+        }
+        result
+    }
+
+    fn restricted_test_token() -> io::Result<HANDLE> {
+        // A restricted token must pass a second access check for its restricted
+        // SID. The private ACL intentionally has no such ACE, so this proves
+        // effective denial without depending on another local account.
+        let restricted_code = well_known_sid(WinRestrictedCodeSid)?;
+        let restricted_sid = [SID_AND_ATTRIBUTES {
+            Sid: restricted_code.as_ptr().cast_mut().cast(),
+            Attributes: 0,
+        }];
+        let source = current_process_token()?;
+        let mut token = std::ptr::null_mut();
+        let result = unsafe {
+            CreateRestrictedToken(
+                source,
+                DISABLE_MAX_PRIVILEGE,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                restricted_sid.len() as u32,
+                restricted_sid.as_ptr(),
+                &mut token,
+            )
+        };
+        unsafe {
+            CloseHandle(source);
+        }
+        if result == 0 {
+            Err(last_error())
+        } else {
+            Ok(token)
+        }
+    }
+
+    #[test]
+    fn protected_acl_allows_owner_and_denies_an_unauthorized_token() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let inherited_parent = root.path().join("inherited-parent");
+        fs::create_dir(&inherited_parent).expect("inherited parent");
+        let directory = inherited_parent.join("private-directory");
+        fs::create_dir(&directory).expect("private directory");
+        ensure_windows_owner_only(&directory).expect("protect directory ACL");
+
+        let file = directory.join("private-file");
+        fs::write(&file, b"private").expect("private file");
+        ensure_windows_owner_only(&file).expect("protect file ACL");
+
+        let owner = current_process_token().expect("owner token");
+        let unauthorized = restricted_test_token().expect("restricted token");
+        for object in [&directory, &file] {
+            assert!(
+                access_check_object(object, owner).expect("owner access check"),
+                "owner must retain full lifecycle access to {}",
+                object.display()
+            );
+            assert!(
+                !access_check_object(object, unauthorized).expect("unauthorized access check"),
+                "restricted token must not access {}",
+                object.display()
+            );
+        }
+        unsafe {
+            CloseHandle(unauthorized);
+            CloseHandle(owner);
+        }
+    }
 
     #[test]
     fn empty_environment_is_double_nul_terminated() {
