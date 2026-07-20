@@ -763,11 +763,13 @@ dependencies = [
  "assert_cmd",
  "clap",
  "dialoguer",
+ "libc",
  "predicates",
  "serde",
  "serde_json",
  "tempfile",
  "unicode-width",
+ "windows-sys",
 ]
 
 [[package]]

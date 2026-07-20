@@ -2,6 +2,12 @@
 # Source this file in your .bashrc:
 #   source path/to/bindings/bash/wt.bash
 
+# Match complete path components, not merely a textual prefix. This keeps a
+# worktree named /repo/.worktrees/app from matching /repo/.worktrees/app-copy.
+wt__path_is_within() {
+    [[ "$1" == "$2" || "$1" == "$2"/* ]]
+}
+
 wt() {
     local cmd="${1:-}"
 
@@ -19,14 +25,26 @@ wt() {
                 esac
             done
 
-            local target
-            target=$(wt-core add "$@" --print-cd-path 2>/dev/null)
-            if [ $? -eq 0 ] && [ -n "$target" ]; then
-                cd "$target" || return 1
-            else
-                # Re-run without --print-cd-path to show the error message
+            # JSON is a caller-selected machine format. Do not append a
+            # path-only flag, which would otherwise change the JSON stream.
+            local want_json=false
+            for arg in "$@"; do
+                case "$arg" in --json) want_json=true ;; esac
+            done
+            if [ "$want_json" = true ]; then
                 wt-core add "$@"
                 return $?
+            fi
+
+            local target rc
+            # Keep stdout private for the path while leaving stderr inherited so
+            # setup recommendations and warnings remain visible on success.
+            target=$(wt-core add "$@" --print-cd-path)
+            rc=$?
+            if [ $rc -eq 0 ] && [ -n "$target" ]; then
+                cd "$target" || return 1
+            else
+                return $rc
             fi
             ;;
         go)
@@ -84,48 +102,59 @@ wt() {
             done
 
             if [ "$want_json" = true ]; then
-                local cwd_before
-                cwd_before=$(pwd)
-                local output
-                output=$(wt-core remove "$@")
-                local rc=$?
+                local cwd_before nav_file output rc
+                cwd_before=$(pwd -P)
+                nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                output=$(wt-core remove "$@" --navigation-file "$nav_file")
+                rc=$?
                 if [ $rc -eq 0 ]; then
-                    # Extract paths from JSON for cd-out-of-removed-worktree logic
-                    local removed_path repo_root
-                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
-                    repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                    if [ -n "$removed_path" ] && [ -n "$repo_root" ]; then
-                        case "$cwd_before" in
-                            "${removed_path}"*)
-                                cd "$repo_root" || true
-                                ;;
-                        esac
+                    local -a navigation
+                    mapfile -d '' -t navigation < "$nav_file"
+                    if [ "${navigation[0]-}" = reset ] \
+                        && [ -n "${navigation[1]-}" ] \
+                        && [ -n "${navigation[2]-}" ] \
+                        && wt__path_is_within "$cwd_before" "${navigation[1]}"; then
+                        cd "${navigation[2]}" || true
                     fi
                 fi
+                rm -f "$nav_file"
                 printf '%s\n' "$output"
                 return $rc
             fi
 
             local cwd_before
-            cwd_before=$(pwd)
-            # --print-paths outputs three lines: removed_path, repo_root, branch.
+            cwd_before=$(pwd -P)
+            # --print-paths is the stable legacy three-line protocol:
+            # removed_path, repo_root, branch. Branch cleanup status is private
+            # navigation metadata so partial cleanup is not reported as complete.
+            local keep_branch=false
+            for arg in "$@"; do
+                [ "$arg" = "--keep-branch" ] && keep_branch=true
+            done
             # stderr is left connected to the terminal so the interactive picker
             # (if triggered) renders correctly and errors are visible.
+            local nav_file
+            nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
             local result
-            result=$(wt-core remove "$@" --print-paths)
+            result=$(wt-core remove "$@" --print-paths --navigation-file "$nav_file")
             local rc=$?
             if [ $rc -eq 0 ]; then
-                local removed_path repo_root branch
+                local removed_path repo_root branch branch_deleted
                 removed_path=$(printf '%s\n' "$result" | sed -n '1p')
                 repo_root=$(printf '%s\n' "$result" | sed -n '2p')
                 branch=$(printf '%s\n' "$result" | sed -n '3p')
-                case "$cwd_before" in
-                    "${removed_path}"*)
-                        cd "$repo_root" || true
-                        ;;
-                esac
-                echo "Removed worktree and branch '${branch}'"
+                branch_deleted=$(mapfile -d '' -t navigation < "$nav_file"; printf '%s' "${navigation[3]-false}")
+                rm -f "$nav_file"
+                if wt__path_is_within "$cwd_before" "$removed_path"; then
+                    cd "$repo_root" || true
+                fi
+                if [ "$keep_branch" = true ] || [ "$branch_deleted" != true ]; then
+                    echo "Removed worktree and kept branch '${branch}'"
+                else
+                    echo "Removed worktree and branch '${branch}'"
+                fi
             else
+                rm -f "$nav_file"
                 return $rc
             fi
             ;;
@@ -142,6 +171,38 @@ wt() {
                 esac
             done
 
+            # Status and abort do not remove a worktree. Continue can finish
+            # source cleanup, so consume the navigation side channel even in
+            # its lifecycle output modes.
+            for arg in "$@"; do
+                case "$arg" in
+                    --status|--abort)
+                        wt-core merge "$@"
+                        return $?
+                        ;;
+                    --continue)
+                        local cwd_before nav_file output rc
+                        cwd_before=$(pwd -P)
+                        nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                        output=$(wt-core merge "$@" --navigation-file "$nav_file")
+                        rc=$?
+                        if [ $rc -eq 0 ] && [ -f "$nav_file" ]; then
+                            local -a navigation
+                            mapfile -d '' -t navigation < "$nav_file"
+                            if [ "${navigation[0]-}" = reset ] \
+                                && [ -n "${navigation[1]-}" ] \
+                                && [ -n "${navigation[2]-}" ] \
+                                && wt__path_is_within "$cwd_before" "${navigation[1]}"; then
+                                cd "${navigation[2]}" || true
+                            fi
+                        fi
+                        rm -f "$nav_file"
+                        printf '%s\n' "$output"
+                        return $rc
+                        ;;
+                esac
+            done
+
             # Detect if the caller explicitly asked for --json
             local want_json=false
             for arg in "$@"; do
@@ -149,50 +210,58 @@ wt() {
             done
 
             if [ "$want_json" = true ]; then
-                local cwd_before
-                cwd_before=$(pwd)
-                local output
-                output=$(wt-core merge "$@")
-                local rc=$?
+                local cwd_before nav_file output rc
+                cwd_before=$(pwd -P)
+                nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                output=$(wt-core merge "$@" --navigation-file "$nav_file")
+                rc=$?
                 if [ $rc -eq 0 ]; then
-                    local removed_path
-                    removed_path=$(printf '%s\n' "$output" | sed -n 's/.*"removed_path": *"\([^"]*\)".*/\1/p')
-                    if [ -n "$removed_path" ]; then
-                        case "$cwd_before" in
-                            "${removed_path}"*)
-                                local repo_root
-                                repo_root=$(printf '%s\n' "$output" | sed -n 's/.*"repo_root": *"\([^"]*\)".*/\1/p')
-                                cd "$repo_root" || true
-                                ;;
-                        esac
+                    local -a navigation
+                    mapfile -d '' -t navigation < "$nav_file"
+                    if [ "${navigation[0]-}" = reset ] \
+                        && [ -n "${navigation[1]-}" ] \
+                        && [ -n "${navigation[2]-}" ] \
+                        && wt__path_is_within "$cwd_before" "${navigation[1]}"; then
+                        cd "${navigation[2]}" || true
                     fi
                 fi
+                rm -f "$nav_file"
                 printf '%s\n' "$output"
                 return $rc
             fi
 
+            for arg in "$@"; do
+                if [ "$arg" = "--inspect" ]; then
+                    wt-core merge "$@"
+                    return $?
+                fi
+            done
+
             local cwd_before
-            cwd_before=$(pwd)
-            # --print-paths outputs: repo_root, branch, mainline, cleaned_up, removed_path, pushed
+            cwd_before=$(pwd -P)
+            # --print-paths-v2 preserves the six legacy fields and appends
+            # destination_path as field seven.
             local result
-            result=$(wt-core merge "$@" --print-paths)
+            result=$(wt-core merge "$@" --print-paths-v2)
             local rc=$?
             if [ $rc -eq 0 ]; then
-                local repo_root branch mainline cleaned_up removed_path pushed
+                local repo_root branch mainline cleaned_up removed_path pushed destination_path
                 repo_root=$(printf '%s\n' "$result" | sed -n '1p')
                 branch=$(printf '%s\n' "$result" | sed -n '2p')
                 mainline=$(printf '%s\n' "$result" | sed -n '3p')
                 cleaned_up=$(printf '%s\n' "$result" | sed -n '4p')
                 removed_path=$(printf '%s\n' "$result" | sed -n '5p')
                 pushed=$(printf '%s\n' "$result" | sed -n '6p')
-                if [ "$cleaned_up" = "true" ] && [ -n "$removed_path" ]; then
-                    case "$cwd_before" in
-                        "${removed_path}"*)
-                            cd "$repo_root" || true
-                            ;;
-                    esac
+                destination_path=$(printf '%s\n' "$result" | sed -n '7p')
+                # A worktree may be gone even when branch cleanup is pending;
+                # never leave the caller inside that deleted directory.
+                if [ -n "$removed_path" ]; then
+                    if wt__path_is_within "$cwd_before" "$removed_path"; then
+                        cd "$repo_root" || true
+                    fi
                 fi
                 echo "Merged '${branch}' into ${mainline}"
+                echo "Destination worktree: ${destination_path}"
                 if [ "$cleaned_up" = "true" ]; then
                     echo "Removed worktree and branch '${branch}'"
                 fi

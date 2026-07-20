@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -55,8 +56,10 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print only the worktree path (for shell wrappers)
-        #[arg(long, conflicts_with = "json")]
+        /// Print only the worktree path (legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_cd_path: bool,
     },
 
@@ -77,9 +80,30 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print only the worktree path (for shell wrappers)
-        #[arg(long, conflicts_with = "json")]
+        /// Print only the worktree path (legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_cd_path: bool,
+    },
+
+    /// Execute a command in an existing worktree
+    Exec {
+        /// Branch name of the worktree to execute in
+        branch: String,
+
+        /// Repository path (defaults to current directory)
+        #[arg(long)]
+        repo: Option<PathBuf>,
+
+        /// Emit one resolved-worktree metadata line on stderr
+        /// (child stderr follows on the same stream)
+        #[arg(long)]
+        json: bool,
+
+        /// Command and arguments to execute; must follow `--`
+        #[arg(last = true, required = true, num_args = 1.., value_name = "COMMAND")]
+        command: Vec<OsString>,
     },
 
     /// Remove a worktree and its local branch
@@ -87,9 +111,13 @@ pub enum Command {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,
 
-        /// Force removal even if dirty; use -D for branch deletion
+        /// Force removal even if dirty; use -D for branch deletion unless the branch is kept
         #[arg(long)]
         force: bool,
+
+        /// Remove the worktree but preserve its local branch
+        #[arg(long)]
+        keep_branch: bool,
 
         /// Repository path (defaults to current directory)
         #[arg(long)]
@@ -99,9 +127,15 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print removed_path, repo_root, and branch (one per line) for shell wrappers
-        #[arg(long, conflicts_with = "json")]
+        /// Print removed_path, repo_root, and branch (one per line; legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths: bool,
+
+        /// Write wrapper navigation metadata to a private side channel.
+        #[arg(long, hide = true, value_name = "PATH")]
+        navigation_file: Option<PathBuf>,
     },
 
     /// Merge a worktree's branch into a checked-out target and clean up
@@ -109,9 +143,75 @@ pub enum Command {
         /// Branch name (defaults to current worktree's branch)
         branch: Option<String>,
 
-        /// Merge into this checked-out branch instead of the detected mainline
+        /// Merge into this branch checked out in the main or a linked worktree
         #[arg(long, value_name = "BRANCH")]
         into: Option<String>,
+
+        /// Inspect merge topology without merging, cleaning up, or pushing
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "status",
+                "continue_merge",
+                "abort"
+            ]
+        )]
+        inspect: bool,
+
+        /// Show the managed conflicted-merge operation
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "branch",
+                "into",
+                "inspect",
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "continue_merge",
+                "abort"
+            ]
+        )]
+        status: bool,
+
+        /// Continue the managed merge after resolving all conflicts
+        #[arg(
+            long = "continue",
+            conflicts_with_all = [
+                "branch",
+                "into",
+                "inspect",
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "status",
+                "abort"
+            ]
+        )]
+        continue_merge: bool,
+
+        /// Abort the managed merge and restore the destination
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "branch",
+                "into",
+                "inspect",
+                "push",
+                "no_cleanup",
+                "print_paths",
+                "print_paths_v2",
+                "status",
+                "continue_merge"
+            ]
+        )]
+        abort: bool,
 
         /// Push the target branch to origin after successful merge
         #[arg(long)]
@@ -129,9 +229,21 @@ pub enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line) for shell wrappers
-        #[arg(long, conflicts_with = "json")]
+        /// Print merge info (repo_root, branch, mainline, cleaned_up, removed_path, pushed — one per line; legacy shell-wrapper output)
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
         print_paths: bool,
+
+        /// Print version 2 merge info, including destination_path, for shell wrappers
+        ///
+        /// When combined with --json, JSON output takes precedence.
+        #[arg(long)]
+        print_paths_v2: bool,
+
+        /// Write wrapper navigation metadata to a private side channel.
+        #[arg(long, hide = true, value_name = "PATH")]
+        navigation_file: Option<PathBuf>,
     },
 
     /// Materialize an explicit detached checkout at a workspace path
@@ -220,9 +332,9 @@ pub enum Command {
         repo: Option<PathBuf>,
     },
 
-    /// Remove worktrees whose branches are fully integrated into mainline
+    /// Remove worktrees and branches fully integrated into a target revision
     Prune {
-        /// Actually remove integrated worktrees (default is dry-run)
+        /// Actually remove integrated worktrees and branches (default is dry-run)
         #[arg(long)]
         execute: bool,
 
@@ -230,9 +342,9 @@ pub enum Command {
         #[arg(long, requires = "execute")]
         force: bool,
 
-        /// Override mainline branch (default: auto-detect)
-        #[arg(long)]
-        mainline: Option<String>,
+        /// Revision to evaluate integration against (default: auto-detect)
+        #[arg(long = "integrated-into", visible_alias = "mainline")]
+        integrated_into: Option<String>,
 
         /// Repository path (defaults to current directory)
         #[arg(long)]

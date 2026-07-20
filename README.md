@@ -25,7 +25,8 @@ these conventions upfront makes everything else predictable.
 
 - **Branch cleanup is the default.** `remove` and `merge` delete the local
   branch after removing the worktree (`git branch -d` by default, `-D` with
-  `--force`). This keeps the branch namespace clean.
+  `--force`). Use `remove --keep-branch` when staged integration still needs
+  the local branch, without keeping its worktree alive.
 
 - **Mainline is auto-detected.** Commands that need a mainline branch (`merge`,
   `prune`) resolve it automatically from `HEAD` of the default remote, so you
@@ -34,9 +35,13 @@ these conventions upfront makes everything else predictable.
 - **Dry-run first.** Destructive batch operations (`prune`) default to dry-run
   and require `--execute` to take action.
 
-- **Three output modes everywhere.** Every command supports human-readable
-  output (default), `--json` for machine consumption, and a
-  `--print-cd-path` / `--print-paths` mode for shell wrappers.
+- **One output contract for navigation.** `add`, `go`, `remove`, and `merge`
+  use human-readable output by default and `--json` as their canonical machine
+  format. The legacy `--print-cd-path` / `--print-paths` flags remain
+  available for existing shell scripts; if a legacy path flag is combined
+  with `--json`, JSON takes precedence. `exec --json` is the exception: it
+  writes resolution metadata to stderr so the child owns stdout unchanged;
+  child diagnostics may follow on that stderr stream.
 
 - **Interactive when appropriate.** When a branch argument is omitted in a
   TTY, `go`, `remove`, and `merge` present a fuzzy picker instead of failing.
@@ -48,12 +53,19 @@ these conventions upfront makes everything else predictable.
 ```
 wt add <branch> [--base <rev>]         Create a worktree and branch
 wt go [<branch>] [-i]                  Switch to an existing worktree
+wt exec <branch> -- <command...>       Run a command in a worktree
 wt list [--stats]                      List all worktrees
 wt remove [<branch>] [--force]         Remove a worktree and its local branch
+                                      [--keep-branch] preserves the branch
 wt merge [<branch>] [--into <branch>]  Merge a branch and clean up
+wt merge --status                     Show a paused managed merge
+wt merge --continue                   Finish a resolved managed merge
+wt merge --abort                      Abort a managed merge safely
+wt merge [<branch>] --inspect         Inspect merge topology without mutation
 wt diff [<branch>] [--dry-run]         Open difftool for branch or dirty changes
 wt materialize --sha <sha> ...         Create an explicit detached checkout
-wt prune [--execute] [--force]         Remove worktrees integrated into mainline
+wt prune [--execute] [--force]         Remove integrated worktrees and branches
+                                      [--integrated-into <rev>] sets the target
 wt doctor                              Diagnose worktree/repo health
 ```
 
@@ -82,6 +94,44 @@ wt go                  # interactive picker (auto-selects if only one)
 wt go -i               # force picker even with one candidate
 ```
 
+### `wt exec`
+
+Resolves the branch using the same worktree lookup as `wt go`, then runs the
+command directly in that worktree. Arguments after `--` are passed unchanged;
+no shell is inserted. The child inherits stdin, stdout, and stderr, and its
+exit status is returned by `wt-core`.
+
+```bash
+wt exec feature/auth -- cargo test
+wt exec feature/auth -- make preview
+```
+
+Use `--json` to emit one compact `exec_resolved` metadata object on stderr
+before the child starts. The first line is resolution metadata, not a command
+result (`resolved: true` means only that the worktree was resolved). Child
+stdout and stderr remain inherited. After the metadata line, stderr may contain
+inherited child diagnostics or a `wt-core` launch error if the command cannot
+be started, so the entire stream is not one parseable JSON document.
+
+The metadata schema is:
+
+```json
+{
+  "event": "exec_resolved",
+  "resolved": true,
+  "message": "resolved worktree for branch 'feature/auth'",
+  "branch": "feature/auth",
+  "repo_root": "/abs/repo",
+  "worktree_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4"
+}
+```
+
+On Unix, `wt-core` replaces itself with the resolved command, preserving
+native stdio, status, and signal behavior. On Windows, it runs the command
+with normal `Command` process execution and waits for its exit status. Child
+processes are not placed in a custom containment boundary; Windows console
+and descendant behavior follows native operating-system semantics.
+
 ### `wt list`
 
 Lists all worktrees with branch, commit, and status information. The current
@@ -101,29 +151,112 @@ wt list --stats --color never
 ### `wt remove`
 
 Removes a worktree and deletes its local branch. When called without a branch
-argument, infers the target from `cwd` or opens a fuzzy picker in a TTY.
+argument, infers the target from `cwd` or opens a fuzzy picker in a TTY. Use
+`--keep-branch` to remove only the worktree; dirty-worktree checks still apply,
+and default branch-deletion safety is unchanged.
 
 ```
-wt remove feature/auth     # explicit branch
-wt remove                  # infer from cwd or pick interactively
-wt remove --force          # remove even if dirty, use -D for branch
+wt remove feature/auth               # explicit branch and branch cleanup
+wt remove                             # infer from cwd or pick interactively
+wt remove --force                     # remove even if dirty, use -D for branch
+wt remove feature/auth --keep-branch  # remove worktree, preserve local branch
 ```
 
 ### `wt merge`
 
 Merges a worktree's branch into the auto-detected mainline using
-`--no-ff`, then removes the worktree and branch by default. Use `--into`
-to merge into a different branch that is already checked out in the main
-worktree. Conflicts cause an automatic `merge --abort` to keep the main
-worktree clean.
+`--no-ff`, then removes the source worktree and branch by default. Use
+`--into` to merge into a different branch that is already checked out in the
+main or a linked worktree. The merge and conflict lifecycle runs in the
+destination worktree; conflicts remain there for resolution or an explicit
+`wt merge --abort`.
 
 ```
 wt merge                         # merge current worktree's branch
 wt merge feature/auth            # explicit branch
 wt merge feature/auth --into rc  # merge into checked-out branch rc
+wt merge feature/auth --into release/1.0  # destination may be linked
 wt merge --push                  # push target branch to origin after merge
 wt merge --no-cleanup            # keep worktree and branch after merge
+wt merge feature/auth --inspect  # report topology without changing the repo
 ```
+
+Before a merge, wt-core reports the destination's configured upstream and
+commit counts. Synchronized destinations are ready to merge; destinations
+that are ahead are called out prominently because a subsequent push includes
+those local commits. Destinations behind or diverged from their upstream are
+refused before Git's content merge starts, so update or reconcile the target
+first. A configured upstream whose remote-tracking ref is unavailable is also
+refused rather than treated as an untracked destination. A source that appears
+in a standard Git revert record is reported as previously merged then reverted.
+
+`--inspect` performs the same read-only preflight and never fetches, prunes
+worktree metadata, merges, pushes, or cleans up. With `--json`, the
+`preflight` object contains `upstream`, `ahead`, `behind`, `topology`, source
+history, and any structured refusal reason. Topology refusals are distinct
+from `content_conflict` refusals.
+
+A content conflict is intentionally left in the destination worktree. The
+source worktree and branch are not cleaned up, and wt-core records the
+operation under Git's common directory at
+`git rev-parse --git-path wt-core/merge-operation.json`. The record is written atomically and includes the schema version, exact
+source/destination worktree registrations, captured source and destination
+heads, merge commit identity, typed lifecycle progress, push intent, and cleanup
+policy. Its directory is private and its state/temp records are owner-only;
+insecure existing records are refused. Resolve
+and stage every path, then continue through Git's normal merge commit and hook
+path:
+
+```bash
+wt merge --status              # unresolved paths and pending actions
+wt merge --continue            # commit, then perform the original push/cleanup
+wt merge --abort               # git merge --abort, then clear matching state
+```
+
+`--status --json` reports `state`, `unresolved_paths`, `pending_actions`, and
+`recovery` (when state is stale, interrupted, or corrupt). A continuation hook
+failure preserves the merge and state for retry. Cleanup and push failures are
+reported as warnings and leave committed operation state so `--continue` can
+retry them; pushes never force-update a remote. If worktree registration
+identity, branch heads, or Git's merge marker no longer match the record,
+wt-core refuses mutation and prints recovery guidance rather than selecting a
+replacement by branch name.
+
+Only one mutating merge lifecycle may own a repository at a time. An
+OS-backed lock is held from preflight through Git subprocess finalization and
+all durable journal/cleanup updates; its lock state is released safely by the
+OS after process death. A live owner makes a new merge, `--continue`, or
+`--abort` fail with recovery guidance, while `--status` remains read-only.
+On Unix, lifecycle Git children acquire a separate child lease in `pre_exec`,
+so unrelated subprocesses cannot inherit the parent lock. Synchronous hooks
+are supported; background or daemonized hooks are not.
+
+On Windows, cooperating `wt` operations use ordinary parent-lock
+serialization and normal `Command` execution. An abnormal owner termination
+may release the wt lifecycle lock before Git descendants or hooks exit; Git's
+native locks and recovery behavior remain the boundary for that case. wt-core
+does not promise child or hook lease survival after Windows owner death and
+does not use globally inheritable lock handles.
+
+Journal updates also compare the operation identity and generation before
+replacement or deletion, so a stale process cannot overwrite a newer journal.
+The lifecycle lock serializes supported mutating `wt` operations, and Git ref
+updates use compare-and-swap checks where a detectable tip race matters. This
+is a cooperation boundary, not an operating-system capability claim: an
+untrusted same-user process can still swap a filesystem path or mount between
+syscalls, and Git provides no atomic API that closes that gap. wt-core fails
+closed when its registration, identity, ref, or HEAD checks detect a change,
+Removal deliberately has no separate filesystem quarantine or deletion
+journal. It retains native `git worktree remove` for Git's cross-platform
+cleanup behavior. A successful `wt merge --continue` also consumes the private
+navigation record in each shell binding, so callers are moved out of a source
+worktree that was removed; successful stderr warnings remain visible in
+Nushell.
+
+The Bash, Zsh, Fish, and Nushell bindings pass lifecycle commands through
+without applying legacy path-only parsing; `--continue` consumes only its
+private navigation record. JSON output remains available for all three
+lifecycle commands.
 
 ### `wt diff`
 
@@ -163,15 +296,18 @@ wt materialize \
 
 ### `wt prune`
 
-Scans all worktrees and identifies branches that are fully integrated into
-mainline. Integration is detected via both ancestry checks (merge/fast-forward)
-and patch-id comparison (rebase merges). Defaults to dry-run.
+Scans linked worktrees and preserved local branches and identifies branches
+that are fully integrated into the selected revision. Integration is detected
+via both ancestry checks (merge/fast-forward) and patch-id comparison (rebase
+merges). Defaults to dry-run. `--integrated-into` accepts any revision and
+`--mainline` remains an alias.
 
 ```
-wt prune                               # dry-run: show what would be pruned
-wt prune --execute                     # actually remove integrated worktrees
-wt prune --execute --force             # also remove dirty worktrees
-wt prune --mainline develop            # override mainline branch
+wt prune                                      # dry-run: show cleanup candidates
+wt prune --execute                            # remove worktrees and branches
+wt prune --execute --force                    # also remove dirty worktrees
+wt prune --integrated-into integration/release # use a staged integration target
+wt prune --mainline develop                   # backwards-compatible alias
 ```
 
 ### `wt doctor`
@@ -195,14 +331,34 @@ Example: branch `feature/auth` → `.worktrees/feature-auth--a1b2c3d4/`
 
 ## Output Modes
 
-| Flag              | Behavior                                     |
-|-------------------|----------------------------------------------|
-| *(default)*       | Human-readable text                          |
-| `--json`          | Single-line JSON envelope on stdout          |
-| `--print-cd-path` | Bare absolute path on stdout (for wrappers)  |
-| `--print-paths`   | Multi-line key values on stdout (for wrappers) |
+| Flag                | Behavior                                                                  |
+|---------------------|---------------------------------------------------------------------------|
+| *(default)*         | Human-readable text                                                       |
+| `--json`            | Single-line JSON on stdout (except `exec`, which emits metadata on stderr) |
+| `--print-cd-path`   | Bare absolute path on stdout for `add` and `go`                          |
+| `--print-paths`     | Legacy multi-line fields for `remove` and `merge`                       |
+| `--print-paths-v2`  | Merge fields plus `destination_path` as line seven                       |
+| `--inspect`         | Read-only merge topology preflight (use with `--json` for facts)         |
 
-`--json` emits one compact JSON object per line so machine consumers can parse stdout line-by-line.
+For `add`, `go`, `remove`, and `merge`, `--json` is authoritative when it is
+combined with either legacy path flag. This lets a wrapper safely append its
+legacy selector while a caller requests JSON, without producing competing
+stdout formats. JSON is exactly one document on stdout; warnings and errors
+remain on stderr.
+
+For `remove --print-paths`, the exact legacy protocol is three lines:
+`removed_path`, `repo_root`, and `branch`. Use `--json` when lifecycle status is
+needed: `worktree_removed` and `branch_deleted` explicitly report each action.
+The merge `--print-paths` protocol remains six lines; `--print-paths-v2` adds
+`destination_path` as line seven for linked-worktree destinations.
+
+Prune dry-runs report `worktree_present` and `branch_will_be_deleted`; execute
+results report `worktree_removed` and `branch_deleted`. A preserved branch has a
+null prune `path` because no worktree remains. For commands other than `exec`,
+`--json` emits one compact JSON object on stdout. `exec --json` emits only its
+first resolution line as JSON on stderr; post-metadata stderr may contain
+inherited child diagnostics or a `wt-core` launch error if the command cannot
+be started.
 
 JSON envelope example (`add`, `go`, `remove`):
 
@@ -218,6 +374,15 @@ JSON envelope example (`add`, `go`, `remove`):
 }
 ```
 
+A `remove --keep-branch --json` response includes the distinct cleanup state:
+
+```json
+{
+  "worktree_removed": true,
+  "branch_deleted": false
+}
+```
+
 JSON envelope example (`merge`):
 
 ```json
@@ -226,6 +391,7 @@ JSON envelope example (`merge`):
   "message": "merged 'feature/auth' into main",
   "branch": "feature/auth",
   "mainline": "main",
+  "destination_path": "/abs/repo",
   "repo_root": "/abs/repo",
   "cleaned_up": true,
   "removed_path": "/abs/repo/.worktrees/feature-auth--a1b2c3d4",
@@ -246,7 +412,14 @@ JSON envelope example (`merge`):
 
 ## Shell Integration
 
-Each binding wraps the binary and handles `cd` in the parent shell.
+The direct `wt-core` CLI never changes its caller's cwd. Each binding wraps the
+binary and may `cd` in the parent shell: normal `add`/`go` use the legacy path
+output to enter a worktree, while normal `remove`/`merge` return to the
+repository root when cleanup removes the current worktree. With `--json`,
+`add` and `go` leave cwd unchanged; JSON `remove` and `merge` still perform that
+safe reset when needed. The JSON document remains raw on stdout (including in
+Nushell); pipe it through Nushell's `from json` explicitly when structured
+values are desired. Warnings and diagnostics remain on stderr.
 
 You can either source files from `bindings/` directly, or generate them with
 `wt-core init <shell>`.

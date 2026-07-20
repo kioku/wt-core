@@ -5,6 +5,9 @@ use serde::Serialize;
 use crate::domain::{Worktree, WorktreeStatsStatus};
 
 /// Output format for commands that produce a navigable path (add, go).
+///
+/// JSON is selected before the legacy path-only mode when both flags are
+/// present; this keeps wrapper-added path flags compatible with machine calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NavigationFormat {
     Human,
@@ -24,7 +27,8 @@ pub enum StatusFormat {
 pub enum RemoveFormat {
     Human,
     Json,
-    /// `--print-paths`: prints removed_path, repo_root, and branch (one per line).
+    /// Stable legacy `--print-paths`: removed_path, repo_root, and branch
+    /// (exactly three lines). Lifecycle status is exposed by JSON.
     PrintPaths,
 }
 
@@ -48,6 +52,12 @@ pub struct JsonResponse {
     pub removed_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch: Option<String>,
+    /// Whether the worktree was removed (only set for `remove`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_removed: Option<bool>,
+    /// Whether the local branch was deleted (only set for `remove`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_deleted: Option<bool>,
     /// Whether the branch tracks a remote branch (only set for `add`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracking: Option<bool>,
@@ -67,6 +77,8 @@ impl JsonResponse {
             cd_path: None,
             removed_path: None,
             branch: None,
+            worktree_removed: None,
+            branch_deleted: None,
             tracking: None,
             symlinks: None,
         }
@@ -94,6 +106,16 @@ impl JsonResponse {
 
     pub fn with_branch(mut self, branch: impl Into<String>) -> Self {
         self.branch = Some(branch.into());
+        self
+    }
+
+    pub fn with_worktree_removed(mut self, removed: bool) -> Self {
+        self.worktree_removed = Some(removed);
+        self
+    }
+
+    pub fn with_branch_deleted(mut self, deleted: bool) -> Self {
+        self.branch_deleted = Some(deleted);
         self
     }
 
@@ -304,7 +326,11 @@ pub struct JsonPruneDryRunEntry {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
-    pub path: String,
+    pub path: Option<String>,
+    /// Whether executing this entry would remove a worktree.
+    pub worktree_present: bool,
+    /// Whether executing this entry would delete the local branch.
+    pub branch_will_be_deleted: bool,
 }
 
 /// JSON response for prune execute.
@@ -320,14 +346,16 @@ pub struct JsonPruneExecuteResponse {
 #[derive(Debug, Serialize)]
 pub struct JsonPrunedEntry {
     pub branch: String,
-    pub path: String,
+    pub path: Option<String>,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
 }
 
 #[derive(Debug, Serialize)]
 pub struct JsonSkippedEntry {
     pub branch: Option<String>,
     pub reason: String,
-    pub path: String,
+    pub path: Option<String>,
 }
 
 /// Output format for the merge command.
@@ -335,8 +363,140 @@ pub struct JsonSkippedEntry {
 pub enum MergeFormat {
     Human,
     Json,
-    /// `--print-paths`: prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
+    /// `--print-paths`: version 1, prints repo_root, branch, mainline, cleaned_up, removed_path, pushed (one per line).
     PrintPaths,
+    /// `--print-paths-v2`: prints the version 1 fields followed by destination_path.
+    PrintPathsV2,
+}
+
+/// Machine-readable refusal details for a merge preflight or content merge.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeRefusal {
+    pub kind: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Facts collected before a merge mutates the destination.
+#[derive(Debug, Serialize)]
+pub struct JsonMergePreflight {
+    pub source: String,
+    pub destination: String,
+    pub destination_path: String,
+    pub upstream: Option<String>,
+    /// Alias kept explicit for consumers that name the destination side.
+    pub destination_upstream: Option<String>,
+    pub ahead: Option<u32>,
+    pub behind: Option<u32>,
+    pub topology: String,
+    pub source_history: String,
+    pub source_was_merged: bool,
+    pub source_was_reverted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reverted_commit: Option<String>,
+    pub allowed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal_message: Option<String>,
+}
+
+impl JsonMergePreflight {
+    pub fn from_preflight(preflight: &crate::worktree::MergePreflight) -> Self {
+        let (refusal_kind, refusal_reason, refusal_message) = preflight
+            .refusal
+            .as_ref()
+            .map(|refusal| {
+                (
+                    Some(refusal.kind.clone()),
+                    Some(refusal.reason.clone()),
+                    Some(refusal.message.clone()),
+                )
+            })
+            .unwrap_or((None, None, None));
+
+        Self {
+            source: preflight.source.clone(),
+            destination: preflight.destination.clone(),
+            destination_path: preflight.destination_path.display().to_string(),
+            upstream: preflight.upstream.clone(),
+            destination_upstream: preflight.upstream.clone(),
+            ahead: preflight.ahead,
+            behind: preflight.behind,
+            topology: merge_topology_name(preflight.topology),
+            source_history: source_history_name(preflight.source_history),
+            source_was_merged: preflight.source_was_merged,
+            source_was_reverted: preflight.source_was_reverted,
+            reverted_commit: preflight.reverted_commit.clone(),
+            allowed: preflight.allowed,
+            refusal_kind,
+            refusal_reason,
+            refusal_message,
+        }
+    }
+}
+
+fn merge_topology_name(topology: crate::worktree::MergeTopology) -> String {
+    match topology {
+        crate::worktree::MergeTopology::NoUpstream => "no_upstream",
+        crate::worktree::MergeTopology::UpstreamUnavailable => "upstream_unavailable",
+        crate::worktree::MergeTopology::Synchronized => "synchronized",
+        crate::worktree::MergeTopology::Ahead => "ahead",
+        crate::worktree::MergeTopology::Behind => "behind",
+        crate::worktree::MergeTopology::Diverged => "diverged",
+    }
+    .to_string()
+}
+
+fn source_history_name(history: crate::worktree::SourceHistory) -> String {
+    match history {
+        crate::worktree::SourceHistory::NotMerged => "not_merged",
+        crate::worktree::SourceHistory::AlreadyMerged => "already_merged",
+        crate::worktree::SourceHistory::MergedThenReverted => "merged_then_reverted",
+    }
+    .to_string()
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// Durable state and pending actions for a managed merge operation.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeOperation {
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub destination_path: Option<String>,
+    pub unresolved_paths: Vec<String>,
+    pub push: bool,
+    pub cleanup: bool,
+    pub keep_branch: bool,
+    pub worktree_removed: bool,
+    pub branch_deleted: bool,
+    pub push_done: bool,
+    pub pending_actions: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state_path: Option<String>,
+}
+
+/// JSON response for `merge --status`, `--continue`, and `--abort` errors.
+#[derive(Debug, Serialize)]
+pub struct JsonMergeOperationResponse {
+    pub ok: bool,
+    pub message: String,
+    #[serde(flatten)]
+    pub operation: JsonMergeOperation,
 }
 
 /// JSON response for the merge command.
@@ -349,11 +509,39 @@ pub struct JsonMergeResponse {
     pub message: String,
     pub branch: String,
     pub mainline: String,
+    pub destination_path: String,
     pub repo_root: String,
     pub cleaned_up: bool,
+    pub branch_deleted: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub removed_path: Option<String>,
     pub pushed: bool,
+    /// Partial-success diagnostics, such as an identity change after commit.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub preflight: Option<JsonMergePreflight>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<JsonMergeRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operation: Option<JsonMergeOperation>,
+    /// True when this response came from `merge --inspect`.
+    #[serde(skip_serializing_if = "is_false")]
+    pub inspect: bool,
+}
+
+/// Resolution metadata emitted before an `exec --json` child starts.
+///
+/// This is intentionally not an execution result: child stdout and stderr
+/// remain inherited, and child stderr is appended to the same stderr stream.
+#[derive(Debug, Serialize)]
+pub struct JsonExecResponse {
+    pub event: &'static str,
+    pub resolved: bool,
+    pub message: String,
+    pub branch: String,
+    pub repo_root: String,
+    pub worktree_path: String,
 }
 
 /// JSON response for the materialize command.
@@ -391,9 +579,67 @@ pub struct JsonSetupResponse {
     pub gitignore_updated: bool,
 }
 
+/// Write the wrapper navigation side channel without involving JSON parsing.
+///
+/// The record is NUL-delimited as `action`, `removed_path`, and `repo_root`.
+/// Paths are written as their display representation, so shell bindings can
+/// read each field verbatim even when it contains JSON-significant characters.
+/// `action` is `reset` when the parent shell should leave the removed
+/// worktree, and `none` otherwise.
+pub fn write_navigation_file(
+    file: &Path,
+    reset: bool,
+    removed_path: Option<&Path>,
+    repo_root: &Path,
+) -> crate::error::Result<()> {
+    write_navigation_file_with_cleanup(file, reset, removed_path, repo_root, None)
+}
+
+/// Write navigation metadata plus private cleanup status for legacy wrappers.
+///
+/// The optional fourth field is deliberately side-channel-only: `--print-paths`
+/// keeps its established three-line stdout protocol while wrappers can avoid
+/// claiming branch deletion when worktree removal succeeded but branch cleanup
+/// was partial.
+pub fn write_navigation_file_with_cleanup(
+    file: &Path,
+    reset: bool,
+    removed_path: Option<&Path>,
+    repo_root: &Path,
+    branch_deleted: Option<bool>,
+) -> crate::error::Result<()> {
+    let action = if reset { "reset" } else { "none" };
+    let removed = removed_path
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    let mut record = format!("{action}\0{removed}\0{}\0", repo_root.display());
+    branch_deleted.into_iter().for_each(|branch_deleted| {
+        record.push_str(if branch_deleted { "true" } else { "false" });
+        record.push('\0');
+    });
+    std::fs::write(file, record.as_bytes()).map_err(|error| {
+        crate::error::AppError::git(format!(
+            "could not write navigation metadata to {}: {error}",
+            file.display()
+        ))
+    })?;
+    Ok(())
+}
+
 /// Serialize a value as a compact single-line JSON object to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
+        "{}",
+        serde_json::to_string(value)
+            .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
+    );
+    Ok(())
+}
+
+/// Serialize pre-execution metadata to stderr so the child owns stdout
+/// unchanged. The stream may contain child diagnostics after this line.
+pub fn print_json_stderr(value: &impl Serialize) -> crate::error::Result<()> {
+    eprintln!(
         "{}",
         serde_json::to_string(value)
             .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?

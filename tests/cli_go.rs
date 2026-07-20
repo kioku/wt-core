@@ -142,6 +142,39 @@ fn go_json_emits_single_line_for_machine_parsing() {
 }
 
 #[test]
+fn go_json_takes_precedence_over_print_cd_path() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "go-json-precedence", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "go",
+            "go-json-precedence",
+            "--repo",
+            &repo_str,
+            "--print-cd-path",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert_eq!(stdout.lines().count(), 1, "expected one JSON document");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "go-json-precedence");
+    assert!(json["cd_path"].as_str().is_some());
+}
+
+#[test]
 fn go_fails_for_nonexistent_branch() {
     let repo = fixtures::TestRepo::new();
 

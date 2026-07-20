@@ -1,10 +1,80 @@
 mod fixtures;
 
+use std::process::Command as StdCommand;
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 
+use fixtures::run_git;
+
 fn wt_core() -> Command {
     Command::new(assert_cmd::cargo_bin!("wt-core"))
+}
+
+const GIT_ENV_OVERRIDES: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+    "GIT_PREFIX",
+];
+
+fn branch_exists(repo: &std::path::Path, branch: &str) -> bool {
+    let mut command = StdCommand::new("git");
+    command
+        .args(["show-ref", "--verify", &format!("refs/heads/{branch}")])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        command.env_remove(var);
+    }
+    command
+        .output()
+        .expect("git show-ref failed")
+        .status
+        .success()
+}
+
+fn git_ref_hash(repo: &std::path::Path, reference: &str) -> Option<String> {
+    let mut command = StdCommand::new("git");
+    command
+        .args(["rev-parse", "--verify", reference])
+        .current_dir(repo);
+    for var in GIT_ENV_OVERRIDES {
+        command.env_remove(var);
+    }
+    let output = command.output().expect("git rev-parse failed");
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+fn assert_branch_exists(repo: &std::path::Path, branch: &str) {
+    assert!(branch_exists(repo, branch), "branch should exist: {branch}");
+}
+
+fn assert_branch_deleted(repo: &std::path::Path, branch: &str) {
+    assert!(
+        !branch_exists(repo, branch),
+        "branch should be deleted: {branch}"
+    );
+}
+
+fn find_worktree_dir_optional(
+    repo: &std::path::Path,
+    slug_prefix: &str,
+) -> Option<std::path::PathBuf> {
+    std::fs::read_dir(repo.join(".worktrees"))
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(slug_prefix))
+        })
 }
 
 #[test]
@@ -87,6 +157,33 @@ fn add_print_cd_path_returns_bare_path() {
     assert!(path.contains(".worktrees/"));
     // Must not be JSON
     assert!(!path.starts_with('{'));
+}
+
+#[test]
+fn add_json_takes_precedence_over_print_cd_path() {
+    let repo = fixtures::TestRepo::new();
+
+    let output = wt_core()
+        .args([
+            "add",
+            "feature/json-precedence",
+            "--repo",
+            &repo.path().display().to_string(),
+            "--print-cd-path",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert_eq!(stdout.lines().count(), 1, "expected one JSON document");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "feature/json-precedence");
+    assert!(json["cd_path"].as_str().is_some());
 }
 
 #[test]
@@ -178,6 +275,8 @@ fn remove_deletes_worktree_and_branch() {
         .assert()
         .success();
 
+    assert_branch_deleted(&repo.path(), "to-remove");
+
     // Verify worktree is gone
     let entries: Vec<_> = std::fs::read_dir(repo.path().join(".worktrees"))
         .unwrap_or_else(|_| std::fs::read_dir(repo.path()).expect("repo gone"))
@@ -185,6 +284,53 @@ fn remove_deletes_worktree_and_branch() {
         .filter(|e| e.path().is_dir())
         .collect();
     assert_eq!(entries.len(), 0);
+}
+
+#[test]
+fn remove_print_paths_side_channel_reports_partial_branch_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "partial-cleanup", "--repo", &repo_str])
+        .assert()
+        .success();
+    let worktree = fixtures::find_worktree_dir(&repo.path(), "partial-cleanup");
+    fixtures::commit_file(
+        &worktree,
+        "partial.txt",
+        "not integrated\n",
+        "partial cleanup",
+    );
+    let navigation = tempfile::NamedTempFile::new().expect("navigation file");
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "partial-cleanup",
+            "--print-paths",
+            "--navigation-file",
+            &navigation.path().display().to_string(),
+            "--repo",
+            &repo_str,
+        ])
+        .output()
+        .expect("remove should start");
+    assert!(output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).lines().count(),
+        3,
+        "legacy stdout must remain three lines"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("branch deletion failed"));
+    let navigation_contents =
+        std::fs::read_to_string(navigation.path()).expect("navigation metadata");
+    let fields: Vec<_> = navigation_contents
+        .split('\0')
+        .filter(|field| !field.is_empty())
+        .collect();
+    assert_eq!(fields.get(3), Some(&"false"));
+    assert_branch_exists(&repo.path(), "partial-cleanup");
+    assert!(!worktree.exists(), "worktree removal should still succeed");
 }
 
 #[test]
@@ -237,6 +383,273 @@ fn remove_json_includes_removed_path() {
     assert_eq!(json["event"], "reset");
     assert!(json["removed_path"].as_str().is_some());
     assert!(json["repo_root"].as_str().is_some());
+    assert_eq!(json["worktree_removed"], true);
+    assert_eq!(json["branch_deleted"], true);
+}
+
+#[test]
+fn remove_keep_branch_preserves_branch_and_reports_separate_cleanup() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "staged/source", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "staged/source",
+            "--keep-branch",
+            "--json",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
+    assert_eq!(json["worktree_removed"], true);
+    assert_eq!(json["branch_deleted"], false);
+    assert_eq!(
+        json["message"],
+        "removed worktree and kept branch 'staged/source'"
+    );
+    assert_branch_exists(&repo.path(), "staged/source");
+    assert!(find_worktree_dir_optional(&repo.path(), "staged-source").is_none());
+}
+
+#[test]
+fn remove_keep_branch_preserves_dirty_safety() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "staged/dirty", "--repo", &repo_str])
+        .assert()
+        .success();
+    let wt_dir = fixtures::find_worktree_dir(&repo.path(), "staged-dirty");
+    std::fs::write(wt_dir.join("uncommitted.txt"), "dirty").expect("write failed");
+
+    wt_core()
+        .args([
+            "remove",
+            "staged/dirty",
+            "--keep-branch",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .failure()
+        .code(5);
+    assert_branch_exists(&repo.path(), "staged/dirty");
+    assert!(wt_dir.exists());
+    assert!(
+        git_ref_hash(&repo.path(), "refs/wt-core/preserved/staged/dirty").is_none(),
+        "failed initial keep should not retain a new marker"
+    );
+
+    wt_core()
+        .args([
+            "remove",
+            "staged/dirty",
+            "--keep-branch",
+            "--force",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    assert_branch_exists(&repo.path(), "staged/dirty");
+    assert!(!wt_dir.exists());
+}
+
+#[test]
+fn remove_keep_branch_failed_retry_preserves_marker_for_later_prune() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let branch = "feature/retry-marker";
+
+    wt_core()
+        .args(["add", branch, "--repo", &repo_str])
+        .assert()
+        .success();
+    let feature_dir = fixtures::find_worktree_dir(&repo.path(), "feature-retry-marker");
+    fixtures::commit_file(&feature_dir, "feature.txt", "feature", "feature commit");
+
+    // The first removal preserves the branch and creates the valid marker
+    // that a later prune will use.
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .success();
+    let marker_ref = "refs/wt-core/preserved/feature/retry-marker";
+    let marker_oid = git_ref_hash(&repo.path(), marker_ref).expect("marker should exist");
+    assert_eq!(
+        Some(marker_oid.clone()),
+        git_ref_hash(&repo.path(), "refs/heads/feature/retry-marker")
+    );
+
+    // Reattach the preserved branch and make the worktree dirty. A failed
+    // repeated remove must keep the original marker intact.
+    let reattached = repo.path().join("retry-marker-reattached");
+    run_git(
+        &["worktree", "add", &reattached.display().to_string(), branch],
+        &repo.path(),
+    );
+    std::fs::write(reattached.join("uncommitted.txt"), "dirty")
+        .expect("failed to make reattached worktree dirty");
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5);
+    assert!(reattached.exists());
+    assert_eq!(
+        Some(marker_oid.clone()),
+        git_ref_hash(&repo.path(), marker_ref)
+    );
+
+    // Once the dirty worktree is forcibly detached and its feature is
+    // integrated, prune should still recognize the preserved branch.
+    run_git(&["checkout", "main"], &repo.path());
+    run_git(&["merge", branch], &repo.path());
+    wt_core()
+        .args([
+            "remove",
+            branch,
+            "--keep-branch",
+            "--force",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success();
+    wt_core()
+        .args(["prune", "--execute", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_branch_deleted(&repo.path(), branch);
+    assert!(git_ref_hash(&repo.path(), marker_ref).is_none());
+}
+
+#[test]
+fn remove_keep_branch_failed_retry_does_not_restore_stale_marker() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let branch = "feature/stale-retry-marker";
+
+    wt_core()
+        .args(["add", branch, "--repo", &repo_str])
+        .assert()
+        .success();
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .success();
+    let marker_ref = "refs/wt-core/preserved/feature/stale-retry-marker";
+    let old_marker = git_ref_hash(&repo.path(), marker_ref).expect("marker should exist");
+
+    let reattached = repo.path().join("stale-retry-marker-reattached");
+    run_git(
+        &["worktree", "add", &reattached.display().to_string(), branch],
+        &repo.path(),
+    );
+    fixtures::commit_file(&reattached, "advanced.txt", "advanced", "advance branch");
+    std::fs::write(reattached.join("uncommitted.txt"), "dirty")
+        .expect("failed to make reattached worktree dirty");
+    assert_ne!(
+        Some(old_marker),
+        git_ref_hash(&repo.path(), "refs/heads/feature/stale-retry-marker")
+    );
+
+    wt_core()
+        .args(["remove", branch, "--keep-branch", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5);
+
+    assert!(
+        reattached.exists(),
+        "failed removal must preserve the worktree"
+    );
+    assert!(
+        git_ref_hash(&repo.path(), marker_ref).is_none(),
+        "rollback must clear a marker whose old OID no longer matches the branch"
+    );
+}
+
+#[test]
+fn remove_keep_branch_print_paths_preserves_legacy_protocol() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "staged/paths", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
+        .args([
+            "remove",
+            "staged/paths",
+            "--keep-branch",
+            "--print-paths",
+            "--repo",
+            &repo_str,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    assert_eq!(lines.len(), 3, "expected exactly 3 lines: {stdout}");
+    assert_eq!(lines[2], "staged/paths");
+    assert_branch_exists(&repo.path(), "staged/paths");
+}
+
+#[test]
+fn remove_json_writes_nul_delimited_navigation_metadata() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "navigation-protocol", "--repo", &repo_str])
+        .assert()
+        .success();
+    let removed_path = fixtures::find_worktree_dir(&repo.path(), "navigation-protocol");
+    let navigation_file = tempfile::NamedTempFile::new().expect("navigation file");
+
+    wt_core()
+        .args([
+            "remove",
+            "navigation-protocol",
+            "--repo",
+            &repo_str,
+            "--json",
+            "--navigation-file",
+            &navigation_file.path().display().to_string(),
+        ])
+        .assert()
+        .success();
+
+    let expected = format!(
+        "reset\0{}\0{}\0",
+        removed_path.display(),
+        repo.path().display()
+    );
+    assert_eq!(
+        std::fs::read(navigation_file.path()).expect("read navigation file"),
+        expected.as_bytes()
+    );
 }
 
 #[test]
@@ -293,24 +706,36 @@ fn remove_print_paths_returns_three_lines() {
 }
 
 #[test]
-fn remove_print_paths_conflicts_with_json() {
+fn remove_json_takes_precedence_over_print_paths() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
 
     wt_core()
+        .args(["add", "json-precedence-rm", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    let output = wt_core()
         .args([
             "remove",
-            "any-branch",
+            "json-precedence-rm",
             "--repo",
             &repo_str,
             "--print-paths",
             "--json",
         ])
         .assert()
-        .failure()
-        .stderr(predicates::prelude::predicate::str::contains(
-            "cannot be used with",
-        ));
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let stdout = String::from_utf8(output).expect("invalid utf8");
+    assert_eq!(stdout.lines().count(), 1, "expected one JSON document");
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("invalid json");
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["branch"], "json-precedence-rm");
+    assert!(json["removed_path"].as_str().is_some());
 }
 
 // ── Interactive picker fallback tests ───────────────────────────────
@@ -699,6 +1124,7 @@ fn add_remote_tracking_sets_correct_upstream() {
         "GIT_INDEX_FILE",
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
         "GIT_PREFIX",
     ] {
         cmd.env_remove(var);
