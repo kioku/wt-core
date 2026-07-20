@@ -248,9 +248,11 @@ Bootstrap and protocol files are owner-only ACL-validated, nonce-bound, and
 swept on the next startup after a crash. On Windows, “owner-only” means the
 current user plus trusted local SYSTEM and the built-in Administrators group;
 those two machine principals intentionally retain full lifecycle access for
-system administration and recovery. Existing files and directories must
-already satisfy this explicit, protected DACL policy; only paths just created
-by wt-core receive the policy. This protects cooperative `wt` operations;
+system administration and recovery. Lifecycle ACL creation must run under the
+process identity; wt-core rejects thread impersonation before changing a new
+object's DACL. Existing files and directories must already satisfy this
+explicit, protected DACL policy; only paths just created by wt-core receive the
+policy. This protects cooperative `wt` operations;
 deliberate tampering, killing, or path replacement by an arbitrary same-user
 process is outside the threat boundary. Git hooks that daemonize,
 detach, or mutate the repository after Git exits are outside the supported

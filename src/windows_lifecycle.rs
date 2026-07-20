@@ -23,8 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, ERROR_NO_TOKEN,
+    HANDLE, INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
@@ -49,11 +49,12 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
-    SetEvent, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
-    CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-    EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-    PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
+    GetCurrentThread, GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken,
+    OpenThreadToken, ResumeThread, SetEvent, UpdateProcThreadAttribute, WaitForMultipleObjects,
+    WaitForSingleObject, CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+    CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION,
+    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES,
+    STARTUPINFOEXW,
 };
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
@@ -1067,7 +1068,7 @@ pub(crate) fn ensure_private_directory_windows(path: &Path) -> io::Result<()> {
             "guardian protocol directory is not a private directory",
         ));
     }
-    let owner_sid = current_user_sid()?;
+    let owner_sid = process_user_sid()?;
     validate_private_windows_acl(path, &owner_sid)
 }
 
@@ -1105,7 +1106,7 @@ fn ensure_protocol_file_private(path: &Path) -> io::Result<()> {
             "guardian protocol file is not a private regular file",
         ));
     }
-    let owner_sid = current_user_sid()?;
+    let owner_sid = process_user_sid()?;
     validate_private_windows_acl(path, &owner_sid)
 }
 
@@ -1119,13 +1120,18 @@ const SID_MAX_SUB_AUTHORITIES: usize = 15;
 /// Apply the private lifecycle policy to a newly-created object. Existing
 /// objects must go through `validate_private_windows_acl` instead: changing
 /// their owner or DACL would turn tampering into an apparent repair.
+///
+/// Lifecycle ACL creation requires the primary process identity. A thread
+/// impersonation is rejected before this function can mutate the object's
+/// DACL, while the owner SID below remains intentionally process-token based.
 fn apply_private_windows_acl(path: &Path) -> io::Result<()> {
     use std::ptr::null_mut;
 
-    let owner_sid = current_user_sid()?;
+    reject_thread_impersonation_for_acl()?;
+    let owner_sid = process_user_sid()?;
     let acl = private_acl(&owner_sid)?;
     let wide = wide_path(path.as_os_str())?;
-    // Newly-created objects are already owned by the effective user. Do not
+    // Newly-created objects are already owned by the process user. Do not
     // pass OWNER_SECURITY_INFORMATION here: reassigning that owner invokes
     // ownership/impersonation-token handling and fails for ordinary runner
     // accounts without elevation (ERROR_NO_IMPERSONATION_TOKEN, 1309).
@@ -1518,6 +1524,8 @@ fn file_generic_mapping() -> GENERIC_MAPPING {
     }
 }
 
+/// Open the primary process token. Unlike `OpenThreadToken`, this does not
+/// follow a thread's impersonation identity.
 fn current_process_token() -> io::Result<HANDLE> {
     current_process_token_with_access(TOKEN_QUERY)
 }
@@ -1573,7 +1581,10 @@ fn access_check(
     }
 }
 
-fn current_user_sid() -> io::Result<Vec<u8>> {
+/// Return the SID from the primary process token. `OpenProcessToken` does not
+/// observe thread impersonation; callers that create lifecycle ACLs reject
+/// impersonated threads before using this process identity.
+fn process_user_sid() -> io::Result<Vec<u8>> {
     use std::ptr::null_mut;
     let mut token = null_mut();
     if unsafe {
@@ -1676,6 +1687,32 @@ fn current_user_sid() -> io::Result<Vec<u8>> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) };
     Ok(bytes.to_vec())
+}
+
+/// Reject ACL creation while the current thread carries an impersonation
+/// token. `ERROR_NO_TOKEN` is the normal non-impersonating result; every
+/// other `OpenThreadToken` error fails closed instead of being treated as a
+/// missing token. `TOKEN_QUERY` is the only right needed to detect the token.
+fn reject_thread_impersonation_for_acl() -> io::Result<()> {
+    let mut token = std::ptr::null_mut();
+    let opened = unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0;
+    if opened {
+        unsafe {
+            // A successful OpenThreadToken transfers ownership of this handle.
+            CloseHandle(token);
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "lifecycle ACL creation requires the process identity",
+        ));
+    }
+
+    let error = unsafe { GetLastError() };
+    if error == ERROR_NO_TOKEN {
+        Ok(())
+    } else {
+        Err(io::Error::from_raw_os_error(error as i32))
+    }
 }
 
 fn validate_protocol_file(path: &Path) -> io::Result<()> {
@@ -2976,6 +3013,63 @@ mod tests {
         result
     }
 
+    fn dacl_snapshot(path: &Path) -> io::Result<Vec<u8>> {
+        use std::ptr::null_mut;
+
+        let wide = wide_path(path.as_os_str())?;
+        let mut dacl: *mut ACL = null_mut();
+        let mut descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = null_mut();
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+
+        let result = (|| {
+            if dacl.is_null() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "test object has no DACL",
+                ));
+            }
+            let mut size = ACL_SIZE_INFORMATION::default();
+            if unsafe {
+                GetAclInformation(
+                    dacl,
+                    (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                    size_of::<ACL_SIZE_INFORMATION>() as u32,
+                    AclSizeInformation,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            let acl_size = unsafe { std::ptr::read_unaligned(dacl.cast::<ACL>()) }.AclSize as usize;
+            let bytes_in_use = size.AclBytesInUse as usize;
+            if bytes_in_use < size_of::<ACL>() || bytes_in_use > acl_size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "test object DACL has inconsistent size information",
+                ));
+            }
+            Ok(unsafe { std::slice::from_raw_parts(dacl.cast::<u8>(), bytes_in_use) }.to_vec())
+        })();
+        unsafe {
+            LocalFree(descriptor);
+        }
+        result
+    }
+
     fn impersonate<T>(token: HANDLE, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
         if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
             return Err(last_error());
@@ -3117,6 +3211,48 @@ mod tests {
         // protection did not need to reassign the owner of either object.
         ensure_private_directory_windows(&directory).expect("validate new directory ACL");
         ensure_private_file_windows(&file).expect("validate new file ACL");
+    }
+
+    #[test]
+    fn impersonated_acl_protection_fails_closed_without_changing_default_acl() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let directory = root.path().join("default-directory");
+        fs::create_dir(&directory).expect("default directory");
+        let file = root.path().join("default-file");
+        fs::write(&file, b"default").expect("default file");
+
+        let unauthorized = restricted_test_token().expect("restricted token");
+        for object in [&directory, &file] {
+            let before = dacl_snapshot(object).expect("snapshot default ACL");
+            let result = impersonate(unauthorized, || {
+                let protected = if object.is_dir() {
+                    protect_private_directory_windows(object)
+                } else {
+                    protect_private_file_windows(object)
+                };
+                assert!(
+                    protected.is_err(),
+                    "ACL protection must reject a thread impersonation"
+                );
+                Ok(())
+            });
+            result.expect("impersonated ACL protection check");
+
+            assert_eq!(
+                before,
+                dacl_snapshot(object).expect("snapshot unchanged ACL"),
+                "rejected ACL protection must not alter the default ACL"
+            );
+            let valid = if object.is_dir() {
+                ensure_private_directory_windows(object)
+            } else {
+                ensure_private_file_windows(object)
+            };
+            assert!(valid.is_err(), "default ACL must remain unprotected");
+        }
+        unsafe {
+            CloseHandle(unauthorized);
+        }
     }
 
     #[test]
