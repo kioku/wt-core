@@ -1125,14 +1125,16 @@ fn apply_private_windows_acl(path: &Path) -> io::Result<()> {
     let owner_sid = current_user_sid()?;
     let acl = private_acl(&owner_sid)?;
     let wide = wide_path(path.as_os_str())?;
+    // Newly-created objects are already owned by the effective user. Do not
+    // pass OWNER_SECURITY_INFORMATION here: reassigning that owner invokes
+    // ownership/impersonation-token handling and fails for ordinary runner
+    // accounts without elevation (ERROR_NO_IMPERSONATION_TOKEN, 1309).
     let error = unsafe {
         SetNamedSecurityInfoW(
             wide.as_ptr(),
             SE_FILE_OBJECT,
-            OWNER_SECURITY_INFORMATION
-                | DACL_SECURITY_INFORMATION
-                | PROTECTED_DACL_SECURITY_INFORMATION,
-            owner_sid.as_ptr().cast_mut().cast(),
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            null_mut(),
             null_mut(),
             acl.as_ptr().cast(),
             null_mut(),
@@ -3098,6 +3100,23 @@ mod tests {
             CloseHandle(unauthorized);
             CloseHandle(owner);
         }
+    }
+
+    #[test]
+    fn newly_created_objects_keep_their_owner_when_protecting_acl() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let directory = root.path().join("new-directory");
+        fs::create_dir(&directory).expect("new directory");
+        protect_private_directory_windows(&directory).expect("protect new directory ACL");
+
+        let file = directory.join("new-file");
+        fs::write(&file, b"private").expect("new file");
+        protect_private_file_windows(&file).expect("protect new file ACL");
+
+        // These are read-only checks. In particular, they verify that ACL
+        // protection did not need to reassign the owner of either object.
+        ensure_private_directory_windows(&directory).expect("validate new directory ACL");
+        ensure_private_file_windows(&file).expect("validate new file ACL");
     }
 
     #[test]
