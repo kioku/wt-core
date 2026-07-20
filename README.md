@@ -232,9 +232,23 @@ OS after process death. A live owner makes a new merge, `--continue`, or
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
 
-The Bash, Zsh, Fish, and Nushell bindings pass `--status`, `--continue`, and
-`--abort` through without applying legacy navigation or path-only parsing.
-JSON output remains available for all three lifecycle commands.
+The lifecycle lock serializes supported mutating `wt` operations, and Git ref
+updates use compare-and-swap checks where a detectable tip race matters. This
+is a cooperation boundary, not an operating-system capability claim: an
+untrusted same-user process can still swap a filesystem path or mount between
+syscalls, and Git provides no atomic API that closes that gap. wt-core fails
+closed when its registration, identity, ref, or HEAD checks detect a change,
+Removal deliberately has no separate filesystem quarantine or deletion
+journal; it retains native `git worktree remove` for Git's cross-platform
+cleanup behavior. A successful `wt merge --continue` also consumes the private
+navigation record in each shell binding, so callers are moved out of a source
+worktree that was removed; successful stderr warnings remain visible in
+Nushell.
+
+The Bash, Zsh, Fish, and Nushell bindings pass lifecycle commands through
+without applying legacy path-only parsing; `--continue` consumes only its
+private navigation record. JSON output remains available for all three
+lifecycle commands.
 
 ### `wt diff`
 

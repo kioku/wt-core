@@ -238,10 +238,15 @@ echo "$status_json" | grep -q '"state":"conflicted"' \
     || fail "wt merge --status: missing conflicted state"
 printf 'resolved\n' > binding-conflict.txt
 git add binding-conflict.txt
-continue_human=$(wt merge --continue)
+cd "$conflict_source"
+wt merge --continue >"$WORK/bash-continue.out"
+continue_human=$(cat "$WORK/bash-continue.out")
 echo "$continue_human" | grep -q "Merged 'matrix-conflict' into " \
     && pass "wt merge --continue: human lifecycle path completes" \
     || fail "wt merge --continue: human lifecycle path failed"
+[[ "$PWD" == "$MATRIX_ROOT" ]] \
+    && pass "wt merge --continue: deleted source cwd reset" \
+    || fail "wt merge --continue: caller remained in deleted cwd"
 [[ ! -e "$conflict_source" ]] \
     && pass "wt merge --continue: source worktree removed" \
     || fail "wt merge --continue: source worktree remains"

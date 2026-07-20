@@ -835,6 +835,13 @@ fn merge_config_injection_cannot_bypass_merge_hooks() {
         .env("GIT_CONFIG_KEY_0", "core.hooksPath")
         .env("GIT_CONFIG_VALUE_0", "/dev/null")
         .env("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/dev/null'")
+        // Windows treats environment names case-insensitively; these lower
+        // case spellings must be removed there as well.
+        .env("git_config_count", "1")
+        .env("git_config_key_0", "core.hooksPath")
+        .env("git_config_value_0", "/dev/null")
+        .env("git_config_parameters", "'core.hooksPath=/dev/null'")
+        .env("GIT_NAMESPACE", "untrusted-namespace")
         .output()
         .expect("merge should run");
     assert!(
@@ -884,6 +891,167 @@ fn merge_continue_destination_ref_lock_blocks_head_race() {
         !source.exists(),
         "successful continuation should clean source"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_restores_symbolic_head_when_final_cas_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-final-cas");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let shim = tempfile::TempDir::new().expect("git shim directory");
+    let marker = shim.path().join("raced");
+    let script = shim.path().join("git");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+if [ "$#" -ge 4 ] && [ "$1" = "update-ref" ] && [ "$2" = "refs/heads/main" ] && [ ! -e "$WT_RACE_MARKER" ]; then
+    : > "$WT_RACE_MARKER"
+    tree=$("$WT_REAL_GIT" rev-parse HEAD^{tree})
+    race=$("$WT_REAL_GIT" commit-tree "$tree" -p "$4" -m race)
+    "$WT_REAL_GIT" update-ref "$2" "$race" "$4"
+fi
+exec "$WT_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write git shim");
+    let mut permissions = std::fs::metadata(&script)
+        .expect("git shim metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&script, permissions).expect("chmod git shim");
+    let real_git = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|component| component.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("git executable")
+    };
+    let path = format!(
+        "{}:{}",
+        shim.path().display(),
+        std::env::var("PATH").expect("PATH")
+    );
+
+    let output = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .env("PATH", path)
+        .env("WT_REAL_GIT", real_git)
+        .env("WT_RACE_MARKER", &marker)
+        .output()
+        .expect("continuation should run");
+    assert!(!output.status.success(), "final CAS race must be refused");
+    assert!(marker.exists(), "final CAS shim did not run");
+    let attached = git_allow_failure(
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &repo.path(),
+    );
+    assert_eq!(
+        String::from_utf8(attached.stdout)
+            .expect("symbolic HEAD should be utf8")
+            .trim(),
+        "main"
+    );
+    assert!(!git_path(&repo.path(), "refs/heads/main.lock").exists());
+    assert!(
+        source.exists(),
+        "failed final CAS must preserve cleanup intent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_recovers_ref_lock_and_symbolic_head_after_kill() {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-kill");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let entered = repo.path().join("continue-kill-entered");
+    let release = repo.path().join("continue-kill-release");
+    install_hook(
+        &repo,
+        "pre-commit",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            shell_quote(&entered.display().to_string()),
+            shell_quote(&release.display().to_string()),
+        ),
+    );
+
+    let mut continuation = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+    continuation
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut continuation = continuation.spawn().expect("continuation should start");
+    wait_for_file(&entered);
+    let ref_lock = git_path(&repo.path(), "refs/heads/main.lock");
+    assert!(
+        ref_lock.exists(),
+        "continuation should reserve the destination ref"
+    );
+    continuation
+        .kill()
+        .expect("continuation should be terminable");
+    std::fs::write(&release, "release\n").expect("release continuation hook");
+    let _ = continuation.wait_with_output();
+
+    // The orphaned Git child may retain the lifecycle lock briefly. Wait for
+    // it to finish before exercising stale ref-lock/head recovery.
+    for _ in 0..200 {
+        let status = wt_core()
+            .args(["merge", "--status", "--json", "--repo", &repo_str])
+            .output()
+            .expect("status should run");
+        if !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\"") {
+            break;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ref_lock.exists(),
+        "the terminated owner should leave a recoverable lock file"
+    );
+    let detached = git_allow_failure(&["symbolic-ref", "--quiet", "HEAD"], &repo.path());
+    assert!(
+        !detached.status.success(),
+        "killed continuation should leave a detached HEAD before recovery"
+    );
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(
+        !ref_lock.exists(),
+        "recovery should clear the stale ref lock"
+    );
+    let attached = git_allow_failure(
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &repo.path(),
+    );
+    assert_eq!(
+        String::from_utf8(attached.stdout)
+            .expect("symbolic HEAD should be utf8")
+            .trim(),
+        "main"
+    );
+    assert!(
+        !source.exists(),
+        "recovered continuation should finish cleanup"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-kill");
 }
 
 #[cfg(unix)]

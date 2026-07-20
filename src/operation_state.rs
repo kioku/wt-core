@@ -204,7 +204,7 @@ fn new_operation_id() -> String {
 }
 
 #[cfg(unix)]
-fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
+pub(crate) fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
 
     // SAFETY: the descriptor belongs to `file` and remains open for the call.
@@ -224,7 +224,7 @@ fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
+pub(crate) fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{GetLastError, ERROR_LOCK_VIOLATION};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -257,7 +257,7 @@ fn try_lock_exclusive(file: &fs::File) -> io::Result<bool> {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn try_lock_exclusive(_file: &fs::File) -> io::Result<bool> {
+pub(crate) fn try_lock_exclusive(_file: &fs::File) -> io::Result<bool> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "managed merge lifecycle locking is unsupported on this platform",

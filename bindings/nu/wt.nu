@@ -50,6 +50,7 @@ def navigation-file [] {
 def run-core [args: list<string>] {
     let result = (^wt-core ...$args | complete)
     if $result.exit_code == 0 {
+        forward-core-stderr $result
         $result.stdout | str trim
     } else {
         forward-core-failure $result
@@ -64,7 +65,16 @@ def forward-core-failure [result: record] {
         ^printf "%s" $result.stdout
     }
     if not ($result.stderr | is-empty) {
-        ^printf "%s" $result.stderr err> /dev/stderr
+        print --raw --no-newline --stderr $result.stderr
+    }
+}
+
+def forward-core-stderr [result: record] {
+    # Successful lifecycle commands can still emit warnings (for example a
+    # branch cleanup that remains pending). Keep them on stderr instead of
+    # silently dropping them from the wrapper.
+    if not ($result.stderr | is-empty) {
+        print --raw --no-newline --stderr $result.stderr
     }
 }
 
@@ -280,14 +290,51 @@ export def --env "wt merge" [
     if $push { $args = ($args | append "--push") }
     if $no_cleanup { $args = ($args | append "--no-cleanup") }
 
-    if $status or $continue or $abort {
-        # Lifecycle reports have no navigation or path-only protocol. Keep
-        # stdout JSON-native when requested and preserve the core exit status.
+    if $status or $abort {
+        # Status and abort do not remove a worktree. Keep stdout JSON-native
+        # when requested and preserve the core exit status.
         let full_args = (build-args $args $repo $json false)
         if $json {
             run-core $full_args
         } else {
             ^wt-core ...$full_args
+        }
+    } else if $continue {
+        # Continuation may remove the source worktree, including only part of
+        # cleanup when branch deletion is deferred. Execute from the repository
+        # root and consume the private navigation side channel in every output
+        # mode so a caller is never left in a deleted cwd.
+        let context = (resolve-command-context $repo)
+        let command_repo = $context.repo
+        cd $command_repo
+        let effective_repo = if $repo != null { $command_repo } else { null }
+        let nav_file = (navigation-file)
+        let full_args = (build-args $args $effective_repo $json false | append ["--navigation-file" $nav_file])
+        let child = (^wt-core ...$full_args | complete)
+        let navigation = if ($nav_file | path exists) {
+            try { read-navigation $nav_file } catch { [] }
+        } else {
+            []
+        }
+        if $child.exit_code == 0 {
+            if (
+                (($navigation | get 0 | default "") == "reset")
+                and (($navigation | get 1 | default "") != "")
+                and (($navigation | get 2 | default "") != "")
+                and (path-is-within $cwd_before ($navigation | get 1))
+            ) {
+                cd ($navigation | get 2)
+            } else {
+                cd $cwd_before
+            }
+            forward-core-stderr $child
+            ^rm -f $nav_file
+            $child.stdout | str trim
+        } else {
+            cd $cwd_before
+            ^rm -f $nav_file
+            forward-core-failure $child
+            error make {msg: ($child.stderr | str trim | default $"wt-core exited with ($child.exit_code)")}
         }
     } else if $inspect {
         # Inspection is a read-only protocol. Do not add navigation metadata or

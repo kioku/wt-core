@@ -253,6 +253,11 @@ if $partial_output.exit_code == 0 and ($partial_output.stdout | str contains "ke
 } else {
     fail $"matrix remove: partial cleanup claimed branch deletion: ($partial_output.stdout)"
 }
+if ($partial_output.stderr | str contains "worktree removed but branch deletion failed") {
+    pass "matrix remove: successful stderr warning preserved"
+} else {
+    fail $"matrix remove: successful stderr warning was discarded: ($partial_output.stderr)"
+}
 if (^git show-ref --verify --quiet refs/heads/matrix-partial | complete).exit_code == 0 {
     pass "matrix remove: partial cleanup retains branch"
 } else {

@@ -7,6 +7,7 @@ use std::process::Stdio;
 
 use crate::domain::{BranchName, RepoRoot, Worktree, WorktreeStats};
 use crate::error::{AppError, Result};
+use crate::operation_state;
 
 /// Environment variables that can leak from parent git processes (e.g. hooks)
 /// and interfere with our subprocess calls.
@@ -17,6 +18,7 @@ const GIT_ENV_OVERRIDES: &[&str] = &[
     "GIT_OBJECT_DIRECTORY",
     "GIT_ALTERNATE_OBJECT_DIRECTORIES",
     "GIT_COMMON_DIR",
+    "GIT_NAMESPACE",
     "GIT_PREFIX",
     // Git also accepts the exact spelling without a suffix for a config file.
     "GIT_CONFIG",
@@ -33,7 +35,14 @@ pub(crate) fn sanitize_git_environment(cmd: &mut Cmd) {
         cmd.env_remove(var);
     }
     for (key, _) in std::env::vars_os() {
-        if key.to_string_lossy().starts_with("GIT_CONFIG_") {
+        let name = key.to_string_lossy();
+        #[cfg(windows)]
+        let is_config_override = name
+            .get(.."GIT_CONFIG_".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("GIT_CONFIG_"));
+        #[cfg(not(windows))]
+        let is_config_override = name.starts_with("GIT_CONFIG_");
+        if is_config_override {
             cmd.env_remove(key);
         }
     }
@@ -240,12 +249,12 @@ pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
 
 /// Delete a branch only if its ref still has the planned object ID.
 ///
-/// `git branch -D` and `git branch -d` resolve the ref and delete it in one
-/// command, but the force form intentionally has no old-value check. Use an
-/// explicit compare-and-swap so a branch moved after worktree removal cannot
-/// turn cleanup into deletion of a newer incarnation. The non-force ancestry
-/// check is performed against the same planned tip before the atomic ref
-/// update, preserving the ordinary remove command's safety rule.
+/// Git's porcelain branch deletion refuses a branch checked out in any
+/// worktree, while a raw `update-ref -d` does not. Reproduce that protection
+/// at the same boundary as the explicit ref transaction: first reject a
+/// registered checkout, then ask `update-ref --stdin` to verify and delete
+/// the exact planned OID in one transaction. The transaction is still a CAS
+/// if a writer moves the branch after the worktree listing.
 pub fn delete_branch_at_cas(
     path: &Path,
     branch: &BranchName,
@@ -259,20 +268,94 @@ pub fn delete_branch_at_cas(
         )));
     }
 
-    let reference = format!("refs/heads/{}", branch.as_str());
-    let mut cmd = Cmd::new("git");
-    cmd.args(["update-ref", "-d", &reference, expected_oid])
-        .current_dir(path);
-    sanitize_git_environment(&mut cmd);
-    let output = cmd
-        .output()
-        .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
-    if output.status.success() {
-        return Ok(());
+    let worktrees = git(&["worktree", "list", "--porcelain"], path)
+        .and_then(|raw| parse_worktree_porcelain(&raw, &RepoRoot(path.to_path_buf())))?;
+    if let Some(worktree) = worktrees
+        .iter()
+        .find(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
+    {
+        return Err(AppError::conflict(format!(
+            "cannot delete branch '{}' checked out at '{}'",
+            branch.as_str(),
+            worktree.path.display()
+        )));
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    Err(classify_git_error(stderr))
+    let reference = format!("refs/heads/{}", branch.as_str());
+    run_update_ref_transaction(
+        path,
+        &format!("start\ndelete {reference} {expected_oid}\ncommit\n"),
+    )?;
+
+    // A raw Git worktree add can register a checkout without changing the
+    // branch ref after the preflight listing. Recheck after the CAS and repair
+    // the only unsafe outcome (the deleted ref) before reporting success.
+    let worktrees = git(&["worktree", "list", "--porcelain"], path)
+        .and_then(|raw| parse_worktree_porcelain(&raw, &RepoRoot(path.to_path_buf())))?;
+    if worktrees
+        .iter()
+        .any(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
+    {
+        restore_deleted_branch_if_missing(path, &reference, expected_oid)?;
+        return Err(AppError::conflict(format!(
+            "cannot delete branch '{}' because it became checked out in another worktree",
+            branch.as_str(),
+        )));
+    }
+    Ok(())
+}
+
+fn restore_deleted_branch_if_missing(
+    path: &Path,
+    reference: &str,
+    expected_oid: &str,
+) -> Result<()> {
+    if branch_oid_from_path(
+        path,
+        &BranchName::new(reference.trim_start_matches("refs/heads/")),
+    )
+    .is_none()
+    {
+        run_update_ref_transaction(
+            path,
+            &format!(
+                "start\nupdate {reference} {expected_oid} 0000000000000000000000000000000000000000\ncommit\n"
+            ),
+        )?;
+    }
+    Ok(())
+}
+
+/// Run a ref transaction while keeping all ref comparisons inside Git's
+/// transaction protocol. This is used for both branch deletion and private
+/// lifecycle markers; individual `update-ref` invocations would leave a
+/// check/delete race.
+fn run_update_ref_transaction(path: &Path, input: &str) -> Result<()> {
+    let mut cmd = Cmd::new("git");
+    cmd.args(["update-ref", "--stdin"])
+        .current_dir(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    sanitize_git_environment(&mut cmd);
+    let mut child = cmd
+        .spawn()
+        .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(input.as_bytes()).map_err(|error| {
+            AppError::git(format!("failed to send git ref transaction: {error}"))
+        })?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(classify_git_error(
+            String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        ))
+    }
 }
 
 /// Atomically verify that a local branch still has `expected_oid`.
@@ -307,10 +390,10 @@ pub fn update_branch_ref_cas(
 }
 
 /// An exclusive Git ref lock held while a continuation commits on a detached
-/// worktree HEAD. The lock creates a cooperating/atomic boundary: Git and
-/// other `wt-core`/raw Git writers cannot advance the destination ref while
-/// the merge commit is being prepared, and the final ref update still uses an
-/// old-value CAS after the lock is released.
+/// worktree HEAD. Git treats the path as a ref lock, while the OS lock makes a
+/// stale file recoverable after SIGKILL or Windows process termination: the
+/// next owner can take the unlocked file, verify its private owner format, and
+/// reuse it instead of requiring manual `.lock` removal.
 pub struct BranchRefLock {
     path: PathBuf,
     file: Option<fs::File>,
@@ -318,8 +401,13 @@ pub struct BranchRefLock {
 
 impl BranchRefLock {
     fn release(&mut self) {
-        self.file.take();
-        let _ = fs::remove_file(&self.path);
+        if let Some(file) = self.file.take() {
+            // Keep the handle alive while removing the path. A new wt-core
+            // owner cannot observe an unlocked gap and Git never sees a stale
+            // lock after a normal completion.
+            let _ = fs::remove_file(&self.path);
+            drop(file);
+        }
     }
 }
 
@@ -329,6 +417,8 @@ impl Drop for BranchRefLock {
     }
 }
 
+const BRANCH_LOCK_HEADER: &str = "wt-core-branch-lock\n";
+
 pub fn acquire_branch_ref_lock(
     path: &Path,
     branch: &BranchName,
@@ -336,19 +426,7 @@ pub fn acquire_branch_ref_lock(
 ) -> Result<BranchRefLock> {
     let lock_name = format!("refs/heads/{}.lock", branch.as_str());
     let lock_path = git_path(path, &lock_name)?;
-    let mut options = fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let file = options.open(&lock_path).map_err(|error| {
-        AppError::conflict(format!(
-            "cannot reserve destination branch '{}': {error}",
-            branch.as_str()
-        ))
-    })?;
+    let file = open_recoverable_branch_lock(&lock_path)?;
 
     if branch_oid_from_path(path, branch).as_deref() != Some(expected_oid) {
         drop(file);
@@ -362,6 +440,102 @@ pub fn acquire_branch_ref_lock(
         path: lock_path,
         file: Some(file),
     })
+}
+
+fn open_recoverable_branch_lock(path: &Path) -> Result<fs::File> {
+    let mut create = fs::OpenOptions::new();
+    create.create_new(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        create.mode(0o600);
+    }
+    match create.open(path) {
+        Ok(file) => {
+            operation_state::try_lock_exclusive(&file).map_err(|error| {
+                AppError::git(format!(
+                    "cannot lock destination ref '{}': {error}",
+                    path.display()
+                ))
+            })?;
+            write_branch_lock_owner(&file)?;
+            Ok(file)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(path).map_err(|inspect| {
+                AppError::conflict(format!(
+                    "cannot inspect destination branch lock '{}': {inspect}",
+                    path.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(AppError::conflict(format!(
+                    "destination branch lock '{}' is not a regular file",
+                    path.display()
+                )));
+            }
+            let mut open = fs::OpenOptions::new();
+            open.read(true).write(true);
+            let file = open.open(path).map_err(|inspect| {
+                AppError::conflict(format!(
+                    "cannot inspect destination branch lock '{}': {inspect}",
+                    path.display()
+                ))
+            })?;
+            if !operation_state::try_lock_exclusive(&file).map_err(|lock_error| {
+                AppError::git(format!(
+                    "cannot inspect destination branch lock '{}': {lock_error}",
+                    path.display()
+                ))
+            })? {
+                return Err(AppError::conflict(format!(
+                    "destination branch ref is busy; retry after the Git writer finishes ({})",
+                    path.display()
+                )));
+            }
+            let contents = fs::read_to_string(path).unwrap_or_default();
+            if !contents.is_empty() && !contents.starts_with(BRANCH_LOCK_HEADER) {
+                return Err(AppError::conflict(format!(
+                    "destination branch lock '{}' belongs to another Git writer; refusing to remove it",
+                    path.display()
+                )));
+            }
+            write_branch_lock_owner(&file)?;
+            Ok(file)
+        }
+        Err(error) => Err(AppError::conflict(format!(
+            "cannot reserve destination branch '{}': {error}",
+            path.display()
+        ))),
+    }
+}
+
+fn write_branch_lock_owner(file: &fs::File) -> Result<()> {
+    let owner = format!("{BRANCH_LOCK_HEADER}pid={}\n", std::process::id());
+    let mut writer = file.try_clone().map_err(|error| {
+        AppError::git(format!("cannot duplicate destination ref lock: {error}"))
+    })?;
+    writer
+        .set_len(0)
+        .and_then(|_| writer.write_all(owner.as_bytes()))
+        .and_then(|_| writer.sync_all())
+        .map_err(|error| {
+            AppError::git(format!("cannot record destination ref lock owner: {error}"))
+        })
+}
+
+/// Recover a stale wt-core ref lock left by an abruptly terminated
+/// continuation. A live Git lock or another wt-core owner remains a hard
+/// refusal; only the private OS-unlocked lock format is reusable.
+pub fn recover_branch_ref_lock(path: &Path, branch: &BranchName, expected_oid: &str) -> Result<()> {
+    let lock_name = format!("refs/heads/{}.lock", branch.as_str());
+    let lock_path = git_path(path, &lock_name)?;
+    if !lock_path.exists() {
+        return Ok(());
+    }
+    let lock = acquire_branch_ref_lock(path, branch, expected_oid)?;
+    drop(lock);
+    Ok(())
 }
 
 fn branch_oid_from_path(path: &Path, branch: &BranchName) -> Option<String> {
@@ -382,17 +556,22 @@ pub fn restore_head(path: &Path, branch: &BranchName) -> Result<()> {
     git(&["symbolic-ref", "HEAD", &reference], path).map(|_| ())
 }
 
-/// Record that a branch should survive worktree removal until a later prune.
-///
-/// The marker is a private ref rather than a file in the repository, so the
-/// state follows clones only when explicitly copied and does not alter branch
-/// names or worktree directories. Its object ID is the branch incarnation
-/// that was explicitly preserved; prune must not authorize a later incarnation.
-pub fn mark_preserved_branch(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
+/// Install a preservation marker only if the branch still has `expected_oid`.
+/// The branch verification and marker update share one Git ref transaction, so
+/// a concurrent branch move can never make the marker authorize its newer tip.
+pub fn mark_preserved_branch_at_cas(
+    repo: &RepoRoot,
+    branch: &BranchName,
+    expected_oid: &str,
+) -> Result<()> {
     let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
     let branch_ref = format!("refs/heads/{}", branch.as_str());
-    git(&["update-ref", &marker, &branch_ref], repo.as_ref())?;
-    Ok(())
+    run_update_ref_transaction(
+        repo.as_ref(),
+        &format!(
+            "start\nverify {branch_ref} {expected_oid}\nupdate {marker} {expected_oid}\ncommit\n"
+        ),
+    )
 }
 
 /// A branch preserved by `remove --keep-branch`, including its exact marker
@@ -434,11 +613,39 @@ pub fn preserved_branch_oid(repo: &RepoRoot, branch: &BranchName) -> Result<Opti
         .map(|preserved| preserved.oid))
 }
 
-/// Restore a previously captured lifecycle marker object ID.
-pub fn restore_preserved_branch(repo: &RepoRoot, branch: &BranchName, oid: &str) -> Result<()> {
+/// Restore a marker only if it still contains the marker installed by this
+/// operation. A failed cleanup must not overwrite a marker another lifecycle
+/// owner created while the operation was unwinding.
+pub fn restore_preserved_branch_at_cas(
+    repo: &RepoRoot,
+    branch: &BranchName,
+    replacement_oid: &str,
+    expected_marker_oid: &str,
+) -> Result<()> {
     let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
-    git(&["update-ref", &marker, oid], repo.as_ref())?;
-    Ok(())
+    let input = format!("start\nupdate {marker} {replacement_oid} {expected_marker_oid}\ncommit\n");
+    run_update_ref_transaction(repo.as_ref(), &input)
+}
+
+/// Clear a lifecycle marker only if it still contains `expected_marker_oid`.
+pub fn clear_preserved_branch_at_cas(
+    repo: &RepoRoot,
+    branch: &BranchName,
+    expected_marker_oid: &str,
+) -> Result<()> {
+    let current = preserved_branch_oid(repo, branch)?;
+    if current.is_none() {
+        return Ok(());
+    }
+    if current.as_deref() != Some(expected_marker_oid) {
+        return Err(AppError::conflict(format!(
+            "preservation marker for branch '{}' changed before cleanup",
+            branch.as_str()
+        )));
+    }
+    let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
+    let input = format!("start\ndelete {marker} {expected_marker_oid}\ncommit\n");
+    run_update_ref_transaction(repo.as_ref(), &input)
 }
 
 /// Resolve the current object ID of a local branch.
@@ -494,14 +701,11 @@ pub fn local_branch_for_remote(repo: &RepoRoot, remote_revision: &str) -> Option
 
 /// Resolve `HEAD` to its checked-out local branch when it is symbolic.
 pub fn current_branch(repo: &RepoRoot) -> Option<String> {
-    git(&["symbolic-ref", "--short", "HEAD"], repo.as_ref()).ok()
+    current_branch_at_path(repo.as_ref())
 }
 
-/// Remove the lifecycle marker for a preserved branch.
-pub fn clear_preserved_branch(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
-    let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
-    git(&["update-ref", "-d", &marker], repo.as_ref())?;
-    Ok(())
+pub fn current_branch_at_path(path: &Path) -> Option<String> {
+    git(&["symbolic-ref", "--short", "HEAD"], path).ok()
 }
 
 /// Run a git command and return true if it exits successfully.
@@ -1671,6 +1875,80 @@ pub fn push(path: &Path, branch: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_git(path: &Path, args: &[&str]) -> String {
+        let mut command = Cmd::new("git");
+        command.args(args).current_dir(path);
+        sanitize_git_environment(&mut command);
+        let output = command.output().expect("git should start");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    fn test_repo() -> tempfile::TempDir {
+        let repo = tempfile::TempDir::new().expect("temporary repository should be created");
+        test_git(repo.path(), &["init", "-b", "main"]);
+        test_git(repo.path(), &["config", "user.name", "wt-core tests"]);
+        test_git(
+            repo.path(),
+            &["config", "user.email", "wt-core@example.test"],
+        );
+        fs::write(repo.path().join("README"), "initial\n").expect("initial file should write");
+        test_git(repo.path(), &["add", "README"]);
+        test_git(repo.path(), &["commit", "-m", "initial"]);
+        repo
+    }
+
+    #[test]
+    fn delete_branch_refuses_a_registered_checkout() {
+        let repo = test_repo();
+        let branch = BranchName::new("feature/checked-out");
+        test_git(repo.path(), &["branch", branch.as_str()]);
+        let worktree = repo.path().join("linked");
+        let worktree_arg = worktree.display().to_string();
+        test_git(
+            repo.path(),
+            &["worktree", "add", &worktree_arg, branch.as_str()],
+        );
+        let expected = test_git(repo.path(), &["rev-parse", branch.as_str()]);
+
+        let error = delete_branch_at_cas(repo.path(), &branch, true, &expected)
+            .expect_err("checked-out branch deletion must be refused");
+        assert_eq!(error.code, crate::error::ExitCode::Conflict);
+        assert_eq!(
+            branch_oid(&RepoRoot(repo.path().to_path_buf()), &branch),
+            Some(expected)
+        );
+    }
+
+    #[test]
+    fn ref_and_preservation_cas_refuse_a_moved_branch_tip() {
+        let repo = test_repo();
+        let root = RepoRoot(repo.path().to_path_buf());
+        let branch = BranchName::new("feature/moved");
+        test_git(repo.path(), &["branch", branch.as_str()]);
+        let expected = test_git(repo.path(), &["rev-parse", branch.as_str()]);
+        fs::write(repo.path().join("advance"), "advanced\n").expect("advance file should write");
+        test_git(repo.path(), &["add", "advance"]);
+        test_git(repo.path(), &["commit", "-m", "advance"]);
+        test_git(repo.path(), &["branch", "-f", branch.as_str(), "HEAD"]);
+        let moved = test_git(repo.path(), &["rev-parse", branch.as_str()]);
+
+        let error = delete_branch_at_cas(repo.path(), &branch, true, &expected)
+            .expect_err("branch deletion must use the planned OID");
+        assert_eq!(error.code, crate::error::ExitCode::Git);
+        assert_eq!(branch_oid(&root, &branch), Some(moved));
+        mark_preserved_branch_at_cas(&root, &branch, &expected)
+            .expect_err("preservation must use the planned OID");
+        assert!(preserved_branch_oid(&root, &branch)
+            .expect("marker lookup should succeed")
+            .is_none());
+    }
 
     #[test]
     fn parse_porcelain_basic() {

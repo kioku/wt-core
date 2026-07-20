@@ -393,43 +393,46 @@ fn remove_with_branch_context(
     };
 
     // Record preservation before removal so a successful worktree removal
-    // cannot lose the branch's later prune eligibility.
+    // cannot lose the branch's later prune eligibility. The marker update is
+    // itself a branch-tip CAS, so it cannot capture a newer incarnation.
     if keep_branch {
-        git::mark_preserved_branch(repo, &target_branch)?;
+        git::mark_preserved_branch_at_cas(repo, &target_branch, &planned_branch_oid)?;
     }
 
     // Revalidate the exact registration and branch tip immediately before
     // removal. The branch tip is a CAS token for the later deletion too;
     // neither path replacement nor a moved branch may be authorized by this
     // earlier plan.
-    validate_worktree_cleanup_plan(
+    if let Err(error) = validate_worktree_cleanup_plan(
         repo,
         &planned_worktree,
         &planned_identity,
         &target_branch,
         &planned_branch_oid,
         "remove",
-    )?;
-
-    // Remove worktree first, then optionally delete the branch. A failed
-    // worktree removal prevents branch cleanup and preserves the old safety
-    // ordering. Restore a prior marker only when it still matches the branch;
-    // otherwise clear the newly-created marker instead of retaining invalid
-    // lifecycle state.
-    if let Err(error) = git::remove_worktree(repo, &removed_path, force) {
-        match (
+    ) {
+        rollback_preservation_if_requested(
             keep_branch,
-            previous_marker
-                .filter(|oid| git::branch_oid(repo, &target_branch).as_deref() == Some(oid)),
-        ) {
-            (true, Some(oid)) => {
-                let _ = git::restore_preserved_branch(repo, &target_branch, &oid);
-            }
-            (true, None) => {
-                let _ = git::clear_preserved_branch(repo, &target_branch);
-            }
-            (false, _) => {}
-        }
+            repo,
+            &target_branch,
+            &planned_branch_oid,
+            previous_marker.as_deref(),
+        );
+        return Err(error);
+    }
+
+    // Retain Git's native worktree removal for its cross-platform metadata and
+    // filesystem behavior. The lifecycle lock serializes cooperating wt-core
+    // commands, while validation and the branch OID CAS fail closed on
+    // detectable changes.
+    if let Err(error) = git::remove_worktree(repo, &removed_path, force) {
+        rollback_preservation_if_requested(
+            keep_branch,
+            repo,
+            &target_branch,
+            &planned_branch_oid,
+            previous_marker.as_deref(),
+        );
         return Err(error);
     }
     let (branch_deleted, warning) = if keep_branch {
@@ -440,13 +443,14 @@ fn remove_with_branch_context(
         match git::delete_branch_at_cas(branch_context, &target_branch, force, &planned_branch_oid)
         {
             Ok(()) => {
-                let warning = git::clear_preserved_branch(repo, &target_branch)
-                    .err()
-                    .map(|e| {
-                        format!(
-                            "branch '{target_branch}' deleted but lifecycle marker cleanup failed: {e}"
-                        )
-                    });
+                let warning =
+                    git::clear_preserved_branch_at_cas(repo, &target_branch, &planned_branch_oid)
+                        .err()
+                        .map(|e| {
+                            format!(
+                        "branch '{target_branch}' deleted but lifecycle marker cleanup failed: {e}"
+                    )
+                        });
                 (true, warning)
             }
             Err(e) => (
@@ -463,6 +467,34 @@ fn remove_with_branch_context(
         branch_deleted,
         warning,
     })
+}
+
+/// Roll back only the marker installed by this remove attempt. If a marker
+/// changed independently, leave it untouched; clobbering it could authorize a
+/// different preservation request after this operation failed.
+fn rollback_preservation_if_requested(
+    keep_branch: bool,
+    repo: &RepoRoot,
+    branch: &BranchName,
+    planned_oid: &str,
+    previous_marker: Option<&str>,
+) {
+    if !keep_branch {
+        return;
+    }
+    if git::preserved_branch_oid(repo, branch)
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some(planned_oid)
+    {
+        return;
+    }
+    let result = match previous_marker {
+        Some(previous) => git::restore_preserved_branch_at_cas(repo, branch, previous, planned_oid),
+        None => git::clear_preserved_branch_at_cas(repo, branch, planned_oid),
+    };
+    let _ = result;
 }
 
 /// How a branch was detected as integrated into mainline.
@@ -676,7 +708,7 @@ fn prune_dry_run_inner(
             repair_stale_markers
                 .then(|| active_merge.is_some_and(|active| active.protects(&preserved.name)))
                 .filter(|protected| !protected)
-                .map(|_| git::clear_preserved_branch(repo, &branch))
+                .map(|_| git::clear_preserved_branch_at_cas(repo, &branch, &preserved.oid))
                 .transpose()?;
             stale_marker_branches.insert(preserved.name);
         } else {
@@ -804,7 +836,7 @@ fn prune_integrated_entry(
             if git::branch_oid(repo, &BranchName::new(&branch_name)).as_deref()
                 != Some(expected_oid) =>
         {
-            git::clear_preserved_branch(repo, &BranchName::new(&branch_name))
+            git::clear_preserved_branch_at_cas(repo, &BranchName::new(&branch_name), expected_oid)
                 .err()
                 .into_iter()
                 .for_each(|e| {
@@ -918,7 +950,7 @@ fn prune_integrated_entry(
     let branch_deleted =
         match git::delete_branch_at_cas(repo.as_ref(), &bn, force_branch, planned_branch_oid) {
             Ok(()) => {
-                if let Err(e) = git::clear_preserved_branch(repo, &bn) {
+                if let Err(e) = git::clear_preserved_branch_at_cas(repo, &bn, planned_branch_oid) {
                     acc.warnings.push(format!(
                         "branch '{branch_name}' deleted but lifecycle marker cleanup failed: {e}"
                     ));
@@ -2546,14 +2578,15 @@ fn cleanup_merge_operation(
     match git::delete_branch_at_cas(&destination.path, &branch, false, &state.source_head) {
         Ok(()) => {
             state.progress.branch_deleted = true;
-            let marker_warning = git::clear_preserved_branch(repo, &branch)
-                .err()
-                .map(|error| {
-                    format!(
-                        "branch '{}' deleted but lifecycle marker cleanup failed: {error}",
-                        state.source
-                    )
-                });
+            let marker_warning =
+                git::clear_preserved_branch_at_cas(repo, &branch, &state.source_head)
+                    .err()
+                    .map(|error| {
+                        format!(
+                            "branch '{}' deleted but lifecycle marker cleanup failed: {error}",
+                            state.source
+                        )
+                    });
             if let Some(warning) = marker_warning {
                 warnings.push(warning);
             }
@@ -2696,6 +2729,120 @@ fn merge_result_from_operation(
     }
 }
 
+/// Restore a destination that was left detached by a terminated continuation.
+/// If the detached HEAD is the exact merge result, first install that result
+/// with the recorded destination-head CAS; otherwise reattach the original
+/// branch and let normal stale-state validation refuse any unsafe cleanup.
+fn recover_detached_destination_head(repo: &RepoRoot, state: &MergeOperationState) -> Result<()> {
+    let worktrees = git::list_worktrees_readonly(repo)?;
+    let destination = worktrees
+        .iter()
+        .find(|worktree| worktree.path == state.destination_path)
+        .ok_or_else(|| {
+            AppError::conflict(
+                "destination worktree changed before detached-head recovery; managed state was preserved"
+                    .to_string(),
+            )
+        })?;
+    let identity = git::capture_worktree_identity(repo, destination)?;
+    if identity != state.destination_identity {
+        return Err(identity_changed(
+            "destination",
+            &state.destination,
+            &state.destination_path,
+            &state.destination_identity,
+            &identity,
+        ));
+    }
+    if git::current_branch_at_path(&state.destination_path).is_some() {
+        return Ok(());
+    }
+
+    let actual_head = git::head_commit(&state.destination_path)?;
+    let merge_source = state
+        .merge_head
+        .as_deref()
+        .unwrap_or(state.source_head.as_str());
+    let expected_result = state
+        .completed_destination_head
+        .clone()
+        .or(git::merge_result_head(
+            &state.destination_path,
+            &state.destination_head,
+            merge_source,
+        )?);
+    let mut install_error = None;
+    if expected_result.as_deref() == Some(actual_head.as_str())
+        && git::branch_oid(repo, &BranchName::new(&state.destination)).as_deref()
+            == Some(state.destination_head.as_str())
+    {
+        install_error = match git::acquire_branch_ref_lock(
+            &state.destination_path,
+            &BranchName::new(&state.destination),
+            &state.destination_head,
+        ) {
+            Ok(lock) => {
+                drop(lock);
+                git::update_branch_ref_cas(
+                    &state.destination_path,
+                    &BranchName::new(&state.destination),
+                    &actual_head,
+                    &state.destination_head,
+                )
+                .err()
+            }
+            Err(error) => Some(error),
+        };
+    }
+
+    let restore_error = git::restore_head(
+        &state.destination_path,
+        &BranchName::new(&state.destination),
+    )
+    .err();
+    match (install_error, restore_error) {
+        (Some(error), _) => Err(AppError::conflict(format!(
+            "destination merge result could not be recovered safely; managed state was preserved: {error}"
+        ))),
+        (None, Some(error)) => Err(AppError::conflict(format!(
+            "destination HEAD could not be restored after continuation: {error}"
+        ))),
+        (None, None) => Ok(()),
+    }
+}
+
+struct DetachedHeadGuard {
+    path: PathBuf,
+    branch: BranchName,
+    armed: bool,
+}
+
+impl DetachedHeadGuard {
+    fn new(path: &Path, branch: &BranchName) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            branch: branch.clone(),
+            armed: true,
+        }
+    }
+
+    fn restore(&mut self) -> Result<()> {
+        if self.armed {
+            git::restore_head(&self.path, &self.branch)?;
+            self.armed = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for DetachedHeadGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = git::restore_head(&self.path, &self.branch);
+        }
+    }
+}
+
 fn continue_merge_commit(
     repo: &RepoRoot,
     state: &mut MergeOperationState,
@@ -2731,19 +2878,30 @@ fn continue_merge_commit(
     // Reserve the destination ref and detach only this worktree's HEAD. Git's
     // normal continue path still runs all configured hooks, but it cannot
     // attach the merge commit to a ref that another writer advances while the
-    // hooks run. The final update-ref is an old-value CAS after the lock is
-    // released, covering writers that do not cooperate with the lock.
-    let _destination_ref_lock = git::acquire_branch_ref_lock(
+    // hooks run. Revalidate after acquiring the lock: preflight alone is not
+    // a boundary against a raw Git writer between validation and locking.
+    let destination_branch = BranchName::new(&state.destination);
+    let destination_ref_lock = git::acquire_branch_ref_lock(
         &state.destination_path,
-        &BranchName::new(&state.destination),
+        &destination_branch,
         &state.destination_head,
     )?;
+    validate_preflight_worktrees(repo, preflight, "source", "destination")?;
+    if git::merge_head(&state.destination_path)? != state.merge_head
+        || git::head_commit(&state.destination_path)? != state.destination_head
+        || git::branch_oid(repo, &destination_branch).as_deref()
+            != Some(state.destination_head.as_str())
+        || git::has_unmerged_entries(&state.destination_path)
+    {
+        return Err(AppError::conflict(
+            "destination merge state changed after ref locking; managed state was preserved for recovery"
+                .to_string(),
+        ));
+    }
+
     git::detach_head(&state.destination_path, &state.destination_head)?;
+    let mut head_guard = DetachedHeadGuard::new(&state.destination_path, &destination_branch);
     if let Err(error) = git::merge_continue(&state.destination_path) {
-        let _ = git::restore_head(
-            &state.destination_path,
-            &BranchName::new(&state.destination),
-        );
         return Err(AppError {
             code: error.code,
             message: format!(
@@ -2764,10 +2922,10 @@ fn continue_merge_commit(
                 .to_string(),
         )
     })?;
-    drop(_destination_ref_lock);
+    drop(destination_ref_lock);
     if let Err(error) = git::update_branch_ref_cas(
         &state.destination_path,
-        &BranchName::new(&state.destination),
+        &destination_branch,
         &expected,
         &state.destination_head,
     ) {
@@ -2775,10 +2933,7 @@ fn continue_merge_commit(
             "destination HEAD changed during continuation; merge result was not installed and managed state was preserved: {error}"
         )));
     }
-    git::restore_head(
-        &state.destination_path,
-        &BranchName::new(&state.destination),
-    )?;
+    head_guard.restore()?;
 
     let expected = git::merge_result_head(
         &state.destination_path,
@@ -2800,6 +2955,12 @@ fn continue_merge_commit(
 pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
     let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     let (_, mut state) = load_valid_merge_state(repo)?;
+    git::recover_branch_ref_lock(
+        &state.destination_path,
+        &BranchName::new(&state.destination),
+        &state.destination_head,
+    )?;
+    recover_detached_destination_head(repo, &state)?;
     if reconcile_operation_progress(repo, &mut state)? {
         // A prior action or the commit itself may have completed before its
         // progress write. Persist reconciliation before taking another action.
@@ -2835,7 +2996,16 @@ pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
 /// Abort a managed merge and clear only the matching operation record.
 pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
     let _lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
-    let (_, state) = load_valid_merge_state(repo)?;
+    let (_, mut state) = load_valid_merge_state(repo)?;
+    git::recover_branch_ref_lock(
+        &state.destination_path,
+        &BranchName::new(&state.destination),
+        &state.destination_head,
+    )?;
+    recover_detached_destination_head(repo, &state)?;
+    if reconcile_operation_progress(repo, &mut state)? {
+        write_operation_state(repo, &mut state)?;
+    }
     let report = merge_operation_status(repo)?;
     if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
         return Err(operation_recovery_error(&report));

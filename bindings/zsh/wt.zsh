@@ -186,13 +186,37 @@ wt() {
                 esac
             done
 
-            # Status, continue, and abort are lifecycle reports, not the
-            # legacy navigation protocol or path-only output protocol.
+            # Status and abort do not remove a worktree. Continue can finish
+            # source cleanup, so consume the navigation side channel even in
+            # its lifecycle output modes.
             for arg in "$@"; do
                 case "$arg" in
-                    --status|--continue|--abort)
+                    --status|--abort)
                         wt-core merge "$@"
                         return $?
+                        ;;
+                    --continue)
+                        local cwd_before nav_file output rc
+                        cwd_before=$(pwd -P)
+                        nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                        output=$(wt-core merge "$@" --navigation-file "$nav_file")
+                        rc=$?
+                        if [[ $rc -eq 0 ]] && [[ -f "$nav_file" ]]; then
+                            local nav_fd nav_action nav_removed nav_root
+                            exec {nav_fd}<"$nav_file"
+                            IFS= read -r -d $'\0' nav_action <&$nav_fd
+                            IFS= read -r -d $'\0' nav_removed <&$nav_fd
+                            IFS= read -r -d $'\0' nav_root <&$nav_fd
+                            exec {nav_fd}<&-
+                            if [[ "$nav_action" == reset ]] && [[ -n "$nav_removed" ]] \
+                                && [[ -n "$nav_root" ]] \
+                                && wt__path_is_within "$cwd_before" "$nav_removed"; then
+                                cd "$nav_root" || true
+                            fi
+                        fi
+                        rm -f "$nav_file"
+                        printf '%s\n' "$output"
+                        return $rc
                         ;;
                 esac
             done
