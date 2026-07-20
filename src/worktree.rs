@@ -285,11 +285,17 @@ pub fn go(repo: &RepoRoot, branch: &BranchName) -> Result<GoResult> {
         .find(|wt| wt.branch.as_deref() == Some(branch.as_str()));
 
     match found {
-        Some(wt) => Ok(GoResult {
+        Some(wt) if wt.path.is_dir() => Ok(GoResult {
             worktree_path: wt.path.clone(),
             branch: branch.clone(),
             repo_root: repo.to_path_buf(),
         }),
+        Some(wt) => Err(AppError::conflict(format!(
+            "worktree for branch '{branch}' is unavailable at {}; inspect its Git metadata; if it is locked, run `git worktree unlock '{}'` when safe, then run `wt prune --execute` or `git worktree remove --force '{}'`",
+            wt.path.display(),
+            wt.path.display(),
+            wt.path.display()
+        ))),
         None => Err(AppError::usage(format!(
             "no worktree found for branch '{branch}'"
         ))),
@@ -1151,12 +1157,12 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
         if wt.is_main {
             continue;
         }
-        if !wt.path.exists() {
+        if !wt.path.is_dir() {
+            let path = wt.path.display().to_string();
             diags.push(Diagnostic {
                 level: DiagLevel::Warn,
                 message: format!(
-                    "stale worktree metadata for {} (run `wt prune --execute` to remove it safely)",
-                    wt.path.display()
+                    "stale worktree metadata for {path} (inspect its Git metadata; if it is locked, run `git worktree unlock '{path}'` when safe, then run `wt prune --execute` or `git worktree remove --force '{path}'`)"
                 ),
             });
         }

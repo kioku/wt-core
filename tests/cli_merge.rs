@@ -3811,26 +3811,63 @@ fn read_only_commands_preserve_stale_worktree_metadata() {
     std::fs::remove_dir_all(&stale_path).expect("remove stale worktree directory");
     let admin_before = worktree_admin_snapshot(&repo.path());
 
-    for args in [
-        vec!["list", "--repo", &repo_str],
-        vec!["go", "feature/read-only-stale", "--repo", &repo_str],
-        vec![
+    wt_core()
+        .args(["list", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    wt_core()
+        .args(["go", "feature/read-only-stale", "--repo", &repo_str])
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains("worktree for branch"))
+        .stderr(predicate::str::contains("is unavailable"));
+
+    wt_core()
+        .args([
             "diff",
             "feature/read-only-stale",
             "--dry-run",
             "--repo",
             &repo_str,
-        ],
-        vec!["doctor", "--repo", &repo_str],
-    ] {
-        wt_core().args(args).assert().success();
-    }
+        ])
+        .assert()
+        .success();
+
+    wt_core()
+        .args(["doctor", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("git worktree unlock"));
 
     assert_eq!(
         worktree_admin_snapshot(&repo.path()),
         admin_before,
         "read-only list, go, diff, and doctor must not run git worktree prune"
     );
+}
+
+#[test]
+fn doctor_guides_locked_stale_metadata_without_recommending_plain_prune() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/locked-stale", "--repo", &repo_str])
+        .assert()
+        .success();
+    let stale_path = find_worktree_dir(&repo.path(), "feature-locked-stale");
+    lock_worktree_metadata(&repo.path(), &stale_path);
+    std::fs::remove_dir_all(&stale_path).expect("remove locked stale worktree");
+
+    wt_core()
+        .args(["doctor", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("git worktree unlock"))
+        .stdout(predicate::str::contains("wt prune --execute"))
+        .stdout(predicate::str::contains("run `wt prune --execute` to remove it safely").not());
 }
 
 #[test]
