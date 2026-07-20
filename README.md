@@ -230,25 +230,22 @@ all durable journal/cleanup updates; its lock state is released safely by the
 OS after process death. A live owner makes a new merge, `--continue`, or
 `--abort` fail with recovery guidance, while `--status` remains read-only.
 
-On Windows 10 and Windows Server 2016 or newer, lifecycle Git is contained
-by an internal launcher. wt-core atomically creates that launcher suspended in
-a private kill-on-close Job Object with `PROC_THREAD_ATTRIBUTE_JOB_LIST`, then
-uses `DuplicateHandle` to place a non-inheritable lease and private stdio/event
-handles in the suspended target. It resumes the launcher only after the
-transfer is complete. No parent handle is made inheritable, so unrelated
-spawns from the owner cannot inherit a lifecycle lease or pipe. The launcher
-runs Git with the exact args, environment, working directory, stdio, and
-supported creation flags, keeps the lease until the parent terminates and
-waits the job, and cannot break away from that job. Cleanup is fail-closed: a
-failed termination or job wait never closes the last job/lease; the job handle
-is retained so recovery remains busy rather than racing a live member. Older
-Windows versions are not supported for lifecycle Git. Git hooks that Git
-synchronously waits for are supported; hooks that daemonize, detach, or mutate
-the repository after Git exits are outside the supported contract and must not
-be used for lifecycle repository mutation. When the owner process dies,
-`KILL_ON_JOB_CLOSE` intentionally tears down the blocked hook; therefore
-post-death `busy` is not promised, but the transferred lease remains until the
-kernel has quiesced the job.
+On Windows 10 and Windows Server 2016 or newer, lifecycle Git is managed by a
+normally-created guardian outside a private kill-on-close Job Object. The
+owner writes a private, nonce-bound bootstrap and duplicates only non-inheritable
+stdio/event/process handles into the guardian; no lifecycle handle is inherited
+or made process-global, so unrelated owner spawns cannot observe them. The
+guardian acquires the child lease by path, signals readiness before Git starts,
+then atomically creates suspended Git in the Job Object with
+`PROC_THREAD_ATTRIBUTE_JOB_LIST` and resumes it. Git receives the exact args,
+environment, working directory, stdio, and supported creation flags, and cannot
+break away from the job. The guardian waits Git and synchronous hooks, terminates
+and waits every remaining member, and only then releases the child lease. If
+the owner dies, the guardian uses its duplicated owner-process handle rather
+than capture-pipe EOF as the death signal and continues that cleanup; recovery
+remains busy until job quiescence. Git hooks that daemonize, detach, or
+mutate the repository after Git exits are outside the supported contract and
+must not be used for lifecycle repository mutation.
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
 

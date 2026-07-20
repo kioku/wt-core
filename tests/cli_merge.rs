@@ -1,5 +1,9 @@
 mod fixtures;
 
+#[cfg(windows)]
+use std::fs::OpenOptions;
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle;
 use std::process::Command as StdCommand;
 #[cfg(any(unix, windows))]
 use std::process::Stdio;
@@ -810,8 +814,6 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
     let release = repo.path().join("windows-sync-release");
     let env_capture = repo.path().join("windows-sync-env");
     let cwd_capture = repo.path().join("windows-sync-cwd");
-    let probe_started = repo.path().join("owner-lock-probe-started");
-    let probe_acquired = repo.path().join("owner-lock-probe-acquired");
     install_hook(
         &repo,
         "post-merge",
@@ -828,15 +830,12 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
     merge
         .args(["merge", "feature/windows-значение", "--repo", &repo_str])
         .env("WT_WINDOWS_EXACT_ENV", "значение with spaces \\\"and\\\"")
-        .env(
-            "WT_CORE_WINDOWS_LIFECYCLE_LOCK_PROBE",
-            repo.path().as_os_str(),
-        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let merge = merge.spawn().expect("Windows merge should start");
     wait_for_file(&entered);
-    wait_for_file(&probe_started);
+    let child_lock = child_lock_path(&repo.path());
+    wait_for_child_lock(&child_lock, false);
 
     let status = wt_core()
         .args(["merge", "--status", "--json", "--repo", &repo_str])
@@ -846,9 +845,18 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
         serde_json::from_slice(&status.stdout).expect("busy status JSON");
     assert_eq!(status_json["state"], "busy");
 
-    // The helper is an unrelated process spawned by the lifecycle owner at
-    // the old inheritance-sensitive phase. It is bounded and reaped by the
-    // owner; its eventual acquisition is the kernel-observable exclusion.
+    // An unrelated owner spawn cannot inherit the guardian's lease or pipes.
+    let unrelated = StdCommand::new("cmd.exe")
+        .args(["/C", "exit", "0"])
+        .spawn()
+        .expect("unrelated owner spawn");
+    assert!(unrelated
+        .wait_with_output()
+        .expect("unrelated spawn wait")
+        .status
+        .success());
+    assert!(!try_child_lock(&child_lock));
+
     let continue_output = wt_core()
         .args(["merge", "--continue", "--repo", &repo_str])
         .output()
@@ -882,21 +890,16 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
         git_rev_parse(&repo.path(), "--show-toplevel")
     );
 
-    wait_for_file(&probe_acquired);
-    assert_eq!(
-        std::fs::read_to_string(&probe_acquired).expect("owner lock probe result"),
-        "acquired\n"
-    );
-
     // Immediate recovery is the important boundary: all direct Git handles,
     // pipe handles, and job members have been reaped before wt-core returns.
+    wait_for_child_lock(&child_lock, true);
     let status = wt_core()
         .args(["merge", "--status", "--json", "--repo", &repo_str])
         .output()
         .expect("recovery status should run");
     assert!(
         !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
-        "lifecycle lock remained busy after the explicit probe completed"
+        "lifecycle lock remained busy after guardian quiescence"
     );
 }
 
@@ -914,30 +917,34 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
 
     let entered = repo.path().join("windows-killed-entered");
     let release = repo.path().join("windows-killed-release");
-    let probe_started = repo.path().join("owner-lock-probe-started");
-    let probe_acquired = repo.path().join("owner-lock-probe-acquired");
+    let hook_alive = repo.path().join("windows-killed-hook-alive");
+    let hook_quiesced = repo.path().join("windows-killed-hook-quiesced");
+    let gate = repo.path().join("windows-killed-cleanup-gate");
+    let gate_started = gate.with_extension("started");
+    let gate_release = gate.with_extension("release");
     install_hook(
         &repo,
         "post-merge",
         &format!(
-            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nprintf alive > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\nprintf quiesced > {}\n",
             shell_quote(&entered.display().to_string()),
+            shell_quote(&hook_alive.display().to_string()),
             shell_quote(&release.display().to_string()),
+            shell_quote(&hook_quiesced.display().to_string()),
         ),
     );
 
     let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
     merge
         .args(["merge", "feature/windows-killed", "--repo", &repo_str])
-        .env(
-            "WT_CORE_WINDOWS_LIFECYCLE_LOCK_PROBE",
-            repo.path().as_os_str(),
-        )
+        .env("WT_CORE_WINDOWS_LIFECYCLE_CLEANUP_GATE", &gate)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut merge = merge.spawn().expect("Windows merge should start");
     wait_for_file(&entered);
-    wait_for_file(&probe_started);
+    wait_for_file(&hook_alive);
+    let child_lock = child_lock_path(&repo.path());
+    wait_for_child_lock(&child_lock, false);
 
     // The parent is still alive while the synchronously waited hook is blocked;
     // the direct lease must make recovery report busy rather than racing Git.
@@ -950,14 +957,24 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
     assert_eq!(busy_json["state"], "busy");
 
     merge.kill().expect("owner should be terminable");
-    let _ = merge.wait_with_output();
+    wait_for_file(&gate_started);
 
-    // KILL_ON_JOB_CLOSE intentionally terminates the blocked hook when the
-    // owner dies, so a post-kill busy observation is not a contract: immediate
-    // non-busy is safe. The owner-spawned probe proves the stronger invariant
-    // that the transferred launcher lease is released only after the kernel
-    // has quiesced the job. It cannot acquire while the hook/job is alive.
-    wait_for_file(&probe_acquired);
+    // The surviving guardian has observed owner death but has not yet
+    // terminated the job. The blocked hook and child lease remain live
+    // together; releasing the lease early would permit a recovery race.
+    assert!(!hook_quiesced.exists(), "hook escaped its blocked phase");
+    assert!(
+        !try_child_lock(&child_lock),
+        "child lease released before job cleanup"
+    );
+
+    std::fs::write(&gate_release, "release\n").expect("release guardian cleanup gate");
+    let _ = merge.wait_with_output();
+    wait_for_child_lock(&child_lock, true);
+    assert!(
+        !hook_quiesced.exists(),
+        "terminated hook reached post-release code"
+    );
     assert!(
         !release.exists(),
         "killed hook unexpectedly reached its release"
@@ -968,13 +985,40 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
         .expect("status should run after owner death");
     assert!(
         !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
-        "killed parent left the lifecycle Git lease busy after the probe completed"
+        "killed parent left the lifecycle Git lease busy after guardian quiescence"
     );
 }
 
 #[cfg(windows)]
 #[test]
-fn windows_lifecycle_continue_and_abort_use_the_launcher() {
+fn windows_lifecycle_setup_failure_after_guardian_job_creation_releases_child_lock() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/windows-setup-failure", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-windows-setup-failure");
+    commit_file(&source, "setup.txt", "setup", "setup source");
+
+    let output = wt_core()
+        .args([
+            "merge",
+            "feature/windows-setup-failure",
+            "--repo",
+            &repo_str,
+        ])
+        .env("WT_CORE_WINDOWS_LIFECYCLE_FAIL_AFTER_JOB", "1")
+        .output()
+        .expect("setup failure should run");
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("guardian job creation"));
+    wait_for_child_lock(&child_lock_path(&repo.path()), true);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lifecycle_continue_and_abort_use_the_guardian() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
     let source = create_conflicted_merge(&repo, "feature/windows-continue");
@@ -1000,6 +1044,60 @@ fn windows_lifecycle_continue_and_abort_use_the_launcher() {
     assert!(
         abort_source.exists(),
         "abort should retain the source worktree"
+    );
+}
+
+#[cfg(windows)]
+fn child_lock_path(repo: &std::path::Path) -> std::path::PathBuf {
+    repo.join(".git/wt-core/.merge-operation.lock-child")
+}
+
+#[cfg(windows)]
+fn try_child_lock(path: &std::path::Path) -> bool {
+    use windows_sys::Win32::Foundation::{GetLastError, ERROR_LOCK_VIOLATION};
+    use windows_sys::Win32::Storage::FileSystem::{
+        LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
+    };
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("child lock file");
+    let mut overlapped = OVERLAPPED::default();
+    let locked = unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } != 0;
+    if !locked {
+        assert_eq!(unsafe { GetLastError() }, ERROR_LOCK_VIOLATION);
+    }
+    locked
+}
+
+#[cfg(windows)]
+fn wait_for_child_lock(path: &std::path::Path, expected: bool) {
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        if try_child_lock(path) == expected {
+            return;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "timed out waiting for child lock {} to be {}",
+        path.display(),
+        if expected { "available" } else { "busy" }
     );
 }
 

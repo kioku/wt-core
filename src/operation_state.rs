@@ -56,9 +56,9 @@ pub(crate) struct MergeProgress {
 /// intentional: process death therefore recovers without a PID-based timeout,
 /// while Git and every hook Git synchronously waits for keep the lifecycle
 /// lock. Background/daemonized hook repository mutation is unsupported.
-/// Windows places an internal launcher in an atomic kill-on-close job and
-/// duplicates a non-inheritable direct lease into it; unrelated subprocesses
-/// never receive that lease.
+/// Windows places a surviving guardian outside an atomic kill-on-close job; the
+/// guardian acquires the separate child lease by path and retains it through
+/// job quiescence. Unrelated subprocesses never receive lifecycle handles.
 #[derive(Debug)]
 pub(crate) struct MergeLifecycleLock {
     // The parent handle is intentionally retained for the entire lifecycle.
@@ -77,10 +77,10 @@ impl MergeLifecycleLock {
     /// Spawn the lifecycle child with a direct lease.
     ///
     /// Unix configures inheritance in the forked child, so the parent never
-    /// exposes the descriptor to unrelated concurrent spawns. Windows creates
-    /// a suspended internal launcher in a job, duplicates a non-inheritable
-    /// lease into it, and resumes it only after the transfer succeeds. The
-    /// job's kill-on-close policy closes every parent-death setup gap.
+    /// exposes the descriptor to unrelated concurrent spawns. Windows uses an
+    /// out-of-job guardian that acquires the child lease by path before
+    /// starting atomically job-assigned Git; the guardian owns cleanup after
+    /// parent death.
     #[cfg(not(windows))]
     pub(crate) fn spawn_child(&self, command: &mut Command) -> io::Result<std::process::Child> {
         #[cfg(unix)]

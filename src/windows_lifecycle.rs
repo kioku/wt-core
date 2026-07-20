@@ -1,31 +1,30 @@
 //! Windows containment for lifecycle Git.
 //!
-//! Windows 10 and Windows Server 2016 introduced `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
-//! The lifecycle path requires that API: it creates an internal launcher suspended
-//! in a kill-on-close job, then duplicates non-inheritable handles into that
-//! already-created process. No parent handle is made inheritable, so an unrelated
-//! concurrent spawn cannot observe a lifecycle lease or a lifecycle pipe.
+//! The lifecycle owner only owns the repository lock.  A normally-created,
+//! out-of-job guardian owns the child lease and the kill-on-close job.  That
+//! distinction is the important lifetime invariant: killing the owner cannot
+//! close the guardian's lease before the job has been terminated and waited.
 //!
-//! The launcher keeps the child lease until the parent has terminated the job and
-//! waited for every member. Cleanup failure retains the job handle and lease
-//! instead of relying on an unproven kill-on-close. Git and hooks that Git
-//! synchronously waits for are supported; daemonized hooks that mutate the
-//! repository after Git returns are outside the contract.
+//! Git and hooks that Git synchronously waits for are supported.  A hook that
+//! daemonizes and mutates the repository after Git returns is unsupported; the
+//! guardian terminates and waits every remaining job member before releasing
+//! the child lease.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Cursor, Read, Write};
 use std::mem::size_of;
-use std::os::windows::ffi::OsStrExt;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::os::windows::io::FromRawHandle;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ExitStatus, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::{
     CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0,
+    INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::{
@@ -39,121 +38,103 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, SetEvent,
-    UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
 };
 
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
-const INTERNAL_LAUNCHER_ARG: &str = "--__wt-core-windows-lifecycle-launcher";
-// This protocol is intentionally opt-in and bounded. It is a kernel-observable
-// test of the no-inheritance invariant, not a production lifecycle mechanism.
-const INTERNAL_LOCK_PROBE_ARG: &str = "--__wt-core-windows-lifecycle-lock-probe";
-const LOCK_PROBE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_LOCK_PROBE";
-const LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-static BOOTSTRAP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const INTERNAL_GUARDIAN_ARG: &str = "--__wt-core-windows-lifecycle-guardian";
+const GUARDIAN_MAGIC: &[u8] = b"wt-core-windows-guardian-v1\0";
+const HANDOFF_MAGIC: &[u8] = b"wt-core-windows-guardian-handoff-v1\0";
+const RESULT_MAGIC: &[u8] = b"wt-core-windows-guardian-result-v1\0";
+const GUARDIAN_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+const GUARDIAN_RETRY_DELAY: Duration = Duration::from_millis(25);
+const TEST_FAIL_AFTER_JOB_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_FAIL_AFTER_JOB";
+const TEST_CLEANUP_GATE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_CLEANUP_GATE";
+static PROTOCOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Run Git with captured stdout/stderr while retaining the direct child lease.
-///
-/// Git and every hook Git synchronously waits for remain inside the supported
-/// lifecycle boundary. Background/daemonized hook repository mutation is
-/// unsupported; the job terminates leftover members before this function
-/// releases either copy of the child lease. If termination or the job wait
-/// fails, the job handle is retained and this call returns an error without
-/// dropping the last lease.
+/// Run Git with captured stdout/stderr.  The parent does not acquire the child
+/// lock: the surviving guardian acquires it by path before it signals ready.
 pub(crate) fn output_git(
     child_lock_path: &Path,
     args: &[&str],
     cwd: &Path,
     environment: &[(OsString, OsString)],
-) -> io::Result<Output> {
+) -> io::Result<std::process::Output> {
     output_git_with_creation_flags(child_lock_path, args, cwd, environment, 0)
 }
 
 /// Run Git with caller-provided creation flags.
 ///
-/// `CREATE_SUSPENDED` cannot be preserved: the internal launcher must resume
-/// its own suspended bootstrap process, and passing that flag to Git would
-/// leave Git suspended while the launcher waits. `CREATE_BREAKAWAY_FROM_JOB`
-/// is also rejected because no lifecycle process may leave its job.
+/// `CREATE_SUSPENDED` cannot be preserved because the guardian uses suspension
+/// only for the atomically job-assigned Git process.  `CREATE_BREAKAWAY_FROM_JOB`
+/// is rejected because lifecycle Git must not escape its job.
 pub(crate) fn output_git_with_creation_flags(
     child_lock_path: &Path,
     args: &[&str],
     cwd: &Path,
     environment: &[(OsString, OsString)],
     creation_flags: u32,
-) -> io::Result<Output> {
+) -> io::Result<std::process::Output> {
     validate_creation_flags(creation_flags)?;
 
-    let child_lock = open_child_lock(child_lock_path)?;
-    if !super::try_lock_exclusive(&child_lock)? {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "managed merge lifecycle child lock is busy",
-        ));
-    }
-
-    // The declaration order is deliberate. Setup failures before launcher
-    // creation close an empty job; failures after creation retain the job and
-    // lease rather than dropping them without a quiescence proof.
-    let mut job = Job::new()?;
-    let mut stdio = StdioHandles::new()?;
-    let mut bootstrap = BootstrapFile::new(child_lock_path)?;
-    let done_event = OwnedHandle::new(create_event()?);
-    let gate_event = OwnedHandle::new(create_event()?);
     let current_exe = std::env::current_exe()?;
+    let nonce = new_nonce();
+    let paths = ProtocolPaths::new(child_lock_path)?;
+    let config = GuardianConfig {
+        nonce: nonce.clone(),
+        child_lock_path: child_lock_path.to_path_buf(),
+        result_path: paths.result.clone(),
+        cwd: cwd.to_path_buf(),
+        args: args.iter().map(OsString::from).collect(),
+        environment: environment.to_vec(),
+        creation_flags,
+        // This is a debug-only fault injection used by the Windows runtime
+        // test.  It is part of the private bootstrap, never a process-global
+        // switch read by the guardian after startup.
+        fail_after_job: cfg!(debug_assertions)
+            && std::env::var_os(TEST_FAIL_AFTER_JOB_ENV).as_deref() == Some(OsStr::new("1")),
+        cleanup_gate: cfg!(debug_assertions)
+            .then(|| std::env::var_os(TEST_CLEANUP_GATE_ENV))
+            .flatten()
+            .map(PathBuf::from),
+    };
+    ProtocolFile::write_new(&paths.bootstrap, encode_config(&config)?)?;
+
+    let mut stdio = StdioHandles::new()?;
+    let start_event = OwnedHandle::new(create_event()?);
+    let ready_event = OwnedHandle::new(create_event()?);
+    let abort_event = OwnedHandle::new(create_event()?);
     let current_exe_wide = wide_path(current_exe.as_os_str())?;
-    let current_directory = wide_path(cwd.as_os_str())?;
-    let environment_block = environment_block(environment)?;
-
-    // Only the job attribute is used for the atomic launcher creation. In
-    // particular, there is no HANDLE_LIST and no inherited lifecycle handle.
-    let mut attributes = AttributeList::new(1)?;
-    let job_handle = job.raw();
-    attributes.update(
-        PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
-        (&job_handle as *const HANDLE).cast(),
-        size_of::<HANDLE>(),
-    )?;
-
-    let mut launcher_args = vec![
-        OsString::from(INTERNAL_LAUNCHER_ARG),
-        bootstrap.path().as_os_str().to_os_string(),
+    let guardian_args = vec![
+        OsString::from(INTERNAL_GUARDIAN_ARG),
+        paths.bootstrap.as_os_str().to_os_string(),
+        paths.handoff.as_os_str().to_os_string(),
+        OsString::from(&nonce),
     ];
-    launcher_args.extend(args.iter().map(OsString::from));
-    let mut command_line = command_line_os(current_exe.as_os_str(), &launcher_args)?;
+    let mut command_line = command_line_os(current_exe.as_os_str(), &guardian_args)?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-    startup.lpAttributeList = attributes.raw();
-
-    // This opt-in helper is an ordinary spawn from the lifecycle owner at the
-    // old inheritance-sensitive phase. It only probes whether the child lock
-    // becomes acquirable after this function releases it. The helper has a
-    // 60-second deadline and is reaped on every path; it cannot orphan a test
-    // process when setup fails.
-    let mut lock_probe = LockProbe::spawn(child_lock_path)?;
-
     let mut process_info = PROCESS_INFORMATION::default();
-    // The launcher is an internal implementation detail. Only CREATE_NO_WINDOW
-    // is copied to it; all other supported caller flags are applied unchanged
-    // to the Git process by the launcher.
-    let launcher_flags = CREATE_NO_WINDOW & creation_flags;
-    // SAFETY: all pointers reference live, NUL-terminated buffers or valid
-    // handles owned by this function for the duration of CreateProcessW.
+    let guardian_flags = CREATE_UNICODE_ENVIRONMENT | (creation_flags & CREATE_NO_WINDOW);
+
+    // The guardian is deliberately a normal process outside the Git job. No
+    // lifecycle handle is inheritable and bInheritHandles is false.
     let created = unsafe {
+        // SAFETY: all pointers reference live, NUL-terminated buffers for the
+        // duration of CreateProcessW; no attribute list or inherited handles
+        // are supplied to the guardian.
         CreateProcessW(
             current_exe_wide.as_ptr(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             0,
-            launcher_flags
-                | CREATE_SUSPENDED
-                | EXTENDED_STARTUPINFO_PRESENT
-                | CREATE_UNICODE_ENVIRONMENT,
-            environment_block.as_ptr().cast(),
-            current_directory.as_ptr(),
+            guardian_flags,
+            std::ptr::null_mut(),
+            std::ptr::null(),
             (&startup as *const STARTUPINFOEXW).cast(),
             &mut process_info,
         )
@@ -161,129 +142,93 @@ pub(crate) fn output_git_with_creation_flags(
     if !created {
         return Err(last_error());
     }
-    job.launcher_created = true;
 
-    let process = OwnedHandle::new(process_info.hProcess);
-    let launcher_thread = OwnedHandle::new(process_info.hThread);
+    let guardian = OwnedHandle::new(process_info.hProcess);
+    close_raw(process_info.hThread);
 
-    // DuplicateHandle writes directly into the suspended launcher's handle
-    // table. Every target copy is explicitly non-inheritable. The source
-    // handles in this parent were never inheritable either.
-    let target_handles = match duplicate_launcher_handles(
-        process.raw(),
-        raw_handle(&child_lock),
-        stdio.stdin.raw(),
+    let handoff = match duplicate_guardian_handles(
+        guardian.raw(),
         stdio.stdout.write.raw(),
         stdio.stderr.write.raw(),
-        done_event.raw(),
-        gate_event.raw(),
+        start_event.raw(),
+        ready_event.raw(),
+        abort_event.raw(),
     ) {
         Ok(handles) => handles,
         Err(error) => {
-            stdio.close_child_writes();
-            let (error, retain_lease) = cleanup_setup_failure(&mut job, process.raw(), error);
-            retain_or_release_child_lease(child_lock, retain_lease);
+            terminate_and_reap_process(guardian.raw());
             return Err(error);
         }
     };
 
-    // The target handle values are intentionally sent after the suspended
-    // process exists. Before ResumeThread, parent death can only leave a
-    // suspended job member, which kill-on-close terminates.
-    if let Err(error) = bootstrap.write(&target_handles, creation_flags) {
-        stdio.close_child_writes();
-        let (error, retain_lease) = cleanup_setup_failure(&mut job, process.raw(), error);
-        retain_or_release_child_lease(child_lock, retain_lease);
+    let handoff_contents = match encode_handoff(&nonce, handoff) {
+        Ok(contents) => contents,
+        Err(error) => {
+            terminate_and_reap_process(guardian.raw());
+            return Err(error);
+        }
+    };
+    if let Err(error) = ProtocolFile::write_new(&paths.handoff, handoff_contents) {
+        terminate_and_reap_process(guardian.raw());
         return Err(error);
     }
 
-    // The only possible setup window after handle duplication is the suspended
-    // launcher. ResumeThread is the handoff point: the target now owns a lease,
-    // and the parent continues to own the job until it proves quiescence.
-    // SAFETY: launcher_thread was created suspended and remains valid until
-    // after this call. The job already contains the target before it resumes.
-    if unsafe { ResumeThread(launcher_thread.raw()) } == u32::MAX {
-        stdio.close_child_writes();
-        let resume_error = last_error();
-        let (error, retain_lease) = cleanup_setup_failure(&mut job, process.raw(), resume_error);
-        retain_or_release_child_lease(child_lock, retain_lease);
-        return Err(error);
-    }
-    drop(launcher_thread);
-
-    // Close the parent's copies of the child ends before reading. The target
-    // launcher owns its duplicates, and Git owns the final explicit copies.
+    // The guardian owns the target copies from this point.  The parent only
+    // retains the read ends and its own lifecycle lock.
     stdio.close_child_writes();
     let stdout = stdio.stdout.take_read();
     let stderr = stdio.stderr.take_read();
     let stdout_reader = thread::spawn(move || read_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_pipe(stderr));
 
-    let completion = wait_for_done_or_process(done_event.raw(), process.raw());
-    // Completion means Git has synchronously returned and the launcher is
-    // waiting on its gate. Terminating the job then closes the launcher lease;
-    // the lease is not released until the job wait proves every member gone.
-    let cleanup_result = job.terminate_and_wait();
-    if let Err(error) = cleanup_result {
-        // The launcher may still own the only remaining child lease. Do not
-        // join readers whose pipes can still be live: Job's Drop deliberately
-        // leaks its handle on this path. Retain the parent's lease too, so a
-        // wait failure cannot accidentally release the last lease if the
-        // launcher happened to terminate concurrently.
-        drop(stdout_reader);
-        drop(stderr_reader);
-        std::mem::forget(child_lock);
+    let ready = match wait_for_ready_or_process(ready_event.raw(), guardian.raw()) {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = unsafe { SetEvent(abort_event.raw()) };
+            let _ = wait_for_process(guardian.raw());
+            let _ = join_reader(stdout_reader);
+            let _ = join_reader(stderr_reader);
+            return Err(error);
+        }
+    };
+    if !ready {
+        let guardian_result = wait_for_process(guardian.raw());
+        let stdout = join_reader(stdout_reader)?;
+        let stderr = join_reader(stderr_reader)?;
+        let _ = (stdout, stderr);
+        guardian_result?;
+        return Err(read_guardian_error(
+            &paths.result,
+            &nonce,
+            "guardian exited before ready",
+        ));
+    }
+
+    if unsafe { SetEvent(start_event.raw()) } == 0 {
+        let error = last_error();
+        // The abort signal makes this error path independent of owner process
+        // lifetime; the guardian still performs the complete job cleanup.
+        let _ = unsafe { SetEvent(abort_event.raw()) };
+        wait_for_process(guardian.raw())?;
+        let _ = join_reader(stdout_reader);
+        let _ = join_reader(stderr_reader);
         return Err(error);
     }
 
-    let completion = completion?;
-    let process_wait_result = wait_for_process(process.raw());
+    let guardian_wait = wait_for_process(guardian.raw());
     let stdout = join_reader(stdout_reader)?;
     let stderr = join_reader(stderr_reader)?;
-    process_wait_result?;
-    let exit_code = if completion {
-        read_launcher_result(bootstrap.path())?
-    } else {
-        return Err(io::Error::other(
-            "lifecycle launcher exited before Git completion",
-        ));
-    };
-    drop(bootstrap);
-    drop(child_lock);
-    if let Some(probe) = lock_probe.as_mut() {
-        probe.finish_after_lease_release()?;
+    guardian_wait?;
+
+    let result = read_result(&paths.result, &nonce)?;
+    if let Some(error) = result.error {
+        return Err(io::Error::other(error));
     }
-    Ok(Output {
-        status: exit_status_from_raw(exit_code),
+    Ok(std::process::Output {
+        status: exit_status_from_raw(result.exit_code.unwrap_or(1)),
         stdout,
         stderr,
     })
-}
-
-fn retain_or_release_child_lease(child_lock: File, retain: bool) {
-    if retain {
-        std::mem::forget(child_lock);
-    }
-}
-
-fn cleanup_setup_failure(job: &mut Job, process: HANDLE, original: io::Error) -> (io::Error, bool) {
-    match job.terminate_and_wait() {
-        Ok(()) => match wait_for_process(process) {
-            Ok(()) => (original, false),
-            Err(wait_error) => (
-                io::Error::other(format!(
-                    "{original}; lifecycle launcher cleanup completed but process reap failed: {wait_error}"
-                )),
-                false,
-            ),
-        },
-        Err(cleanup_error) => (
-            io::Error::other(format!(
-                "{original}; lifecycle cleanup failed and the child lease was retained: {cleanup_error}"
-            )),
-            true,
-        ),
-    }
 }
 
 fn validate_creation_flags(creation_flags: u32) -> io::Result<()> {
@@ -302,54 +247,502 @@ fn validate_creation_flags(creation_flags: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn raw_handle(file: &File) -> HANDLE {
-    use std::os::windows::io::AsRawHandle;
-    file.as_raw_handle()
+fn new_nonce() -> String {
+    let sequence = PROTOCOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{}-{nanos:x}-{sequence:x}", std::process::id())
+}
+
+struct ProtocolPaths {
+    bootstrap: PathBuf,
+    handoff: PathBuf,
+    result: PathBuf,
+}
+
+impl ProtocolPaths {
+    fn new(child_lock_path: &Path) -> io::Result<Self> {
+        let directory = child_lock_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed merge lifecycle child lock has no parent",
+            )
+        })?;
+        let stem = child_lock_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "merge-operation-child.lock".to_string());
+        Ok(Self {
+            bootstrap: allocate_protocol_path(directory, &stem, "bootstrap")?,
+            handoff: allocate_protocol_path(directory, &stem, "handoff")?,
+            result: allocate_protocol_path(directory, &stem, "result")?,
+        })
+    }
+}
+
+impl Drop for ProtocolPaths {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.bootstrap);
+        let _ = fs::remove_file(&self.handoff);
+        let _ = fs::remove_file(&self.result);
+    }
+}
+
+fn allocate_protocol_path(directory: &Path, stem: &str, kind: &str) -> io::Result<PathBuf> {
+    let sequence = PROTOCOL_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    for attempt in 0..32u32 {
+        let path = directory.join(format!(
+            ".{stem}-guardian-{kind}-{}-{sequence}-{attempt}.tmp",
+            std::process::id()
+        ));
+        if !path.exists() {
+            return Ok(path);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "could not allocate a unique Windows lifecycle guardian file",
+    ))
+}
+
+struct ProtocolFile;
+
+impl ProtocolFile {
+    fn write_new(path: &Path, contents: Vec<u8>) -> io::Result<()> {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        file.write_all(&contents)?;
+        file.sync_all()
+    }
+
+    fn write_atomic(path: &Path, contents: Vec<u8>) -> io::Result<()> {
+        let temporary = path.with_extension("write-tmp");
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        file.write_all(&contents)?;
+        file.sync_all()?;
+        fs::rename(temporary, path)
+    }
+}
+
+struct GuardianConfig {
+    nonce: String,
+    child_lock_path: PathBuf,
+    result_path: PathBuf,
+    cwd: PathBuf,
+    args: Vec<OsString>,
+    environment: Vec<(OsString, OsString)>,
+    creation_flags: u32,
+    fail_after_job: bool,
+    cleanup_gate: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+struct GuardianHandles {
+    stdout: HANDLE,
+    stderr: HANDLE,
+    start_event: HANDLE,
+    ready_event: HANDLE,
+    abort_event: HANDLE,
+    parent_process: HANDLE,
+}
+
+struct GuardianResult {
+    exit_code: Option<u32>,
+    error: Option<String>,
+}
+
+fn encode_config(config: &GuardianConfig) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(GUARDIAN_MAGIC);
+    write_bytes(&mut output, config.nonce.as_bytes())?;
+    write_wide(&mut output, config.child_lock_path.as_os_str())?;
+    write_wide(&mut output, config.result_path.as_os_str())?;
+    write_wide(&mut output, config.cwd.as_os_str())?;
+    write_u32(&mut output, config.creation_flags)?;
+    output.push(u8::from(config.fail_after_job));
+    match &config.cleanup_gate {
+        Some(path) => {
+            output.push(1);
+            write_wide(&mut output, path.as_os_str())?;
+        }
+        None => output.push(0),
+    }
+    write_u32(
+        &mut output,
+        config.args.len().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "too many guardian arguments")
+        })?,
+    )?;
+    for arg in &config.args {
+        write_wide(&mut output, arg)?;
+    }
+    write_u32(
+        &mut output,
+        config.environment.len().try_into().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "too many guardian environment entries",
+            )
+        })?,
+    )?;
+    for (key, value) in &config.environment {
+        write_wide(&mut output, key)?;
+        write_wide(&mut output, value)?;
+    }
+    Ok(output)
+}
+
+fn decode_config(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianConfig> {
+    let mut cursor = Cursor::new(contents);
+    expect_magic(&mut cursor, GUARDIAN_MAGIC)?;
+    let nonce = read_bytes(&mut cursor)?;
+    let nonce = String::from_utf8(nonce)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "guardian nonce is not UTF-8"))?;
+    if nonce != expected_nonce {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian bootstrap nonce mismatch",
+        ));
+    }
+    let child_lock_path = PathBuf::from(read_wide(&mut cursor)?);
+    let result_path = PathBuf::from(read_wide(&mut cursor)?);
+    let cwd = PathBuf::from(read_wide(&mut cursor)?);
+    let creation_flags = read_u32(&mut cursor)?;
+    let fail_after_job = read_byte(&mut cursor)? != 0;
+    let cleanup_gate = if read_byte(&mut cursor)? != 0 {
+        Some(PathBuf::from(read_wide(&mut cursor)?))
+    } else {
+        None
+    };
+    let args = read_wide_vec(&mut cursor)?;
+    let environment_count = read_u32(&mut cursor)? as usize;
+    let mut environment = Vec::with_capacity(environment_count);
+    for _ in 0..environment_count {
+        environment.push((read_wide(&mut cursor)?, read_wide(&mut cursor)?));
+    }
+    ensure_cursor_exhausted(&cursor)?;
+    validate_protocol_path(&child_lock_path)?;
+    validate_protocol_path(&result_path)?;
+    validate_protocol_path(&cwd)?;
+    if let Some(path) = &cleanup_gate {
+        validate_protocol_path(path)?;
+    }
+    validate_creation_flags(creation_flags)?;
+    Ok(GuardianConfig {
+        nonce,
+        child_lock_path,
+        result_path,
+        cwd,
+        args,
+        environment,
+        creation_flags,
+        fail_after_job,
+        cleanup_gate,
+    })
+}
+
+fn encode_handoff(nonce: &str, handles: GuardianHandles) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(HANDOFF_MAGIC);
+    write_bytes(&mut output, nonce.as_bytes())?;
+    for handle in [
+        handles.stdout,
+        handles.stderr,
+        handles.start_event,
+        handles.ready_event,
+        handles.abort_event,
+        handles.parent_process,
+    ] {
+        write_u64(&mut output, handle as usize as u64);
+    }
+    Ok(output)
+}
+
+fn decode_handoff(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianHandles> {
+    let mut cursor = Cursor::new(contents);
+    expect_magic(&mut cursor, HANDOFF_MAGIC)?;
+    let nonce = String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidData, "guardian handoff nonce invalid")
+    })?;
+    if nonce != expected_nonce {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian handoff nonce mismatch",
+        ));
+    }
+    let mut handles = [std::ptr::null_mut(); 6];
+    for handle in &mut handles {
+        let raw = read_u64(&mut cursor)? as usize as HANDLE;
+        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guardian handoff contains an invalid handle",
+            ));
+        }
+        *handle = raw;
+    }
+    ensure_cursor_exhausted(&cursor)?;
+    Ok(GuardianHandles {
+        stdout: handles[0],
+        stderr: handles[1],
+        start_event: handles[2],
+        ready_event: handles[3],
+        abort_event: handles[4],
+        parent_process: handles[5],
+    })
+}
+
+fn encode_result(nonce: &str, result: &GuardianResult) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(RESULT_MAGIC);
+    write_bytes(&mut output, nonce.as_bytes())?;
+    match (&result.exit_code, &result.error) {
+        (Some(code), None) => {
+            output.push(0);
+            write_u32(&mut output, *code)?;
+            write_bytes(&mut output, &[])?;
+        }
+        (None, Some(error)) => {
+            output.push(1);
+            write_u32(&mut output, 1)?;
+            write_bytes(&mut output, error.as_bytes())?;
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid guardian result",
+            ))
+        }
+    }
+    Ok(output)
+}
+
+fn read_result(path: &Path, expected_nonce: &str) -> io::Result<GuardianResult> {
+    validate_protocol_file(path)?;
+    let contents = fs::read(path)?;
+    let mut cursor = Cursor::new(contents.as_slice());
+    expect_magic(&mut cursor, RESULT_MAGIC)?;
+    let nonce = String::from_utf8(read_bytes(&mut cursor)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "guardian result nonce invalid"))?;
+    if nonce != expected_nonce {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian result nonce mismatch",
+        ));
+    }
+    let kind = read_byte(&mut cursor)?;
+    let code = read_u32(&mut cursor)?;
+    let message = read_bytes(&mut cursor)?;
+    ensure_cursor_exhausted(&cursor)?;
+    match kind {
+        0 => Ok(GuardianResult {
+            exit_code: Some(code),
+            error: None,
+        }),
+        1 => Ok(GuardianResult {
+            exit_code: None,
+            error: Some(String::from_utf8_lossy(&message).into_owned()),
+        }),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian result kind invalid",
+        )),
+    }
+}
+
+fn read_guardian_error(path: &Path, nonce: &str, fallback: &str) -> io::Error {
+    match read_result(path, nonce) {
+        Ok(result) => io::Error::other(result.error.unwrap_or_else(|| fallback.to_string())),
+        Err(error) => io::Error::other(format!("{fallback}: {error}")),
+    }
+}
+
+fn write_guardian_result(config: &GuardianConfig, result: GuardianResult) {
+    if let Ok(contents) = encode_result(&config.nonce, &result) {
+        let _ = ProtocolFile::write_atomic(&config.result_path, contents);
+    }
+}
+
+fn write_bytes(output: &mut Vec<u8>, value: &[u8]) -> io::Result<()> {
+    write_u32(
+        output,
+        value.len().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "guardian record is too large")
+        })?,
+    )?;
+    output.extend_from_slice(value);
+    Ok(())
+}
+
+fn write_wide(output: &mut Vec<u8>, value: &OsStr) -> io::Result<()> {
+    let units: Vec<u16> = value.encode_wide().collect();
+    write_u32(
+        output,
+        units.len().try_into().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "guardian path is too large")
+        })?,
+    )?;
+    for unit in units {
+        output.extend_from_slice(&unit.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn write_u32(output: &mut Vec<u8>, value: u32) -> io::Result<()> {
+    output.extend_from_slice(&value.to_le_bytes());
+    Ok(())
+}
+
+fn write_u64(output: &mut Vec<u8>, value: u64) {
+    output.extend_from_slice(&value.to_le_bytes());
+}
+
+fn read_byte(cursor: &mut Cursor<&[u8]>) -> io::Result<u8> {
+    let mut value = [0; 1];
+    cursor.read_exact(&mut value)?;
+    Ok(value[0])
+}
+
+fn read_u32(cursor: &mut Cursor<&[u8]>) -> io::Result<u32> {
+    let mut value = [0; 4];
+    cursor.read_exact(&mut value)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64(cursor: &mut Cursor<&[u8]>) -> io::Result<u64> {
+    let mut value = [0; 8];
+    cursor.read_exact(&mut value)?;
+    Ok(u64::from_le_bytes(value))
+}
+
+fn read_bytes(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<u8>> {
+    let length = read_u32(cursor)? as usize;
+    if length > 16 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian record is too large",
+        ));
+    }
+    let mut value = vec![0; length];
+    cursor.read_exact(&mut value)?;
+    Ok(value)
+}
+
+fn read_wide(cursor: &mut Cursor<&[u8]>) -> io::Result<OsString> {
+    let count = read_u32(cursor)? as usize;
+    if count > 4 * 1024 * 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian string is too large",
+        ));
+    }
+    let mut units = Vec::with_capacity(count);
+    for _ in 0..count {
+        units.push(read_u16(cursor)?);
+    }
+    Ok(OsString::from_wide(&units))
+}
+
+fn read_u16(cursor: &mut Cursor<&[u8]>) -> io::Result<u16> {
+    let mut value = [0; 2];
+    cursor.read_exact(&mut value)?;
+    Ok(u16::from_le_bytes(value))
+}
+
+fn read_wide_vec(cursor: &mut Cursor<&[u8]>) -> io::Result<Vec<OsString>> {
+    let count = read_u32(cursor)? as usize;
+    if count > 100_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "too many guardian arguments",
+        ));
+    }
+    (0..count).map(|_| read_wide(cursor)).collect()
+}
+
+fn expect_magic(cursor: &mut Cursor<&[u8]>, magic: &[u8]) -> io::Result<()> {
+    let mut actual = vec![0; magic.len()];
+    cursor.read_exact(&mut actual)?;
+    if actual == magic {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian protocol magic mismatch",
+        ))
+    }
+}
+
+fn ensure_cursor_exhausted(cursor: &Cursor<&[u8]>) -> io::Result<()> {
+    if cursor.position() == cursor.get_ref().len() as u64 {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian protocol has trailing data",
+        ))
+    }
+}
+
+fn validate_protocol_path(path: &Path) -> io::Result<()> {
+    if !path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian protocol path must be absolute",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_protocol_file(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian protocol file is not a private regular file",
+        ));
+    }
+    Ok(())
 }
 
 fn open_child_lock(path: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
-    // Rust opens this handle non-inheritable. Do not toggle process-global
-    // inheritability: that is exactly the race this launcher architecture
-    // avoids.
+    // Windows opens ordinary Rust file handles non-inheritable.  The guardian
+    // never changes that process-wide property.
     options.open(path)
 }
 
-fn create_event() -> io::Result<HANDLE> {
-    // Null SECURITY_ATTRIBUTES makes the event handle non-inheritable.
-    // SAFETY: null attributes/name request a private manual-reset event.
-    let event = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
-    if event.is_null() {
-        Err(last_error())
-    } else {
-        Ok(event)
-    }
-}
-
-fn duplicate_launcher_handles(
+fn duplicate_guardian_handles(
     target_process: HANDLE,
-    child_lock: HANDLE,
-    stdin: HANDLE,
     stdout: HANDLE,
     stderr: HANDLE,
-    done_event: HANDLE,
-    gate_event: HANDLE,
-) -> io::Result<LauncherHandles> {
-    Ok(LauncherHandles {
-        lease: duplicate_into(target_process, child_lock)?,
-        stdin: duplicate_into(target_process, stdin)?,
+    start_event: HANDLE,
+    ready_event: HANDLE,
+    abort_event: HANDLE,
+) -> io::Result<GuardianHandles> {
+    Ok(GuardianHandles {
         stdout: duplicate_into(target_process, stdout)?,
         stderr: duplicate_into(target_process, stderr)?,
-        done_event: duplicate_into(target_process, done_event)?,
-        gate_event: duplicate_into(target_process, gate_event)?,
+        start_event: duplicate_into(target_process, start_event)?,
+        ready_event: duplicate_into(target_process, ready_event)?,
+        abort_event: duplicate_into(target_process, abort_event)?,
+        parent_process: duplicate_into(
+            target_process,
+            // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+            unsafe { GetCurrentProcess() },
+        )?,
     })
 }
 
 fn duplicate_into(target_process: HANDLE, source: HANDLE) -> io::Result<HANDLE> {
     let mut target = std::ptr::null_mut();
-    // SAFETY: source is a live handle owned by this process and target_process
-    // is the live suspended launcher. bInheritHandle is explicitly false.
+    // SAFETY: source is a live handle in this process and target_process is the
+    // live guardian.  bInheritHandle is false for every guardian copy.
     if unsafe {
         DuplicateHandle(
             GetCurrentProcess(),
@@ -368,437 +761,428 @@ fn duplicate_into(target_process: HANDLE, source: HANDLE) -> io::Result<HANDLE> 
     }
 }
 
-#[derive(Clone, Copy)]
-struct LauncherHandles {
-    lease: HANDLE,
-    stdin: HANDLE,
-    stdout: HANDLE,
-    stderr: HANDLE,
-    done_event: HANDLE,
-    gate_event: HANDLE,
-}
-
-struct BootstrapFile {
-    path: PathBuf,
-    file: Option<File>,
-}
-
-impl BootstrapFile {
-    fn new(child_lock_path: &Path) -> io::Result<Self> {
-        let directory = child_lock_path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed merge lifecycle child lock has no parent",
-            )
-        })?;
-        let stem = child_lock_path
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| std::borrow::Cow::Borrowed("merge-operation-child.lock"));
-        let sequence = BOOTSTRAP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        for attempt in 0..32u32 {
-            let path = directory.join(format!(
-                ".{stem}-launcher-{}-{sequence}-{attempt}.tmp",
-                std::process::id()
-            ));
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(file) => {
-                    return Ok(Self {
-                        path,
-                        file: Some(file),
-                    })
-                }
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                Err(error) => return Err(error),
-            }
-        }
-        Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "could not allocate a unique lifecycle launcher bootstrap file",
-        ))
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn write(&mut self, handles: &LauncherHandles, creation_flags: u32) -> io::Result<()> {
-        let file = self.file.as_mut().expect("bootstrap file is open");
-        file.set_len(0)?;
-        file.seek(SeekFrom::Start(0))?;
-        writeln!(file, "{:x}", handles.lease as usize)?;
-        writeln!(file, "{:x}", handles.stdin as usize)?;
-        writeln!(file, "{:x}", handles.stdout as usize)?;
-        writeln!(file, "{:x}", handles.stderr as usize)?;
-        writeln!(file, "{:x}", handles.done_event as usize)?;
-        writeln!(file, "{:x}", handles.gate_event as usize)?;
-        writeln!(file, "{creation_flags:x}")?;
-        file.sync_all()?;
-        drop(self.file.take());
-        Ok(())
-    }
-}
-
-impl Drop for BootstrapFile {
-    fn drop(&mut self) {
-        drop(self.file.take());
-        let _ = fs::remove_file(&self.path);
-    }
-}
-
-fn read_bootstrap(path: &Path) -> io::Result<(LauncherHandles, u32)> {
-    let contents = fs::read_to_string(path)?;
-    let mut lines = contents.lines();
-    let handles = LauncherHandles {
-        lease: parse_handle(lines.next())?,
-        stdin: parse_handle(lines.next())?,
-        stdout: parse_handle(lines.next())?,
-        stderr: parse_handle(lines.next())?,
-        done_event: parse_handle(lines.next())?,
-        gate_event: parse_handle(lines.next())?,
-    };
-    let flags = lines
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher flags missing"))?
-        .trim()
-        .parse::<u32>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "launcher flags invalid"))?;
-    if lines.next().is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "launcher bootstrap has trailing data",
-        ));
-    }
-    Ok((handles, flags))
-}
-
-fn parse_handle(value: Option<&str>) -> io::Result<HANDLE> {
-    let value = value
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher handle missing"))?
-        .trim();
-    let raw = usize::from_str_radix(value, 16)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "launcher handle invalid"))?;
-    let handle = raw as HANDLE;
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "launcher handle is null",
-        ));
-    }
-    Ok(handle)
-}
-
-/// Handle the private launcher command before Clap parses normal CLI input.
-/// The launcher is the same executable so no extra binary or inherited control
-/// channel is required. Test binaries do not invoke this entry point; their
-/// Windows coverage exercises the public CLI integration path instead.
+/// Handle the private guardian command before Clap parses normal CLI input.
+/// The mode is usable only with a matching private bootstrap, handoff, and
+/// nonce; malformed or spoofed invocations never run Git.
 pub(crate) fn run_launcher_if_requested() {
     let mut args = std::env::args_os();
     let _argv0 = args.next();
-    match args.next().as_deref() {
-        Some(value) if value == OsStr::new(INTERNAL_LAUNCHER_ARG) => {
-            let code = match args.next() {
-                Some(path) => launcher_main(PathBuf::from(path), args.collect()),
-                None => 1,
-            };
-            std::process::exit(code as i32);
-        }
-        Some(value) if value == OsStr::new(INTERNAL_LOCK_PROBE_ARG) => {
-            let code = match (args.next(), args.next(), args.next()) {
-                (Some(lock), Some(started), Some(acquired)) => lock_probe_main(
-                    PathBuf::from(lock),
-                    PathBuf::from(started),
-                    PathBuf::from(acquired),
-                ),
-                _ => 1,
-            };
-            std::process::exit(code);
-        }
-        _ => {}
+    if args.next().as_deref() != Some(OsStr::new(INTERNAL_GUARDIAN_ARG)) {
+        return;
     }
+    let values: Vec<OsString> = args.collect();
+    if values.len() != 3 {
+        std::process::exit(1);
+    }
+    let code = guardian_main(
+        PathBuf::from(&values[0]),
+        PathBuf::from(&values[1]),
+        values[2].to_string_lossy().into_owned(),
+    );
+    std::process::exit(code as i32);
 }
 
-/// A bounded helper used only by Windows integration tests. It is spawned by
-/// the lifecycle owner, not by the test runner, and attempts to acquire the
-/// child lock after the owner drops it. If the owner accidentally lends the
-/// lock handle to this unrelated process, acquisition never succeeds; the
-/// helper times out and is reaped instead of waiting on an unbounded release
-/// file.
-struct LockProbe {
-    child: Option<Child>,
-    acquired: PathBuf,
-}
-
-impl LockProbe {
-    fn spawn(child_lock_path: &Path) -> io::Result<Option<Self>> {
-        // Integration tests run the debug binary. Keep this internal protocol
-        // out of release builds even if an inherited environment is hostile.
-        if !cfg!(debug_assertions) {
-            return Ok(None);
-        }
-        let Some(root) = std::env::var_os(LOCK_PROBE_ENV) else {
-            return Ok(None);
-        };
-        let root = PathBuf::from(root);
-        let started = root.join("owner-lock-probe-started");
-        let acquired = root.join("owner-lock-probe-acquired");
-        let executable = std::env::current_exe()?;
-        let child = std::process::Command::new(executable)
-            .arg(INTERNAL_LOCK_PROBE_ARG)
-            .arg(child_lock_path)
-            .arg(&started)
-            .arg(&acquired)
-            .env_remove(LOCK_PROBE_ENV)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        Ok(Some(Self {
-            child: Some(child),
-            acquired,
-        }))
-    }
-
-    fn finish_after_lease_release(&mut self) -> io::Result<()> {
-        let mut child = self
-            .child
-            .take()
-            .ok_or_else(|| io::Error::other("lifecycle lock probe was already reaped"))?;
-        let deadline = std::time::Instant::now() + LOCK_PROBE_TIMEOUT;
-        loop {
-            if child.try_wait()?.is_some() {
-                let output = child.wait_with_output()?;
-                return validate_lock_probe_output(output, &self.acquired);
-            }
-            if std::time::Instant::now() >= deadline {
-                kill_and_reap_probe(&mut child);
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "lifecycle lock probe exceeded its 60-second deadline",
-                ));
-            }
-            thread::sleep(std::time::Duration::from_millis(25));
-        }
-    }
-}
-
-fn kill_and_reap_probe(child: &mut Child) {
-    if let Err(error) = child.kill() {
-        eprintln!("failed to terminate Windows lifecycle test helper: {error}");
-    }
-    if let Err(error) = child.wait() {
-        eprintln!("failed to reap Windows lifecycle test helper: {error}");
-    }
-}
-
-fn validate_lock_probe_output(output: Output, acquired: &Path) -> io::Result<()> {
-    if !output.status.success()
-        || !fs::read_to_string(acquired)
-            .map(|contents| contents == "acquired\n")
-            .unwrap_or(false)
-    {
-        return Err(io::Error::other(format!(
-            "lifecycle lock probe failed: stdout={:?}, stderr={:?}",
-            output.stdout, output.stderr
-        )));
-    }
-    Ok(())
-}
-
-impl Drop for LockProbe {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let deadline = std::time::Instant::now() + LOCK_PROBE_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    thread::sleep(std::time::Duration::from_millis(25));
-                }
-                Ok(None) => {
-                    kill_and_reap_probe(&mut child);
-                    return;
-                }
-                Err(error) => {
-                    eprintln!("failed to poll Windows lifecycle test helper: {error}");
-                    kill_and_reap_probe(&mut child);
-                    return;
-                }
-            }
-        }
-    }
-}
-
-fn lock_probe_main(child_lock_path: PathBuf, started: PathBuf, acquired: PathBuf) -> i32 {
-    if fs::write(&started, "started\n").is_err() {
-        return 1;
-    }
-    let lock = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(child_lock_path)
-    {
-        Ok(lock) => lock,
+fn guardian_main(bootstrap_path: PathBuf, handoff_path: PathBuf, expected_nonce: String) -> u32 {
+    let config = match read_config_file(&bootstrap_path, &expected_nonce) {
+        Ok(config) => config,
         Err(_) => return 1,
     };
-    let deadline = std::time::Instant::now() + LOCK_PROBE_TIMEOUT;
-    loop {
-        match super::try_lock_exclusive(&lock) {
-            Ok(true) => {
-                // Publish only after the successful lock handle is dropped;
-                // the marker is therefore an explicit lease-release event.
-                drop(lock);
-                return i32::from(fs::write(acquired, "acquired\n").is_err());
-            }
-            Ok(false) if std::time::Instant::now() < deadline => {
-                thread::sleep(std::time::Duration::from_millis(25));
-            }
-            Ok(false) => return 2,
-            Err(_) => return 1,
-        }
-    }
-}
-
-fn read_launcher_result(path: &Path) -> io::Result<u32> {
-    let result = fs::read_to_string(path)?;
-    let line = result
-        .lines()
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher result missing"))?;
-    let code = line
-        .strip_prefix("exit=")
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "launcher result invalid"))?
-        .parse::<u32>()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "launcher exit code invalid"))?;
-    Ok(code)
-}
-
-fn launcher_main(bootstrap_path: PathBuf, git_args: Vec<OsString>) -> u32 {
-    let (handles, creation_flags) = match read_bootstrap(&bootstrap_path) {
-        Ok(value) => value,
-        Err(_) => return 1,
-    };
-    // Remove the setup record as soon as the suspended-target handoff has been
-    // consumed. The same path is recreated only for the completion result.
     let _ = fs::remove_file(&bootstrap_path);
 
-    let exit_code = launch_git_from_launcher(handles, &git_args, creation_flags).unwrap_or(1);
-
-    // The result is written and closed before the parent is notified. The
-    // launcher then waits on an unsignaled gate; the parent terminates the job
-    // and waits for quiescence, so the lease cannot be released early.
-    let _ = fs::write(&bootstrap_path, format!("exit={exit_code}\n"));
-    if unsafe { SetEvent(handles.done_event) } == 0 {
+    if handoff_path.parent() != bootstrap_path.parent() {
         return 1;
     }
-    // The parent deliberately never signals this event. Terminating the job
-    // closes the launcher and its lease after all remaining members are gone.
-    let _ = wait_for_process(handles.gate_event);
-    1
+    let handoff = match wait_for_handoff(&handoff_path, &expected_nonce) {
+        Ok(handoff) => handoff,
+        Err(_) => return 1,
+    };
+    let handles = GuardianOwnedHandles::new(handoff);
+    let child_lock = match open_child_lock(&config.child_lock_path) {
+        Ok(lock) => lock,
+        Err(error) => {
+            write_guardian_result(&config, guardian_error(error));
+            return 0;
+        }
+    };
+    if !super::try_lock_exclusive(&child_lock).unwrap_or(false) {
+        write_guardian_result(
+            &config,
+            guardian_error(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "managed merge lifecycle child lock is busy",
+            )),
+        );
+        return 0;
+    }
+
+    let mut job = match Job::new() {
+        Ok(job) => job,
+        Err(error) => {
+            write_guardian_result(&config, guardian_error(error));
+            return 0;
+        }
+    };
+
+    if config.fail_after_job {
+        let cleanup = cleanup_job_until_quiesced(&mut job);
+        drop(job);
+        drop(child_lock);
+        write_guardian_result(
+            &config,
+            guardian_error(match cleanup {
+                Ok(()) => io::Error::other("injected setup failure after guardian job creation"),
+                Err(error) => error,
+            }),
+        );
+        return 0;
+    }
+
+    if unsafe { SetEvent(handles.ready.raw()) } == 0 {
+        let error = last_error();
+        let cleanup = cleanup_job_until_quiesced(&mut job);
+        drop(job);
+        drop(child_lock);
+        write_guardian_result(&config, guardian_error(combine_errors(error, cleanup)));
+        return 0;
+    }
+
+    let start = wait_for_start_abort_or_parent(
+        handles.start.raw(),
+        handles.abort.raw(),
+        handles.parent.raw(),
+    );
+    if !start {
+        return finish_guardian_start_abort(&config, &mut job, child_lock, handles.parent.raw());
+    }
+
+    let git_result = launch_git_inside_job(
+        &mut job,
+        &config,
+        handles.stdout.raw(),
+        handles.stderr.raw(),
+        handles.parent.raw(),
+    );
+    if !parent_is_alive(handles.parent.raw()) {
+        wait_for_cleanup_gate(config.cleanup_gate.as_deref());
+    }
+    let cleanup = cleanup_job_until_quiesced(&mut job);
+    let result = match (git_result, cleanup) {
+        (Ok(exit_code), Ok(())) => GuardianResult {
+            exit_code: Some(exit_code),
+            error: None,
+        },
+        (Err(error), Ok(())) => guardian_error(error),
+        (Ok(_), Err(error)) => guardian_error(error),
+        (Err(original), Err(cleanup_error)) => {
+            guardian_error(combine_errors(original, Err(cleanup_error)))
+        }
+    };
+    drop(job);
+    drop(child_lock);
+    let parent_alive = parent_is_alive(handles.parent.raw());
+    if parent_alive {
+        write_guardian_result(&config, result);
+    } else {
+        let _ = fs::remove_file(&config.result_path);
+    }
+    0
 }
 
-fn launch_git_from_launcher(
-    handles: LauncherHandles,
-    args: &[OsString],
-    creation_flags: u32,
-) -> io::Result<u32> {
-    validate_creation_flags(creation_flags)?;
+fn finish_guardian_start_abort(
+    config: &GuardianConfig,
+    job: &mut Job,
+    child_lock: File,
+    parent: HANDLE,
+) -> u32 {
+    let cleanup = cleanup_job_until_quiesced(job);
+    drop(child_lock);
+    if parent_is_alive(parent) {
+        write_guardian_result(
+            config,
+            guardian_error(match cleanup {
+                Ok(()) => io::Error::other("lifecycle guardian start was aborted"),
+                Err(error) => error,
+            }),
+        );
+    } else {
+        let _ = fs::remove_file(&config.result_path);
+    }
+    0
+}
 
-    // The copies in the launcher are non-inheritable. Create only private,
-    // inheritable duplicates immediately for Git's explicit HANDLE_LIST; no
-    // parent process can race this local launcher with an unrelated spawn.
-    let stdin = duplicate_in_launcher(handles.stdin, true)?;
-    let stdout = match duplicate_in_launcher(handles.stdout, true) {
+fn read_config_file(path: &Path, nonce: &str) -> io::Result<GuardianConfig> {
+    validate_protocol_path(path)?;
+    validate_protocol_file(path)?;
+    let contents = fs::read(path)?;
+    let config = decode_config(&contents, nonce)?;
+    let directory = path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian bootstrap has no parent",
+        )
+    })?;
+    if config.child_lock_path.parent() != Some(directory)
+        || config.result_path.parent() != Some(directory)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian bootstrap escapes its private directory",
+        ));
+    }
+    Ok(config)
+}
+
+fn wait_for_handoff(path: &Path, nonce: &str) -> io::Result<GuardianHandles> {
+    validate_protocol_path(path)?;
+    let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
+    loop {
+        let contents = match validate_protocol_file(path).and_then(|()| fs::read(path)) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "lifecycle guardian handoff timed out",
+                    ));
+                }
+                thread::sleep(GUARDIAN_RETRY_DELAY);
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        if let Ok(handles) = decode_handoff(&contents, nonce) {
+            let _ = fs::remove_file(path);
+            return Ok(handles);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "lifecycle guardian handoff timed out",
+            ));
+        }
+        thread::sleep(GUARDIAN_RETRY_DELAY);
+    }
+}
+
+fn launch_git_inside_job(
+    job: &mut Job,
+    config: &GuardianConfig,
+    stdout: HANDLE,
+    stderr: HANDLE,
+    parent: HANDLE,
+) -> io::Result<u32> {
+    let stdin = create_nul()?;
+    let stdin_handle = duplicate_in_process(stdin.raw(), true)?;
+    let stdout_handle = match duplicate_in_process(stdout, true) {
         Ok(handle) => handle,
         Err(error) => {
-            close_raw(stdin);
+            close_raw(stdin_handle);
             return Err(error);
         }
     };
-    let stderr = match duplicate_in_launcher(handles.stderr, true) {
+    let stderr_handle = match duplicate_in_process(stderr, true) {
         Ok(handle) => handle,
         Err(error) => {
-            close_raw(stdin);
-            close_raw(stdout);
+            close_raw(stdin_handle);
+            close_raw(stdout_handle);
             return Err(error);
         }
     };
-    let inherited_handles = [stdin, stdout, stderr];
-    let mut attributes = match AttributeList::new(1) {
+    let inherited = [stdin_handle, stdout_handle, stderr_handle];
+    let mut attributes = match AttributeList::new(2) {
         Ok(attributes) => attributes,
         Err(error) => {
-            close_handles(&inherited_handles);
+            close_handles(&inherited);
             return Err(error);
         }
     };
-    if let Err(error) = attributes.update(
-        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
-        inherited_handles.as_ptr().cast(),
-        size_of::<HANDLE>() * inherited_handles.len(),
-    ) {
-        close_handles(&inherited_handles);
+    let job_handle = job.raw();
+    if let Err(error) = attributes
+        .update(
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            (&job_handle as *const HANDLE).cast(),
+            size_of::<HANDLE>(),
+        )
+        .and_then(|()| {
+            attributes.update(
+                PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+                inherited.as_ptr().cast(),
+                size_of::<HANDLE>() * inherited.len(),
+            )
+        })
+    {
+        close_handles(&inherited);
         return Err(error);
     }
 
-    let mut command_line = match command_line_os(OsStr::new("git"), args) {
+    let mut command_line = match command_line_os(OsStr::new("git"), &config.args) {
         Ok(command_line) => command_line,
         Err(error) => {
-            close_handles(&inherited_handles);
+            close_handles(&inherited);
             return Err(error);
         }
     };
+    let current_directory = wide_path(config.cwd.as_os_str())?;
+    let environment = environment_block(&config.environment)?;
     let mut startup = STARTUPINFOEXW::default();
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-    startup.StartupInfo.hStdInput = stdin;
-    startup.StartupInfo.hStdOutput = stdout;
-    startup.StartupInfo.hStdError = stderr;
+    startup.StartupInfo.hStdInput = inherited[0];
+    startup.StartupInfo.hStdOutput = inherited[1];
+    startup.StartupInfo.hStdError = inherited[2];
     startup.lpAttributeList = attributes.raw();
 
     let mut process_info = PROCESS_INFORMATION::default();
-    // Null environment and current directory intentionally inherit the
-    // launcher's exact environment/cwd, supplied by the parent at creation.
-    // The launcher itself does not mutate either value.
     let created = unsafe {
+        // SAFETY: the command line, environment, current directory, startup
+        // structure, and attribute storage remain live through this call.
         CreateProcessW(
             std::ptr::null(),
             command_line.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
             1,
-            creation_flags | EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
-            std::ptr::null_mut(),
-            std::ptr::null(),
+            config.creation_flags
+                | CREATE_SUSPENDED
+                | EXTENDED_STARTUPINFO_PRESENT
+                | CREATE_UNICODE_ENVIRONMENT,
+            environment.as_ptr().cast(),
+            current_directory.as_ptr(),
             (&startup as *const STARTUPINFOEXW).cast(),
             &mut process_info,
         )
     } != 0;
-
-    close_handles(&inherited_handles);
+    close_handles(&inherited);
+    drop(stdin);
     if !created {
         return Err(last_error());
     }
 
-    close_raw(process_info.hThread);
     let process = OwnedHandle::new(process_info.hProcess);
-    wait_for_process(process.raw())?;
-    get_exit_code(process.raw())
+    let thread = OwnedHandle::new(process_info.hThread);
+    job.member_created = true;
+    if unsafe { ResumeThread(thread.raw()) } == u32::MAX {
+        return Err(last_error());
+    }
+
+    let wait = wait_for_git_or_parent(process.raw(), parent)?;
+    if !wait {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "lifecycle owner exited while Git was running",
+        ));
+    }
+    let exit_code = get_exit_code(process.raw())?;
+    Ok(exit_code)
 }
 
-fn duplicate_in_launcher(source: HANDLE, inheritable: bool) -> io::Result<HANDLE> {
+fn guardian_error(error: io::Error) -> GuardianResult {
+    GuardianResult {
+        exit_code: None,
+        error: Some(error.to_string()),
+    }
+}
+
+fn combine_errors(original: io::Error, cleanup: io::Result<()>) -> io::Error {
+    match cleanup {
+        Ok(()) => original,
+        Err(cleanup_error) => io::Error::other(format!(
+            "{original}; lifecycle cleanup failed: {cleanup_error}"
+        )),
+    }
+}
+
+fn wait_for_cleanup_gate(path: Option<&Path>) {
+    let Some(path) = path else {
+        return;
+    };
+    let started = path.with_extension("started");
+    let release = path.with_extension("release");
+    let _ = fs::write(&started, "started\n");
+    let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
+    while !release.is_file() && Instant::now() < deadline {
+        thread::sleep(GUARDIAN_RETRY_DELAY);
+    }
+}
+
+fn cleanup_job_until_quiesced(job: &mut Job) -> io::Result<()> {
+    // A guardian must not exit after a cleanup error: process exit closes the
+    // kill-on-close handle and can release the lease before quiescence.  Retry
+    // while retaining both the job and child-lock handles instead.
+    loop {
+        match job.terminate_and_wait() {
+            Ok(()) => return Ok(()),
+            Err(_error) => thread::sleep(GUARDIAN_RETRY_DELAY),
+        }
+    }
+}
+
+struct GuardianOwnedHandles {
+    stdout: OwnedHandle,
+    stderr: OwnedHandle,
+    start: OwnedHandle,
+    ready: OwnedHandle,
+    abort: OwnedHandle,
+    parent: OwnedHandle,
+}
+
+impl GuardianOwnedHandles {
+    fn new(handles: GuardianHandles) -> Self {
+        Self {
+            stdout: OwnedHandle::new(handles.stdout),
+            stderr: OwnedHandle::new(handles.stderr),
+            start: OwnedHandle::new(handles.start_event),
+            ready: OwnedHandle::new(handles.ready_event),
+            abort: OwnedHandle::new(handles.abort_event),
+            parent: OwnedHandle::new(handles.parent_process),
+        }
+    }
+}
+
+fn create_event() -> io::Result<HANDLE> {
+    // Null SECURITY_ATTRIBUTES makes the event handle non-inheritable.
+    let handle = unsafe { CreateEventW(std::ptr::null(), 1, 0, std::ptr::null()) };
+    if handle.is_null() {
+        Err(last_error())
+    } else {
+        Ok(handle)
+    }
+}
+
+fn create_nul() -> io::Result<OwnedHandle> {
+    let nul = wide_path(OsStr::new("NUL"))?;
+    let handle = unsafe {
+        // SAFETY: nul is NUL-terminated and the returned handle is adopted
+        // immediately by OwnedHandle.
+        CreateFileW(
+            nul.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        Err(last_error())
+    } else {
+        Ok(OwnedHandle::new(handle))
+    }
+}
+
+fn duplicate_in_process(source: HANDLE, inheritable: bool) -> io::Result<HANDLE> {
     let mut target = std::ptr::null_mut();
-    // SAFETY: source is a valid handle duplicated into this launcher. The
-    // inheritable copy is restricted to the one explicit Git CreateProcessW.
     if unsafe {
+        // SAFETY: source is a live handle in the guardian process.  This is a
+        // private duplicate used only by the immediately following Git spawn.
         DuplicateHandle(
             GetCurrentProcess(),
             source,
             GetCurrentProcess(),
             &mut target,
             0,
-            if inheritable { 1 } else { 0 },
+            i32::from(inheritable),
             DUPLICATE_SAME_ACCESS,
         )
     } == 0
@@ -809,10 +1193,73 @@ fn duplicate_in_launcher(source: HANDLE, inheritable: bool) -> io::Result<HANDLE
     }
 }
 
+fn parent_is_alive(parent: HANDLE) -> bool {
+    unsafe { WaitForSingleObject(parent, 0) == WAIT_TIMEOUT }
+}
+
+fn wait_for_start_abort_or_parent(start: HANDLE, abort: HANDLE, parent: HANDLE) -> bool {
+    let handles = [start, abort, parent];
+    matches!(
+        unsafe { WaitForMultipleObjects(3, handles.as_ptr(), 0, INFINITE) },
+        WAIT_OBJECT_0
+    )
+}
+
+// The owner process handle, rather than EOF on a capture pipe, is the
+// authoritative death signal. A broken pipe therefore cannot release the
+// guardian lease while Git or a hook is still a job member.
+fn wait_for_git_or_parent(git: HANDLE, parent: HANDLE) -> io::Result<bool> {
+    let handles = [git, parent];
+    match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
+        WAIT_OBJECT_0 => Ok(true),
+        value if value == WAIT_OBJECT_0 + 1 => Ok(false),
+        WAIT_FAILED => Err(last_error()),
+        _ => Err(io::Error::other("unexpected lifecycle Git wait result")),
+    }
+}
+
+fn wait_for_ready_or_process(ready: HANDLE, process: HANDLE) -> io::Result<bool> {
+    let handles = [ready, process];
+    match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
+        WAIT_OBJECT_0 => Ok(true),
+        value if value == WAIT_OBJECT_0 + 1 => Ok(false),
+        WAIT_FAILED => Err(last_error()),
+        _ => Err(io::Error::other(
+            "unexpected lifecycle guardian wait result",
+        )),
+    }
+}
+
+fn wait_for_process(handle: HANDLE) -> io::Result<()> {
+    if unsafe { WaitForSingleObject(handle, INFINITE) } == WAIT_OBJECT_0 {
+        Ok(())
+    } else {
+        Err(last_error())
+    }
+}
+
+fn terminate_and_reap_process(handle: HANDLE) {
+    if unsafe { TerminateProcess(handle, 1) } == 0 {
+        return;
+    }
+    let _ = wait_for_process(handle);
+}
+
+fn get_exit_code(handle: HANDLE) -> io::Result<u32> {
+    let mut code = 0;
+    if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
+        Err(last_error())
+    } else {
+        Ok(code)
+    }
+}
+
 fn close_raw(handle: HANDLE) {
     if !handle.is_null() && handle != INVALID_HANDLE_VALUE {
-        // SAFETY: this function is called only for owned Win32 handles.
-        unsafe { CloseHandle(handle) };
+        unsafe {
+            // SAFETY: callers pass only owned Win32 handles.
+            CloseHandle(handle);
+        }
     }
 }
 
@@ -823,7 +1270,6 @@ fn close_handles(handles: &[HANDLE]) {
 }
 
 fn last_error() -> io::Error {
-    // SAFETY: GetLastError has no pointer or handle preconditions.
     io::Error::from_raw_os_error(unsafe { GetLastError() } as i32)
 }
 
@@ -848,7 +1294,7 @@ impl Drop for OwnedHandle {
 struct Job {
     handle: OwnedHandle,
     quiesced: bool,
-    launcher_created: bool,
+    member_created: bool,
     #[cfg(test)]
     cleanup_failure: Option<CleanupFailure>,
 }
@@ -865,17 +1311,13 @@ static RETAINED_JOB_HANDLES: AtomicU64 = AtomicU64::new(0);
 
 impl Job {
     fn new() -> io::Result<Self> {
-        // SAFETY: null attributes/name request a private unnamed job.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(last_error());
         }
-
         let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-        // BREAKAWAY_OK and SILENT_BREAKAWAY_OK are intentionally absent. A
-        // launcher or Git descendant therefore cannot escape this job.
+        // Neither BREAKAWAY_OK nor SILENT_BREAKAWAY_OK is set.
         limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-        // SAFETY: handle is owned above and limits remains live for the call.
         if unsafe {
             SetInformationJobObject(
                 handle,
@@ -891,7 +1333,7 @@ impl Job {
         Ok(Self {
             handle: OwnedHandle::new(handle),
             quiesced: false,
-            launcher_created: false,
+            member_created: false,
             #[cfg(test)]
             cleanup_failure: None,
         })
@@ -900,6 +1342,7 @@ impl Job {
     #[cfg(test)]
     fn new_with_cleanup_failure(failure: CleanupFailure) -> io::Result<Self> {
         let mut job = Self::new()?;
+        job.member_created = true;
         job.cleanup_failure = Some(failure);
         Ok(job)
     }
@@ -915,10 +1358,6 @@ impl Job {
                 return Err(io::Error::other("injected TerminateJobObject failure"));
             }
             Some(CleanupFailure::Wait) => {
-                // Exercise the same fail-closed state as a real WAIT_FAILED
-                // without relying on a race or an invalid kernel handle.
-                // Termination still happens below, but quiescence is withheld.
-                // The injected error is returned after the call.
                 if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
                     return Err(last_error());
                 }
@@ -926,15 +1365,12 @@ impl Job {
             }
             None => {}
         }
-
-        // SAFETY: the job handle is owned by self and remains live here.
         if unsafe { TerminateJobObject(self.raw(), 1) } == 0 {
             return Err(last_error());
         }
-        // A successful wait is the proof that no job member can retain the
-        // duplicated lease. Neither a TerminateJobObject failure nor a wait
-        // failure may mark this job quiesced.
-        wait_for_process(self.raw())?;
+        if unsafe { WaitForSingleObject(self.raw(), INFINITE) } != WAIT_OBJECT_0 {
+            return Err(last_error());
+        }
         self.quiesced = true;
         Ok(())
     }
@@ -942,17 +1378,13 @@ impl Job {
 
 impl Drop for Job {
     fn drop(&mut self) {
-        if self.quiesced || !self.launcher_created {
+        if self.quiesced || !self.member_created {
             return;
         }
-
-        // Drop cannot report an OS error. Closing this handle would activate
-        // kill-on-close without proving that the launcher and Git are gone,
-        // allowing the last child lease to disappear before quiescence. Leave
-        // the job handle open instead: a live launcher retains the child lease
-        // and blocks recovery; process exit closes the handle and lets the job
-        // kill its remaining members. This intentional leak is the fail-closed
-        // fallback for every unexpected cleanup failure.
+        // A Job cannot report an OS error from Drop.  Never close an
+        // unquiesced kill-on-close handle here: guardian_main keeps retrying
+        // until the job is quiescent, and this fallback intentionally leaks the
+        // handle in tests or unexpected paths rather than releasing the lease.
         let leaked = std::mem::replace(&mut self.handle, OwnedHandle(std::ptr::null_mut()));
         std::mem::forget(leaked);
         #[cfg(test)]
@@ -968,19 +1400,20 @@ struct AttributeList {
 impl AttributeList {
     fn new(attribute_count: u32) -> io::Result<Self> {
         let mut bytes = 0usize;
-        // SAFETY: the null probe only writes the required size.
         let first = unsafe {
+            // SAFETY: null is the documented size-only probe.
             InitializeProcThreadAttributeList(std::ptr::null_mut(), attribute_count, 0, &mut bytes)
         };
-        // SAFETY: GetLastError has no preconditions.
         if first == 0 && unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER {
             return Err(last_error());
         }
-        let words = bytes.div_ceil(size_of::<usize>());
-        let mut storage = vec![0usize; words];
+        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
         let raw = storage.as_mut_ptr().cast();
-        // SAFETY: raw points to aligned storage of the requested size.
-        if unsafe { InitializeProcThreadAttributeList(raw, attribute_count, 0, &mut bytes) } == 0 {
+        if unsafe {
+            // SAFETY: raw points to aligned storage of the requested size.
+            InitializeProcThreadAttributeList(raw, attribute_count, 0, &mut bytes)
+        } == 0
+        {
             return Err(last_error());
         }
         Ok(Self { storage, raw })
@@ -996,8 +1429,8 @@ impl AttributeList {
         value: *const core::ffi::c_void,
         size: usize,
     ) -> io::Result<()> {
-        // SAFETY: raw and value remain valid for this attribute update.
         if unsafe {
+            // SAFETY: the attribute list and value remain valid for this call.
             UpdateProcThreadAttribute(
                 self.raw,
                 0,
@@ -1018,8 +1451,10 @@ impl AttributeList {
 
 impl Drop for AttributeList {
     fn drop(&mut self) {
-        // SAFETY: self.raw was successfully initialized and is not reused.
-        unsafe { DeleteProcThreadAttributeList(self.raw) };
+        unsafe {
+            // SAFETY: raw was successfully initialized by new.
+            DeleteProcThreadAttributeList(self.raw);
+        }
         let _ = self.storage.as_ptr();
     }
 }
@@ -1031,8 +1466,6 @@ struct Pipe {
 
 impl Pipe {
     fn new() -> io::Result<Self> {
-        // bInheritHandle=0 is essential: the parent never creates a temporary
-        // inheritable pipe end, even while another thread may spawn a child.
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: std::ptr::null_mut(),
@@ -1040,7 +1473,6 @@ impl Pipe {
         };
         let mut read = std::ptr::null_mut();
         let mut write = std::ptr::null_mut();
-        // SAFETY: output pointers and security attributes remain live for the call.
         if unsafe { CreatePipe(&mut read, &mut write, &attributes, 0) } == 0 {
             return Err(last_error());
         }
@@ -1051,41 +1483,27 @@ impl Pipe {
     }
 
     fn take_read(&mut self) -> File {
-        let read = self.read.take().expect("pipe read handle is available");
-        let raw = read.0;
+        let read = self
+            .read
+            .take()
+            .expect("lifecycle pipe read handle is available");
+        let raw = read.raw();
         std::mem::forget(read);
-        // SAFETY: raw is the one owned read end removed from OwnedHandle.
-        unsafe { File::from_raw_handle(raw) }
+        unsafe {
+            // SAFETY: raw is the one read handle removed from OwnedHandle.
+            File::from_raw_handle(raw)
+        }
     }
 }
 
 struct StdioHandles {
-    stdin: OwnedHandle,
     stdout: Pipe,
     stderr: Pipe,
 }
 
 impl StdioHandles {
     fn new() -> io::Result<Self> {
-        let nul = wide_path(OsStr::new("NUL"))?;
-        // SAFETY: nul is NUL-terminated and all output pointers are null by
-        // design; the returned handle is adopted immediately below.
-        let stdin = unsafe {
-            CreateFileW(
-                nul.as_ptr(),
-                windows_sys::Win32::Foundation::GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                std::ptr::null(),
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                std::ptr::null_mut(),
-            )
-        };
-        if stdin == INVALID_HANDLE_VALUE || stdin.is_null() {
-            return Err(last_error());
-        }
         Ok(Self {
-            stdin: OwnedHandle::new(stdin),
             stdout: Pipe::new()?,
             stderr: Pipe::new()?,
         })
@@ -1096,42 +1514,6 @@ impl StdioHandles {
         let stderr = std::mem::replace(&mut self.stderr.write, OwnedHandle(std::ptr::null_mut()));
         drop(stdout);
         drop(stderr);
-    }
-}
-
-fn wait_for_process(handle: HANDLE) -> io::Result<()> {
-    // SAFETY: handle is an owned process, event, or job synchronization handle.
-    if unsafe { WaitForSingleObject(handle, INFINITE) } != WAIT_OBJECT_0 {
-        Err(last_error())
-    } else {
-        Ok(())
-    }
-}
-
-fn wait_for_done_or_process(done: HANDLE, process: HANDLE) -> io::Result<bool> {
-    let handles = [done, process];
-    // SAFETY: both handles remain live for the duration of this wait.
-    let result = unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) };
-    if result == WAIT_OBJECT_0 {
-        Ok(true)
-    } else if result == WAIT_OBJECT_0 + 1 {
-        Ok(false)
-    } else if result == WAIT_FAILED {
-        Err(last_error())
-    } else {
-        Err(io::Error::other(
-            "unexpected lifecycle launcher wait result",
-        ))
-    }
-}
-
-fn get_exit_code(handle: HANDLE) -> io::Result<u32> {
-    let mut code = 0;
-    // SAFETY: handle is an owned process handle and code is writable storage.
-    if unsafe { GetExitCodeProcess(handle, &mut code) } == 0 {
-        Err(last_error())
-    } else {
-        Ok(code)
     }
 }
 
@@ -1206,7 +1588,6 @@ fn environment_block(environment: &[(OsString, OsString)]) -> io::Result<Vec<u16
             .to_ascii_lowercase()
             .cmp(&right.0.to_string_lossy().to_ascii_lowercase())
     });
-
     let mut block = Vec::new();
     for (key, value) in values {
         let mut entry = key;
@@ -1217,7 +1598,6 @@ fn environment_block(environment: &[(OsString, OsString)]) -> io::Result<Vec<u16
         block.push(0);
     }
     if block.is_empty() {
-        // CreateProcessW requires two NUL code units even for an empty block.
         block.extend_from_slice(&[0, 0]);
     } else {
         block.push(0);
@@ -1225,7 +1605,7 @@ fn environment_block(environment: &[(OsString, OsString)]) -> io::Result<Vec<u16
     Ok(block)
 }
 
-fn exit_status_from_raw(code: u32) -> ExitStatus {
+fn exit_status_from_raw(code: u32) -> std::process::ExitStatus {
     use std::os::windows::process::ExitStatusExt;
     ExitStatusExt::from_raw(code)
 }
@@ -1282,9 +1662,6 @@ mod tests {
         let before = RETAINED_JOB_HANDLES.load(Ordering::Relaxed);
         for failure in [CleanupFailure::Terminate, CleanupFailure::Wait] {
             let mut job = Job::new_with_cleanup_failure(failure).expect("test job");
-            // Model the post-CreateProcess state in which the job owns the
-            // launcher and therefore owns the only safe cleanup boundary.
-            job.launcher_created = true;
             assert!(job.terminate_and_wait().is_err());
             assert!(!job.quiesced);
             drop(job);
@@ -1297,7 +1674,31 @@ mod tests {
     }
 
     #[test]
-    fn setup_failure_does_not_leave_a_child_lease() {
+    fn guardian_bootstrap_round_trips_exact_unicode_arguments_and_environment() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = GuardianConfig {
+            nonce: "nonce-значение".to_string(),
+            child_lock_path: directory.path().join("child.lock"),
+            result_path: directory.path().join("result"),
+            cwd: directory.path().join("рабочая папка"),
+            args: vec![OsString::from("a b\\"), OsString::from("значение")],
+            environment: vec![(OsString::from("A"), OsString::from("значение \\"))],
+            creation_flags: CREATE_NEW_PROCESS_GROUP,
+            fail_after_job: false,
+            cleanup_gate: None,
+        };
+        let encoded = encode_config(&config).expect("encode config");
+        let decoded = decode_config(&encoded, &config.nonce).expect("decode config");
+        assert_eq!(decoded.nonce, config.nonce);
+        assert_eq!(decoded.child_lock_path, config.child_lock_path);
+        assert_eq!(decoded.cwd, config.cwd);
+        assert_eq!(decoded.args, config.args);
+        assert_eq!(decoded.environment, config.environment);
+        assert_eq!(decoded.creation_flags, config.creation_flags);
+    }
+
+    #[test]
+    fn setup_failure_before_guardian_spawn_does_not_leave_a_child_lease() {
         let repository = tempfile::tempdir().expect("temporary repository");
         let environment = crate::git::sanitized_git_environment();
         let missing = repository.path().join("missing/merge-operation.lock");
@@ -1310,7 +1711,7 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_git_captures_exact_output_with_unicode_args_cwd_and_env() {
+    fn lifecycle_git_captures_exact_output_with_unicode_cwd_and_environment() {
         let repository = tempfile::tempdir().expect("temporary repository");
         let cwd = repository.path().join("рабочая папка");
         fs::create_dir(&cwd).expect("unicode cwd");
@@ -1321,11 +1722,40 @@ mod tests {
             .expect("git init")
             .success());
 
+        let hook = cwd.join(".git/hooks/pre-commit");
+        fs::write(
+            &hook,
+            "#!/bin/sh\nprintf hook-stdout\nprintf hook-stderr >&2\n",
+        )
+        .expect("write exact-output hook");
+        fs::write(cwd.join("output.txt"), "output\n").expect("write output fixture");
+
         let lock_path = repository.path().join("merge-operation.lock");
         fs::File::create(&lock_path).expect("child lease file");
-        let exact_value = r#"значение with spaces "and" \ trailing"#;
+        let exact_value = r#"значение with spaces \"and\" \\ trailing"#;
         let config = format!("wt.lifecycle={exact_value}");
         let mut environment = crate::git::sanitized_git_environment();
+        let staged = output_git(&lock_path, &["add", "output.txt"], &cwd, &environment)
+            .expect("stage exact-output fixture");
+        assert!(staged.status.success());
+        let hooked = output_git(
+            &lock_path,
+            &[
+                "-c",
+                "user.name=Windows Test",
+                "-c",
+                "user.email=windows@example.test",
+                "commit",
+                "--quiet",
+                "-m",
+                "exact output",
+            ],
+            &cwd,
+            &environment,
+        )
+        .expect("hooked commit should run");
+        assert_eq!(hooked.stdout, b"hook-stdout\n");
+        assert_eq!(hooked.stderr, b"hook-stderr\n");
         environment.push((
             OsString::from("WT_WINDOWS_EXACT_ENV"),
             OsString::from(exact_value),
@@ -1342,13 +1772,6 @@ mod tests {
         assert_eq!(output.stdout, format!("{exact_value}\n").as_bytes());
         assert_eq!(output.stderr, b"");
 
-        let expected = std::process::Command::new("git")
-            .args(["rev-parse", "--show-toplevel"])
-            .current_dir(&cwd)
-            .env_clear()
-            .envs(environment.iter().map(|(key, value)| (key, value)))
-            .output()
-            .expect("reference Git invocation");
         let actual = output_git(
             &lock_path,
             &["rev-parse", "--show-toplevel"],
@@ -1356,8 +1779,8 @@ mod tests {
             &environment,
         )
         .expect("contained Git invocation");
-        assert_eq!(actual.stdout, expected.stdout);
-        assert_eq!(actual.stderr, expected.stderr);
+        assert_eq!(actual.stdout, format!("{}\n", cwd.display()).as_bytes());
+        assert_eq!(actual.stderr, b"");
 
         let failed = output_git(
             &lock_path,
