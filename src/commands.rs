@@ -343,7 +343,7 @@ fn list_stats(
             }
             rev.to_string()
         }
-        None => git::resolve_mainline(repo)?,
+        None => git::resolve_mainline_readonly(repo)?,
     };
 
     Ok(worktrees
@@ -1227,7 +1227,7 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
     };
     if inspect {
         let preflight =
-            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), true)?;
+            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref())?;
         return print_merge_inspection(&repo, &preflight, fmt);
     }
 
@@ -1235,8 +1235,12 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
     // every durable journal/cleanup update. A paused hook therefore blocks all
     // competing mutators while read-only status remains available.
     let lifecycle_lock = worktree::acquire_merge_lifecycle_lock(&repo)?;
-    let preflight =
-        worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), false)?;
+    let preflight = worktree::merge_preflight_with_lifecycle_lock(
+        &repo,
+        resolved_branch.as_ref(),
+        into.as_deref(),
+        &lifecycle_lock,
+    )?;
 
     if fmt == MergeFormat::Human {
         print_merge_preflight(&preflight);

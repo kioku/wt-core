@@ -66,6 +66,33 @@ fn git_with_lifecycle_lock(
     git_command(args, cwd, Some(lifecycle_lock))
 }
 
+fn lifecycle_output_with_stdin(
+    command: &mut Cmd,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+    input: &[u8],
+) -> io::Result<std::process::Output> {
+    #[cfg(unix)]
+    {
+        command.stdin(Stdio::piped());
+        let mut child = lifecycle_lock.spawn_child(command)?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input)?;
+        }
+        child.wait_with_output()
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = lifecycle_lock;
+        command.stdin(Stdio::piped());
+        let mut child = command.spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            stdin.write_all(input)?;
+        }
+        child.wait_with_output()
+    }
+}
+
 fn git_command(
     args: &[&str],
     cwd: &Path,
@@ -158,10 +185,8 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
     Ok(RepoRoot(root))
 }
 
-/// List all worktrees via `git worktree list --porcelain`.
+/// List all worktrees via `git worktree list --porcelain` without mutation.
 pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
-    // Prune stale worktrees first (matches current behavior expectation).
-    let _ = git(&["worktree", "prune"], repo.as_ref());
     list_worktrees_readonly(repo)
 }
 
@@ -172,6 +197,16 @@ pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
 pub fn list_worktrees_readonly(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     let raw = git(&["worktree", "list", "--porcelain"], repo.as_ref())?;
     parse_worktree_porcelain(&raw, repo)
+}
+
+/// Prune stale Git worktree metadata while retaining the lifecycle child lease.
+/// Callers must already own the repository lifecycle lock before invoking this
+/// mutating operation.
+pub fn prune_worktree_metadata_with_lifecycle_lock(
+    repo: &RepoRoot,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    git_with_lifecycle_lock(&["worktree", "prune"], repo.as_ref(), lifecycle_lock).map(|_| ())
 }
 
 /// A raw worktree entry parsed from porcelain lines.
@@ -252,12 +287,13 @@ fn parse_worktree_porcelain(raw: &str, _repo: &RepoRoot) -> Result<Vec<Worktree>
     Ok(worktrees)
 }
 
-/// Add a new worktree.
+/// Add a new worktree while retaining the lifecycle child lease.
 pub fn add_worktree(
     repo: &RepoRoot,
     dir: &Path,
     branch: &BranchName,
     base: Option<&str>,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     let base_rev = base.unwrap_or("HEAD");
     let branch_str = branch.as_str();
@@ -266,12 +302,17 @@ pub fn add_worktree(
     args.push(&dir_str);
     args.push(base_rev);
 
-    git(&args, repo.as_ref())?;
+    git_with_lifecycle_lock(&args, repo.as_ref(), lifecycle_lock)?;
     Ok(())
 }
 
-/// Remove a worktree directory.
-pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
+/// Remove a worktree directory while retaining the lifecycle child lease.
+pub fn remove_worktree(
+    repo: &RepoRoot,
+    dir: &Path,
+    force: bool,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
     let dir_str = dir.display().to_string();
     let mut args = vec!["worktree", "remove"];
     if force {
@@ -279,7 +320,7 @@ pub fn remove_worktree(repo: &RepoRoot, dir: &Path, force: bool) -> Result<()> {
     }
     args.push(&dir_str);
 
-    git(&args, repo.as_ref())?;
+    git_with_lifecycle_lock(&args, repo.as_ref(), lifecycle_lock)?;
     Ok(())
 }
 
@@ -296,6 +337,7 @@ pub fn delete_branch_at_cas(
     branch: &BranchName,
     force: bool,
     expected_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     if !force && !git_success(&["merge-base", "--is-ancestor", expected_oid, "HEAD"], path) {
         return Err(AppError::conflict(format!(
@@ -321,6 +363,7 @@ pub fn delete_branch_at_cas(
     run_update_ref_transaction(
         path,
         &format!("start\ndelete {reference} {expected_oid}\ncommit\n"),
+        lifecycle_lock,
     )?;
 
     // A raw Git worktree add can register a checkout without changing the
@@ -332,7 +375,7 @@ pub fn delete_branch_at_cas(
         .iter()
         .any(|worktree| worktree.branch.as_deref() == Some(branch.as_str()))
     {
-        restore_deleted_branch_if_missing(path, &reference, expected_oid)?;
+        restore_deleted_branch_if_missing(path, &reference, expected_oid, lifecycle_lock)?;
         return Err(AppError::conflict(format!(
             "cannot delete branch '{}' because it became checked out in another worktree",
             branch.as_str(),
@@ -345,6 +388,7 @@ fn restore_deleted_branch_if_missing(
     path: &Path,
     reference: &str,
     expected_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     if branch_oid_from_path(
         path,
@@ -357,6 +401,7 @@ fn restore_deleted_branch_if_missing(
             &format!(
                 "start\nupdate {reference} {expected_oid} 0000000000000000000000000000000000000000\ncommit\n"
             ),
+            lifecycle_lock,
         )?;
     }
     Ok(())
@@ -366,24 +411,18 @@ fn restore_deleted_branch_if_missing(
 /// transaction protocol. This is used for both branch deletion and private
 /// lifecycle markers; individual `update-ref` invocations would leave a
 /// check/delete race.
-fn run_update_ref_transaction(path: &Path, input: &str) -> Result<()> {
+fn run_update_ref_transaction(
+    path: &Path,
+    input: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
     let mut cmd = Cmd::new("git");
     cmd.args(["update-ref", "--stdin"])
         .current_dir(path)
-        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     sanitize_git_environment(&mut cmd);
-    let mut child = cmd
-        .spawn()
-        .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(input.as_bytes()).map_err(|error| {
-            AppError::git(format!("failed to send git ref transaction: {error}"))
-        })?;
-    }
-    let output = child
-        .wait_with_output()
+    let output = lifecycle_output_with_stdin(&mut cmd, lifecycle_lock, input.as_bytes())
         .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
     if output.status.success() {
         Ok(())
@@ -397,8 +436,13 @@ fn run_update_ref_transaction(path: &Path, input: &str) -> Result<()> {
 /// Atomically verify that a local branch still has `expected_oid`.
 /// Updating a ref to its current value still takes Git's ref transaction and
 /// gives removal callers an immediate CAS boundary before path cleanup.
-pub fn verify_branch_ref_cas(path: &Path, branch: &BranchName, expected_oid: &str) -> Result<()> {
-    update_branch_ref_cas(path, branch, expected_oid, expected_oid)
+pub fn verify_branch_ref_cas(
+    path: &Path,
+    branch: &BranchName,
+    expected_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    update_branch_ref_cas(path, branch, expected_oid, expected_oid, lifecycle_lock)
 }
 
 /// Update a local branch ref with an atomic old-value check.
@@ -407,14 +451,14 @@ pub fn update_branch_ref_cas(
     branch: &BranchName,
     new_oid: &str,
     expected_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     let reference = format!("refs/heads/{}", branch.as_str());
     let mut cmd = Cmd::new("git");
     cmd.args(["update-ref", &reference, new_oid, expected_oid])
         .current_dir(path);
     sanitize_git_environment(&mut cmd);
-    let output = cmd
-        .output()
+    let output = lifecycle_output(&mut cmd, Some(lifecycle_lock))
         .map_err(|error| AppError::git(format!("failed to run git update-ref: {error}")))?;
     if output.status.success() {
         Ok(())
@@ -598,14 +642,27 @@ fn branch_oid_from_path(path: &Path, branch: &BranchName) -> Option<String> {
 /// Temporarily detach a worktree HEAD without changing its index or files.
 /// `symbolic-ref --delete HEAD` intentionally rejects deleting the current
 /// HEAD, so update the per-worktree HEAD file without dereferencing it.
-pub fn detach_head(path: &Path, expected_oid: &str) -> Result<()> {
-    git(&["update-ref", "--no-deref", "HEAD", expected_oid], path).map(|_| ())
+pub fn detach_head(
+    path: &Path,
+    expected_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    git_with_lifecycle_lock(
+        &["update-ref", "--no-deref", "HEAD", expected_oid],
+        path,
+        lifecycle_lock,
+    )
+    .map(|_| ())
 }
 
 /// Restore a worktree's symbolic HEAD after a detached continuation.
-pub fn restore_head(path: &Path, branch: &BranchName) -> Result<()> {
+pub fn restore_head(
+    path: &Path,
+    branch: &BranchName,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
     let reference = format!("refs/heads/{}", branch.as_str());
-    git(&["symbolic-ref", "HEAD", &reference], path).map(|_| ())
+    git_with_lifecycle_lock(&["symbolic-ref", "HEAD", &reference], path, lifecycle_lock).map(|_| ())
 }
 
 /// Install a preservation marker only if the branch still has `expected_oid`.
@@ -615,6 +672,7 @@ pub fn mark_preserved_branch_at_cas(
     repo: &RepoRoot,
     branch: &BranchName,
     expected_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
     let branch_ref = format!("refs/heads/{}", branch.as_str());
@@ -623,6 +681,7 @@ pub fn mark_preserved_branch_at_cas(
         &format!(
             "start\nverify {branch_ref} {expected_oid}\nupdate {marker} {expected_oid}\ncommit\n"
         ),
+        lifecycle_lock,
     )
 }
 
@@ -673,10 +732,11 @@ pub fn restore_preserved_branch_at_cas(
     branch: &BranchName,
     replacement_oid: &str,
     expected_marker_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
     let input = format!("start\nupdate {marker} {replacement_oid} {expected_marker_oid}\ncommit\n");
-    run_update_ref_transaction(repo.as_ref(), &input)
+    run_update_ref_transaction(repo.as_ref(), &input, lifecycle_lock)
 }
 
 /// Clear a lifecycle marker only if it still contains `expected_marker_oid`.
@@ -684,6 +744,7 @@ pub fn clear_preserved_branch_at_cas(
     repo: &RepoRoot,
     branch: &BranchName,
     expected_marker_oid: &str,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
     let current = preserved_branch_oid(repo, branch)?;
     if current.is_none() {
@@ -697,7 +758,7 @@ pub fn clear_preserved_branch_at_cas(
     }
     let marker = format!("refs/wt-core/preserved/{}", branch.as_str());
     let input = format!("start\ndelete {marker} {expected_marker_oid}\ncommit\n");
-    run_update_ref_transaction(repo.as_ref(), &input)
+    run_update_ref_transaction(repo.as_ref(), &input, lifecycle_lock)
 }
 
 /// Resolve the current object ID of a local branch.
@@ -1578,11 +1639,16 @@ pub fn remote_branch_exists(repo: &RepoRoot, branch: &BranchName) -> bool {
 /// Set the upstream tracking reference for a local branch.
 ///
 /// Equivalent to `git branch --set-upstream-to=origin/<branch> <branch>`.
-pub fn set_upstream(repo: &RepoRoot, branch: &BranchName) -> Result<()> {
+pub fn set_upstream(
+    repo: &RepoRoot,
+    branch: &BranchName,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
     let upstream = format!("origin/{}", branch.as_str());
-    git(
+    git_with_lifecycle_lock(
         &["branch", "--set-upstream-to", &upstream, branch.as_str()],
         repo.as_ref(),
+        lifecycle_lock,
     )?;
     Ok(())
 }
@@ -1959,6 +2025,13 @@ mod tests {
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
+    fn test_lifecycle_lock(repo: &tempfile::TempDir) -> operation_state::MergeLifecycleLock {
+        operation_state::acquire_merge_lifecycle_lock(
+            &repo.path().join("wt-core/merge-operation.lock"),
+        )
+        .expect("test lifecycle lock should be available")
+    }
+
     fn test_repo() -> tempfile::TempDir {
         let repo = tempfile::TempDir::new().expect("temporary repository should be created");
         test_git(repo.path(), &["init", "-b", "main"]);
@@ -1985,8 +2058,9 @@ mod tests {
             &["worktree", "add", &worktree_arg, branch.as_str()],
         );
         let expected = test_git(repo.path(), &["rev-parse", branch.as_str()]);
+        let lifecycle_lock = test_lifecycle_lock(&repo);
 
-        let error = delete_branch_at_cas(repo.path(), &branch, true, &expected)
+        let error = delete_branch_at_cas(repo.path(), &branch, true, &expected, &lifecycle_lock)
             .expect_err("checked-out branch deletion must be refused");
         assert_eq!(error.code, crate::error::ExitCode::Conflict);
         assert_eq!(
@@ -2007,12 +2081,13 @@ mod tests {
         test_git(repo.path(), &["commit", "-m", "advance"]);
         test_git(repo.path(), &["branch", "-f", branch.as_str(), "HEAD"]);
         let moved = test_git(repo.path(), &["rev-parse", branch.as_str()]);
+        let lifecycle_lock = test_lifecycle_lock(&repo);
 
-        let error = delete_branch_at_cas(repo.path(), &branch, true, &expected)
+        let error = delete_branch_at_cas(repo.path(), &branch, true, &expected, &lifecycle_lock)
             .expect_err("branch deletion must use the planned OID");
         assert_eq!(error.code, crate::error::ExitCode::Git);
         assert_eq!(branch_oid(&root, &branch), Some(moved));
-        mark_preserved_branch_at_cas(&root, &branch, &expected)
+        mark_preserved_branch_at_cas(&root, &branch, &expected, &lifecycle_lock)
             .expect_err("preservation must use the planned OID");
         assert!(preserved_branch_oid(&root, &branch)
             .expect("marker lookup should succeed")

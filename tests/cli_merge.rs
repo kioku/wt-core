@@ -811,6 +811,284 @@ fn wait_for_file(path: &std::path::Path) {
 
 #[cfg(unix)]
 #[test]
+fn merge_cleanup_worktree_remove_retains_lifecycle_lease_after_owner_death() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/remove-child-lease");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let shim = install_blocking_git_shim(BlockingGitMutation::WorktreeRemove, false);
+    let mut owner = shim.command(["merge", "--continue", "--repo", &repo_str]);
+    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut owner = owner.spawn().expect("cleanup owner should start");
+    wait_for_file(&shim.entered);
+    owner.kill().expect("cleanup owner should be terminable");
+    let _ = owner
+        .wait_with_output()
+        .expect("killed cleanup owner should be reaped before busy assertion");
+
+    assert_lifecycle_busy(&repo_str);
+    assert_lifecycle_busy_for(&shim, ["merge", "--continue", "--repo", &repo_str]);
+    assert_lifecycle_busy_for(&shim, ["merge", "--abort", "--repo", &repo_str]);
+
+    std::fs::write(&shim.release, "release\n").expect("release worktree removal");
+    wait_for_lifecycle_idle(&repo_str);
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!source.exists(), "recovery should finish source cleanup");
+    assert_branch_deleted(&repo.path(), "feature/remove-child-lease");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_cleanup_ref_mutation_retains_lease_and_recovers_failure() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/ref-child-lease");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let shim = install_blocking_git_shim(BlockingGitMutation::UpdateRef, true);
+    let mut owner = shim.command(["merge", "--continue", "--repo", &repo_str]);
+    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut owner = owner.spawn().expect("ref cleanup owner should start");
+    wait_for_file(&shim.entered);
+    owner
+        .kill()
+        .expect("ref cleanup owner should be terminable");
+    let _ = owner
+        .wait_with_output()
+        .expect("killed ref cleanup owner should be reaped before busy assertion");
+
+    assert_lifecycle_busy(&repo_str);
+    assert_lifecycle_busy_for(&shim, ["merge", "--continue", "--repo", &repo_str]);
+    assert_lifecycle_busy_for(&shim, ["merge", "--abort", "--repo", &repo_str]);
+
+    std::fs::write(&shim.release, "release\n").expect("release ref mutation");
+    wait_for_lifecycle_idle(&repo_str);
+
+    // The blocked writer may fail after the owner dies. Recovery retries the
+    // recorded cleanup only after the stale child has exited.
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!source.exists(), "recovery should finish source cleanup");
+    assert_branch_deleted(&repo.path(), "feature/ref-child-lease");
+}
+
+#[cfg(unix)]
+#[test]
+fn pre_lock_merge_and_remove_selection_cannot_prune_without_the_lifecycle_lock() {
+    for action in ["merge", "remove"] {
+        let repo = fixtures::TestRepo::new();
+        let repo_str = repo.path().display().to_string();
+        let branch = format!("feature/pre-lock-{action}");
+        wt_core()
+            .args(["add", &branch, "--repo", &repo_str])
+            .assert()
+            .success();
+        let source = find_worktree_dir(&repo.path(), &format!("feature-pre-lock-{action}"));
+        if action == "merge" {
+            commit_file(&source, "pre-lock.txt", "pre-lock", "pre-lock selection");
+        }
+
+        let shim = install_blocking_git_shim(BlockingGitMutation::WorktreePrune, false);
+        let mut owner = shim.command([action, "--repo", &repo_str]);
+        owner
+            .current_dir(&source)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let owner = owner.spawn().expect("selection owner should start");
+        wait_for_file(&shim.entered);
+
+        // The blocked prune must already be inside the lifecycle lock.
+        assert_lifecycle_busy(&repo_str);
+
+        std::fs::write(&shim.release, "release\n").expect("release selection prune");
+        let output = owner
+            .wait_with_output()
+            .expect("selection owner should finish");
+        assert!(
+            output.status.success(),
+            "{action} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_metadata_prune_is_explicit_and_retains_lifecycle_lease_after_owner_death() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/prune-child-lease", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-prune-child-lease");
+    commit_file(&source, "prune-child.txt", "prune", "prune child");
+
+    let shim = install_blocking_git_shim(BlockingGitMutation::WorktreePrune, false);
+    let mut owner = shim.command(["merge", "feature/prune-child-lease", "--repo", &repo_str]);
+    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut owner = owner.spawn().expect("prune owner should start");
+    wait_for_file(&shim.entered);
+    owner.kill().expect("prune owner should be terminable");
+    let owner_output = owner
+        .wait_with_output()
+        .expect("killed prune owner should be reaped before busy assertion");
+    assert!(!owner_output.status.success());
+
+    assert_lifecycle_busy(&repo_str);
+    assert_lifecycle_busy_for(
+        &shim,
+        ["merge", "feature/prune-child-lease", "--repo", &repo_str],
+    );
+
+    std::fs::write(&shim.release, "release\n").expect("release metadata prune");
+    wait_for_lifecycle_idle(&repo_str);
+
+    let retry = shim
+        .command(["merge", "feature/prune-child-lease", "--repo", &repo_str])
+        .output()
+        .expect("merge retry should run");
+    assert!(
+        retry.status.success(),
+        "merge retry failed: {}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    assert!(!source.exists(), "merge retry should finish source cleanup");
+    assert_branch_deleted(&repo.path(), "feature/prune-child-lease");
+}
+
+#[cfg(unix)]
+fn assert_lifecycle_busy(repo: &str) {
+    let output = wt_core()
+        .args(["merge", "--status", "--json", "--repo", repo])
+        .output()
+        .expect("status should run while cleanup Git is blocked");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"state\":\"busy\""),
+        "status must report the contained cleanup child as busy: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(unix)]
+fn assert_lifecycle_busy_for<const N: usize>(shim: &GitMutationShim, args: [&str; N]) {
+    let output = shim
+        .command(args)
+        .output()
+        .expect("cooperating lifecycle command should run");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("busy"),
+        "cooperating lifecycle command must remain busy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+fn wait_for_lifecycle_idle(repo: &str) {
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let output = wt_core()
+            .args(["merge", "--status", "--json", "--repo", repo])
+            .output()
+            .expect("status should run while waiting for cleanup child");
+        if !String::from_utf8_lossy(&output.stdout).contains("\"state\":\"busy\"") {
+            return;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    panic!("contained cleanup Git child did not release the lifecycle lease");
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum BlockingGitMutation {
+    WorktreePrune,
+    WorktreeRemove,
+    UpdateRef,
+}
+
+#[cfg(unix)]
+struct GitMutationShim {
+    _directory: tempfile::TempDir,
+    real_git: std::path::PathBuf,
+    path: std::ffi::OsString,
+    entered: std::path::PathBuf,
+    release: std::path::PathBuf,
+}
+
+#[cfg(unix)]
+impl GitMutationShim {
+    fn command<const N: usize>(&self, args: [&str; N]) -> StdCommand {
+        let mut command = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+        command
+            .args(args)
+            .env("PATH", &self.path)
+            .env("WT_REAL_GIT", &self.real_git);
+        command
+    }
+}
+
+#[cfg(unix)]
+fn install_blocking_git_shim(
+    mutation: BlockingGitMutation,
+    fail_after_release: bool,
+) -> GitMutationShim {
+    let directory = tempfile::tempdir().expect("Git shim directory");
+    let entered = directory.path().join("entered");
+    let release = directory.path().join("release");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let real_git = std::env::split_paths(&original_path)
+        .map(|component| component.join("git"))
+        .find(|candidate| candidate.is_file())
+        .expect("real git executable");
+    let mut paths = vec![directory.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&original_path));
+    let path = std::env::join_paths(paths).expect("shim PATH");
+    let block = match mutation {
+        BlockingGitMutation::WorktreePrune => "worktree_prune",
+        BlockingGitMutation::WorktreeRemove => "worktree_remove",
+        BlockingGitMutation::UpdateRef => "update_ref",
+    };
+    let script_path = directory.path().join("git");
+    let script = format!(
+        "#!/bin/sh\nset -eu\nblock=0\nif [ \"{block}\" = worktree_prune ] && [ \"$1\" = worktree ] && [ \"$2\" = prune ]; then block=1; fi\nif [ \"{block}\" = worktree_remove ] && [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then block=1; fi\nif [ \"{block}\" = update_ref ] && [ \"$1\" = update-ref ] && [ \"$2\" = --stdin ]; then block=1; fi\nif [ \"$block\" = 1 ]; then printf entered > {entered}; while [ ! -f {release} ]; do sleep 0.05; done; fi\nif [ \"{fail}\" = 1 ] && [ \"$block\" = 1 ]; then exit 42; fi\nexec \"$WT_REAL_GIT\" \"$@\"\n",
+        block = block,
+        fail = if fail_after_release { 1 } else { 0 },
+        entered = shell_quote(&entered.display().to_string()),
+        release = shell_quote(&release.display().to_string()),
+    );
+    std::fs::write(&script_path, script).expect("write Git shim");
+    use std::os::unix::fs::PermissionsExt;
+    let mut permissions = std::fs::metadata(&script_path)
+        .expect("Git shim metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script_path, permissions).expect("chmod Git shim");
+
+    GitMutationShim {
+        _directory: directory,
+        real_git,
+        path,
+        entered,
+        release,
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn merge_config_injection_cannot_bypass_merge_hooks() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();
@@ -3524,6 +3802,28 @@ fn read_only_commands_preserve_stale_worktree_metadata() {
         admin_before,
         "read-only commands must not prune stale metadata"
     );
+}
+
+#[test]
+fn doctor_guides_locked_stale_metadata_without_recommending_plain_prune() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+
+    wt_core()
+        .args(["add", "feature/locked-stale", "--repo", &repo_str])
+        .assert()
+        .success();
+    let stale_path = find_worktree_dir(&repo.path(), "feature-locked-stale");
+    lock_worktree_metadata(&repo.path(), &stale_path);
+    std::fs::remove_dir_all(&stale_path).expect("remove locked stale worktree");
+
+    wt_core()
+        .args(["doctor", "--repo", &repo_str])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("git worktree unlock"))
+        .stdout(predicate::str::contains("wt prune --execute"))
+        .stdout(predicate::str::contains("run `wt prune --execute` to remove it safely").not());
 }
 
 #[cfg(unix)]
