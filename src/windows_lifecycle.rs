@@ -30,14 +30,13 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CheckTokenMembership, CreateWellKnownSid,
-    EqualSid, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CreateWellKnownSid, EqualSid,
+    GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
     GetTokenInformation, InitializeAcl, IsValidSid, MapGenericMask, TokenUser,
     WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
     ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERITED_ACE,
     OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
-    SECURITY_ATTRIBUTES, SE_DACL_DEFAULTED, SE_DACL_PROTECTED, TOKEN_DUPLICATE, TOKEN_QUERY,
-    TOKEN_USER,
+    SECURITY_ATTRIBUTES, SE_DACL_DEFAULTED, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
@@ -2845,8 +2844,8 @@ fn exit_status_from_raw(code: u32) -> std::process::ExitStatus {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, ImpersonateLoggedOnUser, RevertToSelf, WinRestrictedCodeSid,
-        DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
+        CheckTokenMembership, CreateRestrictedToken, ImpersonateLoggedOnUser, RevertToSelf,
+        WinRestrictedCodeSid, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         DeleteFileW, WriteFile, DELETE, FILE_SHARE_DELETE, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
