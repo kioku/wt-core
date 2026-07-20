@@ -113,6 +113,27 @@ impl MergeLifecycleLock {
         self.spawn_child(command)?.wait_with_output()
     }
 
+    /// Capture a lifecycle child whose stdin must receive a Git transaction.
+    #[cfg(not(windows))]
+    pub(crate) fn output_with_stdin(
+        &self,
+        command: &mut Command,
+        input: &[u8],
+    ) -> io::Result<std::process::Output> {
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = self.spawn_child(command)?;
+        let stdin_result = child.stdin.take().map(|mut stdin| stdin.write_all(input));
+        if let Some(Err(error)) = stdin_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
+        child.wait_with_output()
+    }
+
     #[cfg(windows)]
     pub(crate) fn output_git(
         &self,
@@ -121,6 +142,23 @@ impl MergeLifecycleLock {
         environment: &[(std::ffi::OsString, std::ffi::OsString)],
     ) -> io::Result<std::process::Output> {
         windows_lifecycle::output_git(&self.child_lock_path, args, cwd, environment)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn output_git_with_stdin(
+        &self,
+        args: &[&str],
+        cwd: &Path,
+        environment: &[(std::ffi::OsString, std::ffi::OsString)],
+        input: &[u8],
+    ) -> io::Result<std::process::Output> {
+        windows_lifecycle::output_git_with_stdin(
+            &self.child_lock_path,
+            args,
+            cwd,
+            environment,
+            input,
+        )
     }
 }
 

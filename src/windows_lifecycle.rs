@@ -78,6 +78,24 @@ pub(crate) fn output_git(
     output_git_with_creation_flags(child_lock_path, args, cwd, environment, 0)
 }
 
+/// Run Git with captured stdin while retaining the lifecycle child lease.
+pub(crate) fn output_git_with_stdin(
+    child_lock_path: &Path,
+    args: &[&str],
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    input: &[u8],
+) -> io::Result<std::process::Output> {
+    output_git_with_creation_flags_and_stdin(
+        child_lock_path,
+        args,
+        cwd,
+        environment,
+        0,
+        Some(input),
+    )
+}
+
 /// Run Git with caller-provided creation flags.
 ///
 /// `CREATE_SUSPENDED` cannot be preserved because the guardian uses suspension
@@ -89,6 +107,24 @@ pub(crate) fn output_git_with_creation_flags(
     cwd: &Path,
     environment: &[(OsString, OsString)],
     creation_flags: u32,
+) -> io::Result<std::process::Output> {
+    output_git_with_creation_flags_and_stdin(
+        child_lock_path,
+        args,
+        cwd,
+        environment,
+        creation_flags,
+        None,
+    )
+}
+
+fn output_git_with_creation_flags_and_stdin(
+    child_lock_path: &Path,
+    args: &[&str],
+    cwd: &Path,
+    environment: &[(OsString, OsString)],
+    creation_flags: u32,
+    input: Option<&[u8]>,
 ) -> io::Result<std::process::Output> {
     validate_creation_flags(creation_flags)?;
 
@@ -120,7 +156,7 @@ pub(crate) fn output_git_with_creation_flags(
     };
     ProtocolFile::write_new(&paths.bootstrap, encode_config(&config)?)?;
 
-    let mut stdio = StdioHandles::new()?;
+    let mut stdio = StdioHandles::new(input.is_some())?;
     let start_event = OwnedHandle::new(create_event()?);
     let abort_event = OwnedHandle::new(create_event()?);
     let current_exe_wide = wide_path(current_exe.as_os_str())?;
@@ -202,6 +238,11 @@ pub(crate) fn output_git_with_creation_flags(
     wait_for_test_handshake("parent-after-ready-before-command");
     let command_handoff = duplicate_guardian_command_handles(
         guardian.raw(),
+        stdio
+            .stdin
+            .as_ref()
+            .and_then(|pipe| pipe.read.as_ref())
+            .map(OwnedHandle::raw),
         stdio.stdout.write.raw(),
         stdio.stderr.write.raw(),
         start_event.raw(),
@@ -222,6 +263,17 @@ pub(crate) fn output_git_with_creation_flags(
         return Err(error);
     }
 
+    // The update-ref transaction is small enough to write after the guardian
+    // authorizes Git. Closing this handle after the write gives Git the
+    // expected EOF without weakening the guardian lease.
+    let stdin = input.map(|input| {
+        (
+            stdio
+                .take_stdin_write()
+                .expect("stdin pipe exists for lifecycle Git input"),
+            input.to_vec(),
+        )
+    });
     stdio.close_child_writes();
     let stdout_reader = thread::spawn({
         let stdout = stdio.stdout.take_read();
@@ -237,6 +289,16 @@ pub(crate) fn output_git_with_creation_flags(
     wait_for_test_handshake("parent-command-before-start");
     if unsafe { SetEvent(start_event.raw()) } == 0 {
         let error = last_error();
+        let _ = unsafe { SetEvent(abort_event.raw()) };
+        wait_for_process(guardian.raw())?;
+        let _ = join_reader(stdout_reader);
+        let _ = join_reader(stderr_reader);
+        return Err(error);
+    }
+    let stdin_result = stdin
+        .map(|(mut stdin, input)| stdin.write_all(&input))
+        .transpose();
+    if let Err(error) = stdin_result {
         let _ = unsafe { SetEvent(abort_event.raw()) };
         wait_for_process(guardian.raw())?;
         let _ = join_reader(stdout_reader);
@@ -473,6 +535,7 @@ struct GuardianOwnerHandle {
 
 #[derive(Clone, Copy)]
 struct GuardianCommandHandles {
+    stdin: Option<HANDLE>,
     stdout: HANDLE,
     stderr: HANDLE,
     start_event: HANDLE,
@@ -648,10 +711,25 @@ fn decode_owner_handoff(contents: &[u8], expected_nonce: &str) -> io::Result<Gua
     Ok(GuardianOwnerHandle { parent_process })
 }
 
+fn read_handoff_handle(cursor: &mut Cursor<&[u8]>, message: &str) -> io::Result<HANDLE> {
+    let raw = read_u64(cursor)? as usize as HANDLE;
+    if raw.is_null() || raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, message));
+    }
+    Ok(raw)
+}
+
 fn encode_command_handoff(nonce: &str, handles: GuardianCommandHandles) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     output.extend_from_slice(HANDOFF_MAGIC);
     write_bytes(&mut output, nonce.as_bytes())?;
+    match handles.stdin {
+        Some(handle) => {
+            output.push(1);
+            write_u64(&mut output, handle as usize as u64);
+        }
+        None => output.push(0),
+    }
     for handle in [
         handles.stdout,
         handles.stderr,
@@ -678,19 +756,23 @@ fn decode_command_handoff(
             "guardian command nonce mismatch",
         ));
     }
+    let stdin = match read_byte(&mut cursor)? {
+        0 => None,
+        _ => Some(read_handoff_handle(
+            &mut cursor,
+            "guardian command handoff contains an invalid stdin handle",
+        )?),
+    };
     let mut handles = [std::ptr::null_mut(); 4];
     for handle in &mut handles {
-        let raw = read_u64(&mut cursor)? as usize as HANDLE;
-        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "guardian command handoff contains an invalid handle",
-            ));
-        }
-        *handle = raw;
+        *handle = read_handoff_handle(
+            &mut cursor,
+            "guardian command handoff contains an invalid handle",
+        )?;
     }
     ensure_cursor_exhausted(&cursor)?;
     Ok(GuardianCommandHandles {
+        stdin,
         stdout: handles[0],
         stderr: handles[1],
         start_event: handles[2],
@@ -1175,12 +1257,16 @@ fn duplicate_guardian_parent_handle(target_process: HANDLE) -> io::Result<HANDLE
 
 fn duplicate_guardian_command_handles(
     target_process: HANDLE,
+    stdin: Option<HANDLE>,
     stdout: HANDLE,
     stderr: HANDLE,
     start_event: HANDLE,
     abort_event: HANDLE,
 ) -> io::Result<GuardianCommandHandles> {
     Ok(GuardianCommandHandles {
+        stdin: stdin
+            .map(|handle| duplicate_into(target_process, handle))
+            .transpose()?,
         stdout: duplicate_into(target_process, stdout)?,
         stderr: duplicate_into(target_process, stderr)?,
         start_event: duplicate_into(target_process, start_event)?,
@@ -1421,6 +1507,7 @@ fn guardian_main_inner(bootstrap_path: &Path, handoff_path: &Path, expected_nonc
     let git_result = launch_git_inside_job(
         &mut resources.job,
         &config,
+        command.stdin.as_ref().map(OwnedHandle::raw),
         command.stdout.raw(),
         command.stderr.raw(),
         handles.parent.raw(),
@@ -1608,12 +1695,21 @@ fn wait_for_command_handoff(
 fn launch_git_inside_job(
     job: &mut Job,
     config: &GuardianConfig,
+    stdin: Option<HANDLE>,
     stdout: HANDLE,
     stderr: HANDLE,
     parent: HANDLE,
 ) -> io::Result<u32> {
-    let stdin = create_nul()?;
-    let stdin_handle = duplicate_in_process(stdin.raw(), true)?;
+    let nul = stdin.is_none().then(create_nul).transpose()?;
+    let stdin_handle = match stdin {
+        Some(handle) => duplicate_in_process(handle, true)?,
+        None => duplicate_in_process(
+            nul.as_ref()
+                .expect("NUL stdin exists when lifecycle input is absent")
+                .raw(),
+            true,
+        )?,
+    };
     let stdout_handle = match duplicate_in_process(stdout, true) {
         Ok(handle) => handle,
         Err(error) => {
@@ -1694,7 +1790,7 @@ fn launch_git_inside_job(
         )
     } != 0;
     close_handles(&inherited);
-    drop(stdin);
+    drop(nul);
     if !created {
         return Err(last_error());
     }
@@ -1780,6 +1876,7 @@ impl GuardianOwnedHandles {
 }
 
 struct GuardianOwnedCommandHandles {
+    stdin: Option<OwnedHandle>,
     stdout: OwnedHandle,
     stderr: OwnedHandle,
     start: OwnedHandle,
@@ -1789,6 +1886,7 @@ struct GuardianOwnedCommandHandles {
 impl GuardianOwnedCommandHandles {
     fn new(handles: GuardianCommandHandles) -> Self {
         Self {
+            stdin: handles.stdin.map(OwnedHandle::new),
             stdout: OwnedHandle::new(handles.stdout),
             stderr: OwnedHandle::new(handles.stderr),
             start: OwnedHandle::new(handles.start_event),
@@ -2172,15 +2270,29 @@ impl Pipe {
 }
 
 struct StdioHandles {
+    stdin: Option<Pipe>,
     stdout: Pipe,
     stderr: Pipe,
 }
 
 impl StdioHandles {
-    fn new() -> io::Result<Self> {
+    fn new(with_stdin: bool) -> io::Result<Self> {
         Ok(Self {
+            stdin: with_stdin.then(Pipe::new).transpose()?,
             stdout: Pipe::new()?,
             stderr: Pipe::new()?,
+        })
+    }
+
+    fn take_stdin_write(&mut self) -> Option<File> {
+        let stdin = self.stdin.as_mut()?;
+        drop(stdin.read.take());
+        let write = std::mem::replace(&mut stdin.write, OwnedHandle(std::ptr::null_mut()));
+        let raw = write.raw();
+        std::mem::forget(write);
+        Some(unsafe {
+            // SAFETY: raw is the one stdin write handle removed from OwnedHandle.
+            File::from_raw_handle(raw)
         })
     }
 
@@ -2475,6 +2587,44 @@ mod tests {
         assert_eq!(failed.stdout, b"");
         assert_eq!(failed.stderr, b"");
         let lock = open_child_lock(&lock_path).expect("child lock remains");
+        assert!(crate::operation_state::try_lock_exclusive(&lock).expect("child lock probe"));
+    }
+
+    #[test]
+    fn lifecycle_guardian_supports_repeated_commands_with_transaction_stdin() {
+        let repository = tempfile::tempdir().expect("temporary repository");
+        let cwd = repository.path().join("repeated");
+        fs::create_dir(&cwd).expect("repeated Git cwd");
+        assert!(std::process::Command::new("git")
+            .args(["init", "--initial-branch=main"])
+            .current_dir(&cwd)
+            .status()
+            .expect("git init")
+            .success());
+
+        let lock_path = repository.path().join("merge-operation.lock");
+        fs::File::create(&lock_path).expect("child lock file");
+        let environment = crate::git::sanitized_git_environment();
+        for _ in 0..3 {
+            let output = output_git(
+                &lock_path,
+                &["rev-parse", "--is-inside-work-tree"],
+                &cwd,
+                &environment,
+            )
+            .expect("repeated contained Git invocation");
+            assert!(output.status.success());
+        }
+        let transaction = output_git_with_stdin(
+            &lock_path,
+            &["update-ref", "--stdin"],
+            &cwd,
+            &environment,
+            b"start\ncommit\n",
+        )
+        .expect("contained ref transaction should run after repeated commands");
+        assert!(transaction.status.success());
+        let lock = open_child_lock(&lock_path).expect("child lock remains reusable");
         assert!(crate::operation_state::try_lock_exclusive(&lock).expect("child lock probe"));
     }
 }

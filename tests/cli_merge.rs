@@ -798,6 +798,225 @@ fn merge_lifecycle_lock_recovers_after_owner_death_without_stale_finalization() 
     assert!(!source.exists());
 }
 
+#[cfg(any(unix, windows))]
+#[test]
+fn merge_cleanup_worktree_remove_retains_lifecycle_lease_after_owner_death() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/remove-child-lease");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let shim = install_blocking_git_shim(&repo, BlockingGitMutation::WorktreeRemove, false);
+    let mut owner = shim.command(["merge", "--continue", "--repo", &repo_str]);
+    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut owner = owner.spawn().expect("cleanup owner should start");
+    wait_for_file(&shim.entered);
+    owner.kill().expect("cleanup owner should be terminable");
+
+    assert_lifecycle_busy(&repo_str);
+    assert_lifecycle_busy_for(&shim, ["merge", "--continue", "--repo", &repo_str]);
+    assert_lifecycle_busy_for(&shim, ["merge", "--abort", "--repo", &repo_str]);
+
+    std::fs::write(&shim.release, "release\n").expect("release worktree removal");
+    let _ = owner.wait_with_output();
+    wait_for_lifecycle_idle(&repo_str);
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!source.exists(), "recovery should finish source cleanup");
+    assert_branch_deleted(&repo.path(), "feature/remove-child-lease");
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn merge_cleanup_ref_mutation_retains_lease_and_recovers_failure() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/ref-child-lease");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let shim = install_blocking_git_shim(&repo, BlockingGitMutation::UpdateRef, true);
+    let mut owner = shim.command(["merge", "--continue", "--repo", &repo_str]);
+    owner.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut owner = owner.spawn().expect("ref cleanup owner should start");
+    wait_for_file(&shim.entered);
+    owner
+        .kill()
+        .expect("ref cleanup owner should be terminable");
+
+    assert_lifecycle_busy(&repo_str);
+    assert_lifecycle_busy_for(&shim, ["merge", "--continue", "--repo", &repo_str]);
+    assert_lifecycle_busy_for(&shim, ["merge", "--abort", "--repo", &repo_str]);
+
+    std::fs::write(&shim.release, "release\n").expect("release ref mutation");
+    let _ = owner.wait_with_output();
+    wait_for_lifecycle_idle(&repo_str);
+
+    // The blocked writer is allowed to fail after the owner dies. Recovery
+    // must retry the recorded cleanup with a fresh contained child only after
+    // the stale child has exited.
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(!source.exists(), "recovery should finish source cleanup");
+    assert_branch_deleted(&repo.path(), "feature/ref-child-lease");
+}
+
+#[cfg(any(unix, windows))]
+fn assert_lifecycle_busy(repo: &str) {
+    let output = wt_core()
+        .args(["merge", "--status", "--json", "--repo", repo])
+        .output()
+        .expect("status should run while cleanup Git is blocked");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("\"state\":\"busy\""),
+        "status must report the contained cleanup child as busy: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn assert_lifecycle_busy_for<const N: usize>(shim: &GitMutationShim, args: [&str; N]) {
+    let output = shim
+        .command(args)
+        .output()
+        .expect("cooperating lifecycle command should run");
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("busy"),
+        "cooperating lifecycle command must remain busy: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(any(unix, windows))]
+fn wait_for_lifecycle_idle(repo: &str) {
+    use std::thread::sleep;
+    use std::time::{Duration, Instant};
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let output = wt_core()
+            .args(["merge", "--status", "--json", "--repo", repo])
+            .output()
+            .expect("status should run while waiting for cleanup child");
+        if !String::from_utf8_lossy(&output.stdout).contains("\"state\":\"busy\"") {
+            return;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    panic!("contained cleanup Git child did not release the lifecycle lease");
+}
+
+#[cfg(any(unix, windows))]
+#[derive(Clone, Copy)]
+enum BlockingGitMutation {
+    WorktreeRemove,
+    UpdateRef,
+}
+
+#[cfg(any(unix, windows))]
+struct GitMutationShim {
+    _directory: tempfile::TempDir,
+    real_git: std::path::PathBuf,
+    path: std::ffi::OsString,
+    entered: std::path::PathBuf,
+    release: std::path::PathBuf,
+}
+
+#[cfg(any(unix, windows))]
+impl GitMutationShim {
+    fn command<const N: usize>(&self, args: [&str; N]) -> StdCommand {
+        let mut command = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+        command
+            .args(args)
+            .env("PATH", &self.path)
+            .env("WT_REAL_GIT", &self.real_git);
+        command
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn install_blocking_git_shim(
+    _repo: &fixtures::TestRepo,
+    mutation: BlockingGitMutation,
+    fail_after_release: bool,
+) -> GitMutationShim {
+    let directory = tempfile::tempdir().expect("Git shim directory");
+    let entered = directory.path().join("entered");
+    let release = directory.path().join("release");
+    let original_path = std::env::var_os("PATH").expect("PATH");
+    let real_git = std::env::split_paths(&original_path)
+        .map(|component| {
+            #[cfg(windows)]
+            {
+                component.join("git.exe")
+            }
+            #[cfg(unix)]
+            {
+                component.join("git")
+            }
+        })
+        .find(|candidate| candidate.is_file())
+        .expect("real git executable");
+    let mut paths = vec![directory.path().to_path_buf()];
+    paths.extend(std::env::split_paths(&original_path));
+    let path = std::env::join_paths(paths).expect("shim PATH");
+    let block = match mutation {
+        BlockingGitMutation::WorktreeRemove => "worktree_remove",
+        BlockingGitMutation::UpdateRef => "update_ref",
+    };
+
+    #[cfg(unix)]
+    let script_path = directory.path().join("git");
+    #[cfg(windows)]
+    let script_path = directory.path().join("git.cmd");
+    #[cfg(unix)]
+    let script = format!(
+        "#!/bin/sh\nset -eu\nblock=0\nif [ \"{block}\" = worktree_remove ] && [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then block=1; fi\nif [ \"{block}\" = update_ref ] && [ \"$1\" = update-ref ] && [ \"$2\" = --stdin ]; then block=1; fi\nif [ \"$block\" = 1 ]; then printf entered > {entered}; while [ ! -f {release} ]; do sleep 0.05; done; fi\nif [ \"{fail}\" = 1 ] && [ \"$block\" = 1 ]; then exit 42; fi\nexec \"$WT_REAL_GIT\" \"$@\"\n",
+        block = block,
+        fail = if fail_after_release { 1 } else { 0 },
+        entered = shell_quote(&entered.display().to_string()),
+        release = shell_quote(&release.display().to_string()),
+    );
+    #[cfg(windows)]
+    let script = format!(
+        "@echo off\r\nset block=0\r\nif \"{block}\"==\"worktree_remove\" if \"%~1\"==\"worktree\" if \"%~2\"==\"remove\" set block=1\r\nif \"{block}\"==\"update_ref\" if \"%~1\"==\"update-ref\" if \"%~2\"==\"--stdin\" set block=1\r\nif \"%block%\"==\"1\" (echo entered>{entered}\r\n:wait\r\nif exist {release} goto done\r\ntimeout /t 1 /nobreak >nul\r\ngoto wait\r\n:done\r\n)\r\nif \"{fail}\"==\"1\" if \"%block%\"==\"1\" exit /b 42\r\n\"%WT_REAL_GIT%\" %*\r\n",
+        block = block,
+        fail = if fail_after_release { 1 } else { 0 },
+        entered = windows_quote(&entered),
+        release = windows_quote(&release),
+    );
+    std::fs::write(&script_path, script).expect("write Git shim");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&script_path)
+            .expect("Git shim metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script_path, permissions).expect("chmod Git shim");
+    }
+
+    GitMutationShim {
+        _directory: directory,
+        real_git,
+        path,
+        entered,
+        release,
+    }
+}
+
+#[cfg(windows)]
+fn windows_quote(path: &std::path::Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('"', "\"\""))
+}
+
 #[cfg(windows)]
 #[test]
 fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immediately() {
