@@ -30,13 +30,14 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CreateWellKnownSid, EqualSid,
-    GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
+    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CheckTokenMembership, CreateWellKnownSid,
+    EqualSid, GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
     GetTokenInformation, InitializeAcl, IsValidSid, MapGenericMask, TokenUser,
     WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
     ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERITED_ACE,
     OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
-    SECURITY_ATTRIBUTES, SE_DACL_DEFAULTED, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    SECURITY_ATTRIBUTES, SE_DACL_DEFAULTED, SE_DACL_PROTECTED, TOKEN_DUPLICATE, TOKEN_QUERY,
+    TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
@@ -1517,11 +1518,15 @@ fn file_generic_mapping() -> GENERIC_MAPPING {
 }
 
 fn current_process_token() -> io::Result<HANDLE> {
+    current_process_token_with_access(TOKEN_QUERY)
+}
+
+fn current_process_token_with_access(desired_access: u32) -> io::Result<HANDLE> {
     let mut token = std::ptr::null_mut();
     if unsafe {
         windows_sys::Win32::System::Threading::OpenProcessToken(
             GetCurrentProcess(),
-            TOKEN_QUERY,
+            desired_access,
             &mut token,
         )
     } == 0
@@ -2876,43 +2881,67 @@ mod tests {
     }
 
     fn restricted_test_token() -> io::Result<HANDLE> {
-        // Disable the Administrators SID as well as all privileges. The
-        // restricted SID forces AccessCheck's second restricted-token pass,
-        // so this remains an effective non-admin token even when CI runs as a
-        // local administrator and no second local account is available.
+        // CreateRestrictedToken requires TOKEN_DUPLICATE on the source token;
+        // TOKEN_QUERY is needed to check whether Administrators is an enabled
+        // source-token membership. The restricted SID is always included, so
+        // the resulting token still fails the second AccessCheck pass even
+        // when the current account is a genuine non-admin account or has a
+        // filtered Administrators membership.
         let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
         let restricted_code = well_known_sid(WinRestrictedCodeSid)?;
-        let disabled_sid = [SID_AND_ATTRIBUTES {
-            Sid: administrators.as_ptr().cast_mut().cast(),
-            Attributes: 0,
-        }];
-        let restricted_sid = [SID_AND_ATTRIBUTES {
-            Sid: restricted_code.as_ptr().cast_mut().cast(),
-            Attributes: 0,
-        }];
-        let source = current_process_token()?;
-        let mut token = std::ptr::null_mut();
-        let result = unsafe {
-            CreateRestrictedToken(
-                source,
-                DISABLE_MAX_PRIVILEGE,
-                disabled_sid.len() as u32,
-                disabled_sid.as_ptr(),
-                0,
-                std::ptr::null(),
-                restricted_sid.len() as u32,
-                restricted_sid.as_ptr(),
-                &mut token,
-            )
-        };
+        let source = current_process_token_with_access(TOKEN_DUPLICATE | TOKEN_QUERY)?;
+        let result = (|| {
+            let mut is_member = 0;
+            if unsafe {
+                CheckTokenMembership(
+                    source,
+                    administrators.as_ptr().cast_mut().cast(),
+                    &mut is_member,
+                )
+            } == 0
+            {
+                return Err(last_error());
+            }
+            let disabled_sids = if is_member != 0 {
+                vec![SID_AND_ATTRIBUTES {
+                    Sid: administrators.as_ptr().cast_mut().cast(),
+                    Attributes: 0,
+                }]
+            } else {
+                Vec::new()
+            };
+            let restricted_sid = [SID_AND_ATTRIBUTES {
+                Sid: restricted_code.as_ptr().cast_mut().cast(),
+                Attributes: 0,
+            }];
+            let mut token = std::ptr::null_mut();
+            let result = unsafe {
+                CreateRestrictedToken(
+                    source,
+                    DISABLE_MAX_PRIVILEGE,
+                    disabled_sids.len() as u32,
+                    if disabled_sids.is_empty() {
+                        std::ptr::null()
+                    } else {
+                        disabled_sids.as_ptr()
+                    },
+                    0,
+                    std::ptr::null(),
+                    restricted_sid.len() as u32,
+                    restricted_sid.as_ptr(),
+                    &mut token,
+                )
+            };
+            if result == 0 {
+                Err(last_error())
+            } else {
+                Ok(token)
+            }
+        })();
         unsafe {
             CloseHandle(source);
         }
-        if result == 0 {
-            Err(last_error())
-        } else {
-            Ok(token)
-        }
+        result
     }
 
     fn access_check_object_for(
