@@ -30,13 +30,13 @@ use windows_sys::Win32::Security::Authorization::{
     GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CreateWellKnownSid, EqualSid, GetAce,
+    AccessCheck, AclSizeInformation, AddAccessAllowedAce, CreateWellKnownSid, EqualSid,
     GetAclInformation, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
-    GetTokenInformation, InitializeAcl, IsValidSid, IsWellKnownSid, MapGenericMask, TokenUser,
+    GetTokenInformation, InitializeAcl, IsValidSid, MapGenericMask, TokenUser,
     WinBuiltinAdministratorsSid, WinLocalSystemSid, ACCESS_ALLOWED_ACE, ACL, ACL_REVISION,
     ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, GENERIC_MAPPING, INHERITED_ACE,
     OWNER_SECURITY_INFORMATION, PRIVILEGE_SET, PROTECTED_DACL_SECURITY_INFORMATION,
-    SECURITY_ATTRIBUTES, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
+    SECURITY_ATTRIBUTES, SE_DACL_DEFAULTED, SE_DACL_PROTECTED, TOKEN_QUERY, TOKEN_USER,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
@@ -462,12 +462,17 @@ struct ProtocolFile;
 impl ProtocolFile {
     fn write_new(path: &Path, contents: Vec<u8>) -> io::Result<()> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-        if let Err(error) = ensure_protocol_file_private(path) {
+        if let Err(error) = protect_private_file_windows(path) {
+            drop(file);
             let _ = fs::remove_file(path);
             return Err(error);
         }
-        file.write_all(&contents)?;
-        file.sync_all()
+        if let Err(error) = file.write_all(&contents).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn write_atomic(path: &Path, contents: Vec<u8>) -> io::Result<()> {
@@ -476,12 +481,30 @@ impl ProtocolFile {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
-        if let Err(error) = ensure_protocol_file_private(&temporary) {
+        if let Err(error) = protect_private_file_windows(&temporary) {
+            drop(file);
             let _ = fs::remove_file(&temporary);
             return Err(error);
         }
-        file.write_all(&contents)?;
-        file.sync_all()?;
+        if let Err(error) = file.write_all(&contents).and_then(|_| file.sync_all()) {
+            drop(file);
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        drop(file);
+        match fs::symlink_metadata(path) {
+            Ok(_) => {
+                if let Err(error) = ensure_protocol_file_private(path) {
+                    let _ = fs::remove_file(&temporary);
+                    return Err(error);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                return Err(error);
+            }
+        }
         if let Err(error) = replace_protocol_file(&temporary, path) {
             let _ = fs::remove_file(&temporary);
             return Err(error);
@@ -1044,11 +1067,34 @@ pub(crate) fn ensure_private_directory_windows(path: &Path) -> io::Result<()> {
             "guardian protocol directory is not a private directory",
         ));
     }
-    ensure_windows_owner_only(path)
+    let owner_sid = current_user_sid()?;
+    validate_private_windows_acl(path, &owner_sid)
+}
+
+pub(crate) fn protect_private_directory_windows(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian protocol directory is not a private directory",
+        ));
+    }
+    apply_private_windows_acl(path)
 }
 
 pub(crate) fn ensure_private_file_windows(path: &Path) -> io::Result<()> {
     ensure_protocol_file_private(path)
+}
+
+pub(crate) fn protect_private_file_windows(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian protocol file is not a private regular file",
+        ));
+    }
+    apply_private_windows_acl(path)
 }
 
 fn ensure_protocol_file_private(path: &Path) -> io::Result<()> {
@@ -1059,20 +1105,21 @@ fn ensure_protocol_file_private(path: &Path) -> io::Result<()> {
             "guardian protocol file is not a private regular file",
         ));
     }
-    ensure_windows_owner_only(path)
+    let owner_sid = current_user_sid()?;
+    validate_private_windows_acl(path, &owner_sid)
 }
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
 const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const PRIVATE_ACE_FLAGS: u8 = 0;
 const PRIVATE_ACCESS: u32 = FILE_ALL_ACCESS;
+const SID_HEADER_SIZE: usize = 8;
+const SID_MAX_SUB_AUTHORITIES: usize = 15;
 
-/// Apply the private lifecycle policy and then inspect the descriptor Windows
-/// actually installed.  The explicit DACL contains only the owner and the two
-/// machine principals that are safe for local lifecycle state: SYSTEM and the
-/// built-in Administrators group.  It is protected so an inherited ACE from a
-/// runner's temp directory cannot silently widen the policy.
-fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
+/// Apply the private lifecycle policy to a newly-created object. Existing
+/// objects must go through `validate_private_windows_acl` instead: changing
+/// their owner or DACL would turn tampering into an apparent repair.
+fn apply_private_windows_acl(path: &Path) -> io::Result<()> {
     use std::ptr::null_mut;
 
     let owner_sid = current_user_sid()?;
@@ -1095,19 +1142,26 @@ fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(error as i32));
     }
 
-    inspect_private_windows_acl(path, &owner_sid)
+    validate_private_windows_acl(path, &owner_sid)
 }
 
-fn private_acl(owner_sid: &[u8]) -> io::Result<Vec<u8>> {
+/// The local SYSTEM account and built-in Administrators group are trusted
+/// recovery principals, not arbitrary access. Validation requires exactly one
+/// full-access allow ACE for each distinct trustee, independent of ACE order.
+fn private_trustees(owner_sid: &[u8]) -> io::Result<Vec<Vec<u8>>> {
     let system_sid = well_known_sid(WinLocalSystemSid)?;
     let administrators_sid = well_known_sid(WinBuiltinAdministratorsSid)?;
-    let mut trustees: Vec<&[u8]> = Vec::with_capacity(3);
-    for sid in [&system_sid[..], &administrators_sid[..], owner_sid] {
-        if !trustees.iter().any(|existing| sid_equal(existing, sid)) {
+    let mut trustees: Vec<Vec<u8>> = Vec::with_capacity(3);
+    for sid in [system_sid, administrators_sid, owner_sid.to_vec()] {
+        if !trustees.iter().any(|existing| sid_equal(existing, &sid)) {
             trustees.push(sid);
         }
     }
+    Ok(trustees)
+}
 
+fn private_acl(owner_sid: &[u8]) -> io::Result<Vec<u8>> {
+    let trustees = private_trustees(owner_sid)?;
     let acl_size = size_of::<ACL>()
         + trustees
             .iter()
@@ -1117,7 +1171,7 @@ fn private_acl(owner_sid: &[u8]) -> io::Result<Vec<u8>> {
     if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl.len() as u32, ACL_REVISION) } == 0 {
         return Err(last_error());
     }
-    for sid in trustees {
+    for sid in &trustees {
         if unsafe {
             AddAccessAllowedAce(
                 acl.as_mut_ptr().cast(),
@@ -1169,8 +1223,8 @@ fn sid_matches_pointer(pointer: windows_sys::Win32::Security::PSID, expected: &[
         && unsafe { EqualSid(pointer, expected.as_ptr().cast_mut().cast()) } != 0
 }
 
-fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> {
-    use std::ptr::null_mut;
+fn validate_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> {
+    use std::ptr::{null_mut, read_unaligned};
     use windows_sys::Win32::Security::ACE_HEADER;
 
     let wide = wide_path(path.as_os_str())?;
@@ -1194,7 +1248,8 @@ fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> 
     }
 
     let result = (|| {
-        if owner.is_null()
+        if descriptor.is_null()
+            || owner.is_null()
             || unsafe { IsValidSid(owner) } == 0
             || !sid_matches_pointer(owner, owner_sid)
         {
@@ -1228,6 +1283,12 @@ fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> 
                 "guardian protocol has no explicit DACL",
             ));
         }
+        if defaulted != 0 || control & SE_DACL_DEFAULTED != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol DACL is defaulted",
+            ));
+        }
 
         let mut size = ACL_SIZE_INFORMATION::default();
         if unsafe {
@@ -1242,17 +1303,83 @@ fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> 
             return Err(last_error());
         }
 
-        let mut owner_allow = false;
-        for index in 0..size.AceCount {
-            let mut ace = null_mut();
-            if unsafe { GetAce(dacl, index, &mut ace) } == 0 || ace.is_null() {
-                return Err(last_error());
-            }
-            let header = unsafe { &*(ace as *const ACE_HEADER) };
-            if header.AceSize < size_of::<ACCESS_ALLOWED_ACE>() as u16 {
+        // GetAclInformation supplies the bytes-in-use bound, while AclSize is
+        // the allocation bound in the ACL header. Validate both before taking
+        // an ACE pointer or reading any ACE/SID field.
+        let acl_header = unsafe { read_unaligned(dacl.cast::<ACL>()) };
+        let acl_size = acl_header.AclSize as usize;
+        let bytes_in_use = size.AclBytesInUse as usize;
+        let bytes_free = size.AclBytesFree as usize;
+        if acl_size < size_of::<ACL>()
+            || bytes_in_use < size_of::<ACL>()
+            || bytes_in_use > acl_size
+            || bytes_free != acl_size - bytes_in_use
+            || size.AceCount != acl_header.AceCount as u32
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol DACL has inconsistent size information",
+            ));
+        }
+
+        let trustees = private_trustees(owner_sid)?;
+        let mut seen = vec![false; trustees.len()];
+        let acl_start = dacl.cast::<u8>() as usize;
+        let acl_end = acl_start.checked_add(bytes_in_use).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol DACL address range overflowed",
+            )
+        })?;
+        let mut cursor = size_of::<ACL>();
+        for _ in 0..size.AceCount {
+            let remaining = bytes_in_use.checked_sub(cursor).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL ACE cursor exceeded bytes in use",
+                )
+            })?;
+            if remaining < size_of::<ACE_HEADER>() {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "guardian protocol DACL contains a truncated ACE",
+                    "guardian protocol DACL has a truncated ACE header",
+                ));
+            }
+
+            // Read the ACE directly from the checked cursor instead of
+            // trusting an untrusted AceCount/size chain.
+            let ace = unsafe { dacl.cast::<u8>().add(cursor) };
+            let ace_start = ace as usize;
+            let ace_offset = ace_start.checked_sub(acl_start).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL ACE points before its ACL",
+                )
+            })?;
+            if ace_start < acl_start
+                || ace_start > acl_end
+                || ace_offset != cursor
+                || ace_offset.checked_add(size_of::<ACE_HEADER>()).is_none()
+                || ace_offset + size_of::<ACE_HEADER>() > acl_end
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL ACE is outside its ACL bounds",
+                ));
+            }
+
+            // The header is read only after the cursor and bytes-in-use checks.
+            // read_unaligned avoids making an alignment assumption about the
+            // ACL buffer's raw ACE address.
+            let header = unsafe { read_unaligned(ace.cast::<ACE_HEADER>()) };
+            let ace_size = header.AceSize as usize;
+            if ace_size < size_of::<ACCESS_ALLOWED_ACE>()
+                || ace_size % size_of::<u32>() != 0
+                || ace_size > remaining
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains a truncated or oversized ACE",
                 ));
             }
             if header.AceFlags & INHERITED_ACE as u8 != 0 {
@@ -1276,54 +1403,73 @@ fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> 
                 ));
             }
 
-            let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
-            let sid = unsafe {
-                (ace as *const u8)
-                    .add(size_of::<ACE_HEADER>() + size_of::<u32>())
-                    .cast_mut()
-            };
+            let allowed = unsafe { read_unaligned(ace.cast::<ACCESS_ALLOWED_ACE>()) };
+            let sid_offset = size_of::<ACE_HEADER>() + size_of::<u32>();
+            let sid_available = ace_size - sid_offset;
+            let sid = unsafe { ace.cast::<u8>().add(sid_offset) };
+            let sid_length = bounded_sid_length(sid, sid_available).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains a truncated or invalid trustee SID",
+                )
+            })?;
             if unsafe { IsValidSid(sid.cast()) } == 0 {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "guardian protocol DACL contains an invalid trustee SID",
                 ));
             }
-            let sid_length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid.cast()) };
-            if sid_length as usize
-                > header.AceSize as usize - size_of::<ACE_HEADER>() - size_of::<u32>()
+            let reported_sid_length =
+                unsafe { windows_sys::Win32::Security::GetLengthSid(sid.cast()) } as usize;
+            if reported_sid_length != sid_length
+                || sid_offset.checked_add(sid_length) != Some(ace_size)
             {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "guardian protocol DACL contains a truncated trustee SID",
-                ));
-            }
-            let trusted = sid_matches_pointer(sid.cast(), owner_sid)
-                || unsafe { IsWellKnownSid(sid.cast(), WinLocalSystemSid) } != 0
-                || unsafe { IsWellKnownSid(sid.cast(), WinBuiltinAdministratorsSid) } != 0;
-            if !trusted {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "guardian protocol DACL contains an untrusted trustee",
+                    "guardian protocol DACL trustee SID length is inconsistent",
                 ));
             }
 
+            let trustee_index = trustees
+                .iter()
+                .position(|expected| sid_matches_pointer(sid.cast(), expected))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "guardian protocol DACL contains an untrusted trustee",
+                    )
+                })?;
+            if seen[trustee_index] {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL contains a duplicate trustee",
+                ));
+            }
+            seen[trustee_index] = true;
+
+            // Windows canonicalizes ACE order. Compare trustees as a set, but
+            // compare the post-generic-mapping mask exactly so extra rights such
+            // as MAXIMUM_ALLOWED or ACCESS_SYSTEM_SECURITY are not accepted.
             let mut mask = allowed.Mask;
             let mapping = file_generic_mapping();
             unsafe { MapGenericMask(&mut mask, &mapping) };
-            if mask & PRIVATE_ACCESS != PRIVATE_ACCESS {
+            if mask != PRIVATE_ACCESS {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "guardian protocol DACL does not grant required rights",
+                    "guardian protocol DACL contains unexpected access rights",
                 ));
             }
-            if sid_matches_pointer(sid.cast(), owner_sid) {
-                owner_allow = true;
-            }
+            cursor = cursor.checked_add(ace_size).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "guardian protocol DACL ACE cursor overflowed",
+                )
+            })?;
         }
-        if !owner_allow {
+        if cursor != bytes_in_use || seen.iter().any(|present| !present) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "guardian protocol DACL does not grant rights to the owner",
+                "guardian protocol DACL does not exactly match its private policy",
             ));
         }
 
@@ -1345,6 +1491,20 @@ fn inspect_private_windows_acl(path: &Path, owner_sid: &[u8]) -> io::Result<()> 
         LocalFree(descriptor);
     }
     result
+}
+
+fn bounded_sid_length(sid: *const u8, available: usize) -> Option<usize> {
+    if available < SID_HEADER_SIZE {
+        return None;
+    }
+    let revision = unsafe { *sid };
+    let subauthority_count = unsafe { *sid.add(1) } as usize;
+    if revision != 1 || subauthority_count > SID_MAX_SUB_AUTHORITIES {
+        return None;
+    }
+    SID_HEADER_SIZE
+        .checked_add(subauthority_count.checked_mul(size_of::<u32>())?)
+        .filter(|length| *length <= available)
 }
 
 fn file_generic_mapping() -> GENERIC_MAPPING {
@@ -1449,7 +1609,13 @@ fn current_user_sid() -> io::Result<Vec<u8>> {
     unsafe {
         CloseHandle(token);
     }
-    let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    if needed as usize > buffer.len() || buffer.len() < size_of::<TOKEN_USER>() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current user token information is truncated",
+        ));
+    }
+    let user = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<TOKEN_USER>()) };
     let sid = user.User.Sid;
     if sid.is_null() {
         return Err(io::Error::new(
@@ -1457,13 +1623,51 @@ fn current_user_sid() -> io::Result<Vec<u8>> {
             "current user has no SID",
         ));
     }
+    let buffer_start = buffer.as_ptr() as usize;
+    let buffer_end = buffer_start.checked_add(needed as usize).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current user token information address range overflowed",
+        )
+    })?;
+    let sid_start = sid as usize;
+    let sid_offset = sid_start.checked_sub(buffer_start).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current user SID points outside token information",
+        )
+    })?;
+    let sid_available = buffer_end.checked_sub(sid_start).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current user SID points outside token information",
+        )
+    })?;
+    if sid_start < buffer_start || sid_start > buffer_end || sid_offset > needed as usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "current user SID points outside token information",
+        ));
+    }
+    let length = bounded_sid_length(sid.cast(), sid_available).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "current user has an invalid or truncated SID",
+        )
+    })?;
     if unsafe { IsValidSid(sid) } == 0 {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "current user has an invalid SID",
         ));
     }
-    let length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid) } as usize;
+    let reported_length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid) } as usize;
+    if reported_length != length {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "current user SID length is inconsistent",
+        ));
+    }
     let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) };
     Ok(bytes.to_vec())
 }
@@ -2636,7 +2840,11 @@ fn exit_status_from_raw(code: u32) -> std::process::ExitStatus {
 mod tests {
     use super::*;
     use windows_sys::Win32::Security::{
-        CreateRestrictedToken, WinRestrictedCodeSid, DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
+        CreateRestrictedToken, ImpersonateLoggedOnUser, RevertToSelf, WinRestrictedCodeSid,
+        DISABLE_MAX_PRIVILEGE, SID_AND_ATTRIBUTES,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        DeleteFileW, WriteFile, DELETE, FILE_SHARE_DELETE, FILE_WRITE_DATA, WRITE_DAC, WRITE_OWNER,
     };
     use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 
@@ -2668,10 +2876,16 @@ mod tests {
     }
 
     fn restricted_test_token() -> io::Result<HANDLE> {
-        // A restricted token must pass a second access check for its restricted
-        // SID. The private ACL intentionally has no such ACE, so this proves
-        // effective denial without depending on another local account.
+        // Disable the Administrators SID as well as all privileges. The
+        // restricted SID forces AccessCheck's second restricted-token pass,
+        // so this remains an effective non-admin token even when CI runs as a
+        // local administrator and no second local account is available.
+        let administrators = well_known_sid(WinBuiltinAdministratorsSid)?;
         let restricted_code = well_known_sid(WinRestrictedCodeSid)?;
+        let disabled_sid = [SID_AND_ATTRIBUTES {
+            Sid: administrators.as_ptr().cast_mut().cast(),
+            Attributes: 0,
+        }];
         let restricted_sid = [SID_AND_ATTRIBUTES {
             Sid: restricted_code.as_ptr().cast_mut().cast(),
             Attributes: 0,
@@ -2682,8 +2896,8 @@ mod tests {
             CreateRestrictedToken(
                 source,
                 DISABLE_MAX_PRIVILEGE,
-                0,
-                std::ptr::null(),
+                disabled_sid.len() as u32,
+                disabled_sid.as_ptr(),
                 0,
                 std::ptr::null(),
                 restricted_sid.len() as u32,
@@ -2701,6 +2915,130 @@ mod tests {
         }
     }
 
+    fn access_check_object_for(
+        path: &Path,
+        token: HANDLE,
+        desired_access: u32,
+    ) -> io::Result<bool> {
+        use std::ptr::null_mut;
+
+        let wide = wide_path(path.as_os_str())?;
+        let mut descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = null_mut();
+        let error = unsafe {
+            GetNamedSecurityInfoW(
+                wide.as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                null_mut(),
+                &mut descriptor,
+            )
+        };
+        if error != 0 {
+            return Err(io::Error::from_raw_os_error(error as i32));
+        }
+        let result = access_check(descriptor, token, desired_access);
+        unsafe {
+            LocalFree(descriptor);
+        }
+        result
+    }
+
+    fn impersonate<T>(token: HANDLE, operation: impl FnOnce() -> io::Result<T>) -> io::Result<T> {
+        if unsafe { ImpersonateLoggedOnUser(token) } == 0 {
+            return Err(last_error());
+        }
+        let result = operation();
+        let revert = unsafe { RevertToSelf() } != 0;
+        if !revert {
+            return Err(last_error());
+        }
+        result
+    }
+
+    fn restricted_open_succeeds(
+        path: &Path,
+        token: HANDLE,
+        desired_access: u32,
+    ) -> io::Result<bool> {
+        let wide = wide_path(path.as_os_str())?;
+        impersonate(token, || {
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    desired_access,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Ok(false);
+            }
+            unsafe {
+                CloseHandle(handle);
+            }
+            Ok(true)
+        })
+    }
+
+    fn restricted_write_succeeds(path: &Path, token: HANDLE) -> io::Result<bool> {
+        let wide = wide_path(path.as_os_str())?;
+        impersonate(token, || {
+            let handle = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_WRITE_DATA,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                return Ok(false);
+            }
+            let byte = b"x";
+            let mut written = 0;
+            let result = unsafe {
+                WriteFile(
+                    handle,
+                    byte.as_ptr(),
+                    byte.len() as u32,
+                    &mut written,
+                    std::ptr::null_mut(),
+                )
+            } != 0;
+            unsafe {
+                CloseHandle(handle);
+            }
+            Ok(result && written == byte.len() as u32)
+        })
+    }
+
+    fn restricted_delete_succeeds(path: &Path, token: HANDLE) -> io::Result<bool> {
+        let wide = wide_path(path.as_os_str())?;
+        impersonate(token, || Ok(unsafe { DeleteFileW(wide.as_ptr()) != 0 }))
+    }
+
+    #[test]
+    fn bounded_sid_length_rejects_truncation_and_oversized_counts() {
+        let valid = [1, 1, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0];
+        assert_eq!(bounded_sid_length(valid.as_ptr(), valid.len()), Some(12));
+        assert_eq!(bounded_sid_length(valid.as_ptr(), 11), None);
+
+        let oversized_count = [1, 16, 0, 0, 0, 0, 0, 5];
+        assert_eq!(
+            bounded_sid_length(oversized_count.as_ptr(), oversized_count.len()),
+            None
+        );
+    }
+
     #[test]
     fn protected_acl_allows_owner_and_denies_an_unauthorized_token() {
         let root = tempfile::tempdir().expect("temporary directory");
@@ -2708,11 +3046,11 @@ mod tests {
         fs::create_dir(&inherited_parent).expect("inherited parent");
         let directory = inherited_parent.join("private-directory");
         fs::create_dir(&directory).expect("private directory");
-        ensure_windows_owner_only(&directory).expect("protect directory ACL");
+        protect_private_directory_windows(&directory).expect("protect directory ACL");
 
         let file = directory.join("private-file");
         fs::write(&file, b"private").expect("private file");
-        ensure_windows_owner_only(&file).expect("protect file ACL");
+        protect_private_file_windows(&file).expect("protect file ACL");
 
         let owner = current_process_token().expect("owner token");
         let unauthorized = restricted_test_token().expect("restricted token");
@@ -2732,6 +3070,57 @@ mod tests {
             CloseHandle(unauthorized);
             CloseHandle(owner);
         }
+    }
+
+    #[test]
+    fn effective_non_admin_token_cannot_mutate_private_file() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let file = root.path().join("private-file");
+        fs::write(&file, b"private").expect("private file");
+        protect_private_file_windows(&file).expect("protect file ACL");
+
+        let unauthorized = restricted_test_token().expect("restricted token");
+        for right in [FILE_WRITE_DATA, DELETE, WRITE_DAC, WRITE_OWNER] {
+            assert!(
+                !access_check_object_for(&file, unauthorized, right)
+                    .expect("effective access check"),
+                "effective non-admin token unexpectedly has right {right:#x}"
+            );
+            assert!(
+                !restricted_open_succeeds(&file, unauthorized, right).expect("restricted open"),
+                "effective non-admin token unexpectedly opened with right {right:#x}"
+            );
+        }
+        assert!(
+            !restricted_write_succeeds(&file, unauthorized).expect("restricted write"),
+            "effective non-admin token unexpectedly wrote the private file"
+        );
+        assert!(
+            !restricted_delete_succeeds(&file, unauthorized).expect("restricted delete"),
+            "effective non-admin token unexpectedly deleted the private file"
+        );
+        assert!(file.exists(), "denied delete must leave the private file");
+        unsafe {
+            CloseHandle(unauthorized);
+        }
+    }
+
+    #[test]
+    fn existing_default_acl_is_rejected_without_repair() {
+        let root = tempfile::tempdir().expect("temporary directory");
+        let directory = root.path().join("existing-directory");
+        fs::create_dir(&directory).expect("existing directory");
+        assert!(
+            ensure_private_directory_windows(&directory).is_err(),
+            "an inherited existing directory must be rejected, not repaired"
+        );
+
+        let file = root.path().join("existing-file");
+        fs::write(&file, b"insecure").expect("existing file");
+        assert!(
+            ensure_private_file_windows(&file).is_err(),
+            "an inherited existing file must be rejected, not repaired"
+        );
     }
 
     #[test]
@@ -2832,6 +3221,7 @@ mod tests {
 
         let lock_path = repository.path().join("merge-operation.lock");
         fs::File::create(&lock_path).expect("child lease file");
+        protect_private_file_windows(&lock_path).expect("protect child lease file");
         let lock = open_child_lock(&lock_path).expect("child lock remains usable");
         assert!(crate::operation_state::try_lock_exclusive(&lock).expect("child lock probe"));
     }
@@ -2858,6 +3248,7 @@ mod tests {
 
         let lock_path = repository.path().join("merge-operation.lock");
         fs::File::create(&lock_path).expect("child lease file");
+        protect_private_file_windows(&lock_path).expect("protect child lease file");
         let exact_value = r#"значение with spaces \"and\" \\ trailing"#;
         let config = format!("wt.lifecycle={exact_value}");
         let mut environment = crate::git::sanitized_git_environment();
@@ -2936,6 +3327,7 @@ mod tests {
 
         let lock_path = repository.path().join("merge-operation.lock");
         fs::File::create(&lock_path).expect("child lock file");
+        protect_private_file_windows(&lock_path).expect("protect child lock file");
         let environment = crate::git::sanitized_git_environment();
         for _ in 0..3 {
             let output = output_git(

@@ -1597,26 +1597,64 @@ fn write_operation_state_inner(
     let mut file = options
         .open(&temp)
         .map_err(|error| AppError::git(format!("cannot write managed merge state: {error}")))?;
-    file.write_all(&bytes)
-        .and_then(|_| file.sync_all())
-        .map_err(|error| AppError::git(format!("cannot flush managed merge state: {error}")))?;
+    if let Err(error) = operation_state::protect_new_file(&temp) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    if let Err(error) = file.write_all(&bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(AppError::git(format!(
+            "cannot flush managed merge state: {error}"
+        )));
+    }
     drop(file);
+    if let Err(error) = operation_state::ensure_private_file(&temp) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
     match create_only {
-        true => match fs::hard_link(&temp, &path) {
-            Ok(()) => {
-                fs::remove_file(&temp).map_err(|error| {
-                    AppError::git(format!(
-                        "cannot remove temporary managed merge state: {error}"
-                    ))
-                })?;
+        true => {
+            // The temporary file is private before this link is attempted.
+            // Validate the installed name too: the journal must never be
+            // treated as secure merely because the hard link succeeded.
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    if let Err(error) = operation_state::ensure_private_file(&path) {
+                        let _ = fs::remove_file(&temp);
+                        return Err(error);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(AppError::git(format!(
+                        "cannot inspect managed merge state destination: {error}"
+                    )));
+                }
             }
-            Err(error) => {
-                let _ = fs::remove_file(&temp);
-                return Err(AppError::conflict(format!(
-                    "cannot claim managed merge state: {error}"
-                )));
+            match fs::hard_link(&temp, &path) {
+                Ok(()) => {
+                    if let Err(error) = operation_state::ensure_private_file(&path) {
+                        let _ = fs::remove_file(&path);
+                        let _ = fs::remove_file(&temp);
+                        return Err(error);
+                    }
+                    fs::remove_file(&temp).map_err(|error| {
+                        AppError::git(format!(
+                            "cannot remove temporary managed merge state: {error}"
+                        ))
+                    })?;
+                }
+                Err(error) => {
+                    let _ = fs::remove_file(&temp);
+                    return Err(AppError::conflict(format!(
+                        "cannot claim managed merge state: {error}"
+                    )));
+                }
             }
-        },
+        }
         false => {
             // Recheck immediately before replacement. The lifecycle lock is
             // the synchronization boundary, while this generation check makes
@@ -1635,6 +1673,10 @@ fn write_operation_state_inner(
                 let _ = fs::remove_file(&temp);
                 return Err(error);
             }
+            // MoveFileEx/rename is atomic, but the destination is still
+            // validated after installation before the new generation is
+            // considered durable.
+            operation_state::ensure_private_file(&path)?;
         }
     }
     sync_operation_parent(parent)?;

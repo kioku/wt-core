@@ -275,20 +275,22 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
     })?;
     ensure_private_directory(parent)?;
 
-    let mut options = fs::OpenOptions::new();
-    options.create(true).read(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options.open(path).map_err(|error| {
+    let (mut file, created) = open_or_create_private_lock(path).map_err(|error| {
         AppError::git(format!(
             "cannot open managed merge lifecycle lock '{}': {error}",
             path.display()
         ))
     })?;
-    ensure_private_file(path)?;
+    let protection = if created {
+        protect_new_file(path)
+    } else {
+        ensure_private_file(path)
+    };
+    if let Err(error) = protection {
+        drop(file);
+        let _ = created.then(|| fs::remove_file(path));
+        return Err(error);
+    }
 
     if !try_lock_exclusive(&file).map_err(|error| {
         AppError::git(format!(
@@ -307,17 +309,24 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
     }
 
     let child_lock_path = child_lock_path(path);
-    let child_file = open_child_lock(&child_lock_path).map_err(|error| {
+    let (child_file, child_created) = open_child_lock(&child_lock_path).map_err(|error| {
         release_parent_lock(&file);
         AppError::git(format!(
             "cannot open managed merge lifecycle child lock '{}': {error}",
             child_lock_path.display()
         ))
     })?;
-    ensure_private_file(&child_lock_path).map_err(|error| {
+    let child_protection = if child_created {
+        protect_new_file(&child_lock_path)
+    } else {
+        ensure_private_file(&child_lock_path)
+    };
+    if let Err(error) = child_protection {
+        drop(child_file);
+        let _ = child_created.then(|| fs::remove_file(&child_lock_path));
         release_parent_lock(&file);
-        error
-    })?;
+        return Err(error);
+    }
     let child_available = try_lock_exclusive(&child_file).map_err(|error| {
         release_parent_lock(&file);
         AppError::git(format!(
@@ -454,9 +463,9 @@ fn child_lock_path(path: &Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
-fn open_child_lock(path: &Path) -> io::Result<fs::File> {
+fn open_or_create_private_lock(path: &Path) -> io::Result<(fs::File, bool)> {
     let mut options = fs::OpenOptions::new();
-    options.create(true).read(true).write(true);
+    options.create_new(true).read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -465,7 +474,19 @@ fn open_child_lock(path: &Path) -> io::Result<fs::File> {
     // Windows opens ordinary file handles non-inheritable by default. Keep
     // this invariant instead of toggling process-global inheritability during
     // lifecycle setup.
-    options.open(path)
+    match options.open(path) {
+        Ok(file) => Ok((file, true)),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let mut existing = fs::OpenOptions::new();
+            existing.read(true).write(true);
+            existing.open(path).map(|file| (file, false))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn open_child_lock(path: &Path) -> io::Result<(fs::File, bool)> {
+    open_or_create_private_lock(path)
 }
 
 fn release_parent_lock(file: &fs::File) {
@@ -522,16 +543,37 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
             ensure_directory_mode(path)?;
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(path).map_err(|error| {
-                AppError::git(format!(
-                    "cannot create managed merge state directory '{}': {error}",
-                    path.display()
-                ))
-            })?;
-            // create_dir_all obeys umask, so enforce the mode after creation
-            // and check again for a concurrent replacement.
-            set_private_directory_mode(path)?;
-            ensure_directory_mode(path)?;
+            // The caller has already validated the parent. Create exactly one
+            // directory so no intermediate path can be left with a default ACL.
+            match fs::create_dir(path) {
+                Ok(()) => {
+                    // New directories may be created with inherited/default
+                    // ACLs. Apply the private policy immediately, then
+                    // validate it read-only. An existing directory never takes
+                    // this path and is never repaired.
+                    let setup = (|| {
+                        set_private_directory_mode(path)?;
+                        protect_new_directory(path)?;
+                        ensure_directory_mode(path)
+                    })();
+                    if let Err(error) = setup {
+                        let _ = fs::remove_dir(path);
+                        return Err(error);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    // A concurrent creator won the CREATE_DIRECTORY race; it
+                    // is now an existing object and must pass read-only
+                    // validation rather than being repaired.
+                    ensure_directory_mode(path)?;
+                }
+                Err(error) => {
+                    return Err(AppError::git(format!(
+                        "cannot create managed merge state directory '{}': {error}",
+                        path.display()
+                    )))
+                }
+            }
         }
         Err(error) => {
             return Err(AppError::git(format!(
@@ -540,6 +582,42 @@ pub(crate) fn ensure_private_directory(path: &Path) -> Result<()> {
             )))
         }
     }
+    Ok(())
+}
+
+/// Apply protection to a file created by this operation, then validate it.
+/// Existing files must use `ensure_private_file` so tampered state is refused,
+/// not silently re-owned or re-permissioned.
+pub(crate) fn protect_new_file(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        AppError::git(format!(
+            "cannot inspect newly-created managed merge state '{}': {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(AppError::conflict(format!(
+            "managed merge state '{}' is not a private regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if metadata.permissions().mode() & 0o777 != 0o600 {
+            return Err(AppError::conflict(format!(
+                "managed merge state '{}' has insecure permissions (expected 0600)",
+                path.display()
+            )));
+        }
+    }
+    #[cfg(windows)]
+    windows_lifecycle::protect_private_file_windows(path).map_err(|error| {
+        AppError::conflict(format!(
+            "new managed merge state '{}' could not be protected: {error}",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -622,6 +700,19 @@ fn set_private_directory_mode(path: &Path) -> Result<()> {
 
 #[cfg(not(unix))]
 fn set_private_directory_mode(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn protect_new_directory(path: &Path) -> Result<()> {
+    #[cfg(windows)]
+    windows_lifecycle::protect_private_directory_windows(path).map_err(|error| {
+        AppError::conflict(format!(
+            "new managed merge state directory '{}' could not be protected: {error}",
+            path.display()
+        ))
+    })?;
+    #[cfg(not(windows))]
+    let _ = path;
     Ok(())
 }
 
