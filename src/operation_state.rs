@@ -300,6 +300,14 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
         )));
     }
 
+    #[cfg(windows)]
+    windows_lifecycle::sweep_stale_protocol_files_for_lock(&child_lock_path).map_err(|error| {
+        release_parent_lock(&file);
+        AppError::git(format!(
+            "cannot sweep managed merge lifecycle guardian protocol: {error}"
+        ))
+    })?;
+
     let operation_id = new_operation_id();
     let owner = format!(
         "pid={}\noperation_id={}\n",
@@ -522,6 +530,13 @@ pub(crate) fn ensure_private_file(path: &Path) -> Result<()> {
             )));
         }
     }
+    #[cfg(windows)]
+    windows_lifecycle::ensure_private_file_windows(path).map_err(|error| {
+        AppError::conflict(format!(
+            "managed merge state '{}' has insecure Windows ACL: {error}",
+            path.display()
+        ))
+    })?;
     Ok(())
 }
 
@@ -541,7 +556,17 @@ fn ensure_directory_mode(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn ensure_directory_mode(path: &Path) -> Result<()> {
+    windows_lifecycle::ensure_private_directory_windows(path).map_err(|error| {
+        AppError::conflict(format!(
+            "managed merge state directory '{}' has insecure Windows ACL: {error}",
+            path.display()
+        ))
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
 fn ensure_directory_mode(_path: &Path) -> Result<()> {
     Ok(())
 }

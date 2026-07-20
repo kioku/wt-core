@@ -845,18 +845,10 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
         serde_json::from_slice(&status.stdout).expect("busy status JSON");
     assert_eq!(status_json["state"], "busy");
 
-    // An unrelated owner spawn cannot inherit the guardian's lease or pipes.
-    let unrelated = StdCommand::new("cmd.exe")
-        .args(["/C", "exit", "0"])
-        .spawn()
-        .expect("unrelated owner spawn");
-    assert!(unrelated
-        .wait_with_output()
-        .expect("unrelated spawn wait")
-        .status
-        .success());
-    assert!(!try_child_lock(&child_lock));
-
+    // The assertion below is made by a new wt process while the lifecycle
+    // hook is still blocked. This is the supported cooperating-operation
+    // serialization boundary; unrelated test-harness spawns are not evidence
+    // about handles owned by the lifecycle owner.
     let continue_output = wt_core()
         .args(["merge", "--continue", "--repo", &repo_str])
         .output()
@@ -877,6 +869,16 @@ fn windows_lifecycle_sync_hook_normal_parent_preserves_stdio_and_recovers_immedi
     assert!(
         output.status.success(),
         "merge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("hook-stdout"),
+        "hook stdout was not forwarded: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("hook-stderr"),
+        "hook stderr was not forwarded: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
@@ -987,6 +989,94 @@ fn windows_lifecycle_killed_parent_cannot_leave_a_running_git_lease() {
         !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\""),
         "killed parent left the lifecycle Git lease busy after guardian quiescence"
     );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_lifecycle_owner_death_at_each_pre_authorization_handshake_phase_is_safe() {
+    let phases = [
+        "parent-before-guardian",
+        "guardian-before-lease",
+        "guardian-after-lease-before-ready",
+        "guardian-ready-before-command",
+        "parent-after-ready-before-command",
+        "parent-command-before-start",
+    ];
+
+    for phase in phases {
+        let repo = fixtures::TestRepo::new();
+        let repo_str = repo.path().display().to_string();
+        wt_core()
+            .args(["add", "feature/windows-handshake", "--repo", &repo_str])
+            .assert()
+            .success();
+        let source = find_worktree_dir(&repo.path(), "feature-windows-handshake");
+        commit_file(&source, "handshake.txt", "handshake", "handshake source");
+
+        let started = repo.path().join(format!("{phase}.started"));
+        let release = repo.path().join(format!("{phase}.release"));
+        let git_started = repo.path().join("handshake-git-started");
+        install_hook(
+            &repo,
+            "pre-merge-commit",
+            &format!(
+                "#!/bin/sh\nprintf started > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+                shell_quote(&git_started.display().to_string()),
+                shell_quote(&release.display().to_string()),
+            ),
+        );
+
+        let mut merge = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+        merge
+            .args(["merge", "feature/windows-handshake", "--repo", &repo_str])
+            .env("WT_CORE_WINDOWS_LIFECYCLE_HANDSHAKE_PHASE", phase)
+            .env(
+                "WT_CORE_WINDOWS_LIFECYCLE_HANDSHAKE_GATE",
+                repo.path().join(phase).display().to_string(),
+            )
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut merge = merge.spawn().expect("handshake merge should start");
+        wait_for_file(&started);
+        merge.kill().expect("handshake owner should be terminable");
+
+        let status = wt_core()
+            .args(["merge", "--status", "--json", "--repo", &repo_str])
+            .output()
+            .expect("handshake status should run after owner death");
+        let status_text = String::from_utf8_lossy(&status.stdout);
+        let lease_phase =
+            phase.contains("after-lease") || phase.contains("ready") || phase.contains("command");
+        if lease_phase {
+            assert!(
+                status_text.contains("\"state\":\"busy\""),
+                "new wt must see the surviving guardian as busy in {phase}: {status_text}"
+            );
+        } else {
+            assert!(
+                status_text.contains("\"state\":\"busy\"") || !git_started.exists(),
+                "pre-lease owner death must not start stale Git in {phase}: {status_text}"
+            );
+        }
+
+        std::fs::write(&release, "release\n").expect("release handshake gate");
+        let _ = merge.wait_with_output();
+        wait_for_child_lock(&child_lock_path(&repo.path()), true);
+        assert!(
+            !git_started.exists(),
+            "owner death before authorization started stale Git in {phase}"
+        );
+        let state_dir = repo.path().join(".git/wt-core");
+        let leftovers: Vec<_> = std::fs::read_dir(&state_dir)
+            .into_iter()
+            .flat_map(|entries| entries.flatten())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("-guardian-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "owner crash left guardian protocol artifacts in {phase}: {leftovers:?}"
+        );
+    }
 }
 
 #[cfg(windows)]

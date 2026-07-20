@@ -232,20 +232,24 @@ OS after process death. A live owner makes a new merge, `--continue`, or
 
 On Windows 10 and Windows Server 2016 or newer, lifecycle Git is managed by a
 normally-created guardian outside a private kill-on-close Job Object. The
-owner writes a private, nonce-bound bootstrap and duplicates only non-inheritable
-stdio/event/process handles into the guardian; no lifecycle handle is inherited
-or made process-global, so unrelated owner spawns cannot observe them. The
-guardian acquires the child lease by path, signals readiness before Git starts,
-then atomically creates suspended Git in the Job Object with
-`PROC_THREAD_ATTRIBUTE_JOB_LIST` and resumes it. Git receives the exact args,
-environment, working directory, stdio, and supported creation flags, and cannot
-break away from the job. The guardian waits Git and synchronous hooks, terminates
-and waits every remaining member, and only then releases the child lease. If
-the owner dies, the guardian uses its duplicated owner-process handle rather
-than capture-pipe EOF as the death signal and continues that cleanup; recovery
-remains busy until job quiescence. Git hooks that daemonize, detach, or
-mutate the repository after Git exits are outside the supported contract and
-must not be used for lifecycle repository mutation.
+owner first gives the guardian only a duplicated owner-process handle. The
+guardian acquires the child lease by path and publishes a durable READY status
+containing its PID and operation ID; only then does the owner publish the
+nonce-bound command handoff with non-inheritable stdio/event handles and the
+final start authorization. Git is then atomically created suspended in the Job
+Object with `PROC_THREAD_ATTRIBUTE_JOB_LIST` and resumed. Git receives the
+exact args, environment, working directory, stdio, and supported creation
+flags, and cannot break away from the job. The guardian waits Git and
+synchronous hooks, terminates and waits every remaining member, and only then
+releases the child lease. If the owner dies, the guardian uses its duplicated
+owner-process handle rather than capture-pipe EOF as the death signal and
+continues that cleanup; recovery remains busy until job quiescence.
+Bootstrap and protocol files are owner-only ACL-validated, nonce-bound, and
+swept on the next startup after a crash. This protects cooperative `wt`
+operations; deliberate tampering, killing, or path replacement by an arbitrary
+same-user process is outside the threat boundary. Git hooks that daemonize,
+detach, or mutate the repository after Git exits are outside the supported
+contract and must not be used for lifecycle repository mutation.
 Journal updates also compare the operation identity and generation before
 replacement or deletion, so a stale process cannot overwrite a newer journal.
 

@@ -23,12 +23,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::GENERIC_READ;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, DuplicateHandle, GetLastError, DUPLICATE_SAME_ACCESS, HANDLE,
+    CloseHandle, DuplicateHandle, GetLastError, LocalFree, DUPLICATE_SAME_ACCESS, HANDLE,
     INVALID_HANDLE_VALUE, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
-use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+use windows_sys::Win32::Security::Authorization::{
+    GetNamedSecurityInfoW, SetNamedSecurityInfoW, SE_FILE_OBJECT,
+};
+use windows_sys::Win32::Security::{
+    AclSizeInformation, AddAccessAllowedAce, EqualSid, GetAce, GetAclInformation,
+    GetSecurityDescriptorDacl, GetTokenInformation, InitializeAcl, TokenUser, ACCESS_ALLOWED_ACE,
+    ACL, ACL_REVISION, ACL_SIZE_INFORMATION, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+};
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JobObjectExtendedLimitInformation, SetInformationJobObject,
@@ -37,8 +46,8 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
-    GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread, SetEvent,
-    TerminateProcess, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
+    GetExitCodeProcess, InitializeProcThreadAttributeList, OpenProcessToken, ResumeThread,
+    SetEvent, UpdateProcThreadAttribute, WaitForMultipleObjects, WaitForSingleObject,
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
     EXTENDED_STARTUPINFO_PRESENT, INFINITE, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
     PROC_THREAD_ATTRIBUTE_JOB_LIST, STARTF_USESTDHANDLES, STARTUPINFOEXW,
@@ -53,10 +62,13 @@ const GUARDIAN_SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 const GUARDIAN_RETRY_DELAY: Duration = Duration::from_millis(25);
 const TEST_FAIL_AFTER_JOB_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_FAIL_AFTER_JOB";
 const TEST_CLEANUP_GATE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_CLEANUP_GATE";
+const TEST_HANDSHAKE_PHASE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_HANDSHAKE_PHASE";
+const TEST_HANDSHAKE_GATE_ENV: &str = "WT_CORE_WINDOWS_LIFECYCLE_HANDSHAKE_GATE";
 static PROTOCOL_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// Run Git with captured stdout/stderr.  The parent does not acquire the child
-/// lock: the surviving guardian acquires it by path before it signals ready.
+/// Run Git with captured stdout/stderr. The parent never owns the child lease;
+/// the surviving guardian acquires it and publishes READY before the parent can
+/// authorize the command handoff.
 pub(crate) fn output_git(
     child_lock_path: &Path,
     args: &[&str],
@@ -83,17 +95,22 @@ pub(crate) fn output_git_with_creation_flags(
     let current_exe = std::env::current_exe()?;
     let nonce = new_nonce();
     let paths = ProtocolPaths::new(child_lock_path)?;
+    sweep_stale_protocol_files_for_lock(child_lock_path)?;
     let config = GuardianConfig {
         nonce: nonce.clone(),
+        operation_id: nonce.clone(),
+        bootstrap_path: paths.bootstrap.clone(),
         child_lock_path: child_lock_path.to_path_buf(),
         result_path: paths.result.clone(),
+        status_path: paths.status.clone(),
+        owner_handoff_path: paths.owner_handoff.clone(),
+        command_handoff_path: paths.command_handoff.clone(),
         cwd: cwd.to_path_buf(),
         args: args.iter().map(OsString::from).collect(),
         environment: environment.to_vec(),
         creation_flags,
-        // This is a debug-only fault injection used by the Windows runtime
-        // test.  It is part of the private bootstrap, never a process-global
-        // switch read by the guardian after startup.
+        // These are test-only values in the private bootstrap. They are never
+        // read from a process-global switch by the guardian after startup.
         fail_after_job: cfg!(debug_assertions)
             && std::env::var_os(TEST_FAIL_AFTER_JOB_ENV).as_deref() == Some(OsStr::new("1")),
         cleanup_gate: cfg!(debug_assertions)
@@ -105,13 +122,12 @@ pub(crate) fn output_git_with_creation_flags(
 
     let mut stdio = StdioHandles::new()?;
     let start_event = OwnedHandle::new(create_event()?);
-    let ready_event = OwnedHandle::new(create_event()?);
     let abort_event = OwnedHandle::new(create_event()?);
     let current_exe_wide = wide_path(current_exe.as_os_str())?;
     let guardian_args = vec![
         OsString::from(INTERNAL_GUARDIAN_ARG),
         paths.bootstrap.as_os_str().to_os_string(),
-        paths.handoff.as_os_str().to_os_string(),
+        paths.command_handoff.as_os_str().to_os_string(),
         OsString::from(&nonce),
     ];
     let mut command_line = command_line_os(current_exe.as_os_str(), &guardian_args)?;
@@ -120,6 +136,7 @@ pub(crate) fn output_git_with_creation_flags(
     let mut process_info = PROCESS_INFORMATION::default();
     let guardian_flags = CREATE_UNICODE_ENVIRONMENT | (creation_flags & CREATE_NO_WINDOW);
 
+    wait_for_test_handshake("parent-before-guardian");
     // The guardian is deliberately a normal process outside the Git job. No
     // lifecycle handle is inheritable and bInheritHandles is false.
     let created = unsafe {
@@ -146,56 +163,32 @@ pub(crate) fn output_git_with_creation_flags(
     let guardian = OwnedHandle::new(process_info.hProcess);
     close_raw(process_info.hThread);
 
-    let handoff = match duplicate_guardian_handles(
-        guardian.raw(),
-        stdio.stdout.write.raw(),
-        stdio.stderr.write.raw(),
-        start_event.raw(),
-        ready_event.raw(),
-        abort_event.raw(),
-    ) {
-        Ok(handles) => handles,
-        Err(error) => {
-            terminate_and_reap_process(guardian.raw());
-            return Err(error);
-        }
-    };
-
-    let handoff_contents = match encode_handoff(&nonce, handoff) {
+    let owner_handoff = duplicate_guardian_parent_handle(guardian.raw())
+        .and_then(|parent_process| encode_owner_handoff(&nonce, parent_process));
+    let owner_handoff = match owner_handoff {
         Ok(contents) => contents,
         Err(error) => {
-            terminate_and_reap_process(guardian.raw());
+            let _ = wait_for_process(guardian.raw());
             return Err(error);
         }
     };
-    if let Err(error) = ProtocolFile::write_new(&paths.handoff, handoff_contents) {
-        terminate_and_reap_process(guardian.raw());
+    if let Err(error) = ProtocolFile::write_new(&paths.owner_handoff, owner_handoff) {
+        let _ = wait_for_process(guardian.raw());
         return Err(error);
     }
 
-    // The guardian owns the target copies from this point.  The parent only
-    // retains the read ends and its own lifecycle lock.
-    stdio.close_child_writes();
-    let stdout = stdio.stdout.take_read();
-    let stderr = stdio.stderr.take_read();
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
-
-    let ready = match wait_for_ready_or_process(ready_event.raw(), guardian.raw()) {
+    let ready = match wait_for_ready_or_process(&paths.status, guardian.raw(), &nonce) {
         Ok(ready) => ready,
         Err(error) => {
-            let _ = unsafe { SetEvent(abort_event.raw()) };
             let _ = wait_for_process(guardian.raw());
-            let _ = join_reader(stdout_reader);
-            let _ = join_reader(stderr_reader);
             return Err(error);
         }
     };
     if !ready {
         let guardian_result = wait_for_process(guardian.raw());
-        let stdout = join_reader(stdout_reader)?;
-        let stderr = join_reader(stderr_reader)?;
-        let _ = (stdout, stderr);
+        stdio.close_child_writes();
+        let _ = read_pipe(stdio.stdout.take_read());
+        let _ = read_pipe(stdio.stderr.take_read());
         guardian_result?;
         return Err(read_guardian_error(
             &paths.result,
@@ -204,10 +197,46 @@ pub(crate) fn output_git_with_creation_flags(
         ));
     }
 
+    // READY is written only after the guardian owns the child lease and its
+    // kill-on-close job. The parent is now allowed to publish authorization.
+    wait_for_test_handshake("parent-after-ready-before-command");
+    let command_handoff = duplicate_guardian_command_handles(
+        guardian.raw(),
+        stdio.stdout.write.raw(),
+        stdio.stderr.write.raw(),
+        start_event.raw(),
+        abort_event.raw(),
+    )
+    .and_then(|handles| encode_command_handoff(&nonce, handles));
+    let command_handoff = match command_handoff {
+        Ok(contents) => contents,
+        Err(error) => {
+            let _ = unsafe { SetEvent(abort_event.raw()) };
+            let _ = wait_for_process(guardian.raw());
+            return Err(error);
+        }
+    };
+    if let Err(error) = ProtocolFile::write_new(&paths.command_handoff, command_handoff) {
+        let _ = unsafe { SetEvent(abort_event.raw()) };
+        let _ = wait_for_process(guardian.raw());
+        return Err(error);
+    }
+
+    stdio.close_child_writes();
+    let stdout_reader = thread::spawn({
+        let stdout = stdio.stdout.take_read();
+        move || read_pipe(stdout)
+    });
+    let stderr_reader = thread::spawn({
+        let stderr = stdio.stderr.take_read();
+        move || read_pipe(stderr)
+    });
+
+    // The start event is the final authorization. A killed owner before this
+    // point leaves the guardian with no permission to run Git.
+    wait_for_test_handshake("parent-command-before-start");
     if unsafe { SetEvent(start_event.raw()) } == 0 {
         let error = last_error();
-        // The abort signal makes this error path independent of owner process
-        // lifetime; the guardian still performs the complete job cleanup.
         let _ = unsafe { SetEvent(abort_event.raw()) };
         wait_for_process(guardian.raw())?;
         let _ = join_reader(stdout_reader);
@@ -230,7 +259,6 @@ pub(crate) fn output_git_with_creation_flags(
         stderr,
     })
 }
-
 fn validate_creation_flags(creation_flags: u32) -> io::Result<()> {
     if creation_flags & CREATE_SUSPENDED != 0 {
         return Err(io::Error::new(
@@ -258,7 +286,9 @@ fn new_nonce() -> String {
 
 struct ProtocolPaths {
     bootstrap: PathBuf,
-    handoff: PathBuf,
+    owner_handoff: PathBuf,
+    command_handoff: PathBuf,
+    status: PathBuf,
     result: PathBuf,
 }
 
@@ -276,7 +306,9 @@ impl ProtocolPaths {
             .unwrap_or_else(|| "merge-operation-child.lock".to_string());
         Ok(Self {
             bootstrap: allocate_protocol_path(directory, &stem, "bootstrap")?,
-            handoff: allocate_protocol_path(directory, &stem, "handoff")?,
+            owner_handoff: allocate_protocol_path(directory, &stem, "owner-handoff")?,
+            command_handoff: allocate_protocol_path(directory, &stem, "command-handoff")?,
+            status: allocate_protocol_path(directory, &stem, "status")?,
             result: allocate_protocol_path(directory, &stem, "result")?,
         })
     }
@@ -284,10 +316,63 @@ impl ProtocolPaths {
 
 impl Drop for ProtocolPaths {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.bootstrap);
-        let _ = fs::remove_file(&self.handoff);
-        let _ = fs::remove_file(&self.result);
+        for path in [
+            &self.bootstrap,
+            &self.owner_handoff,
+            &self.command_handoff,
+            &self.status,
+            &self.result,
+        ] {
+            let _ = fs::remove_file(path);
+        }
     }
+}
+
+fn sweep_all_stale_protocol_files(directory: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if name.starts_with('.') && name.contains("-guardian-") {
+            validate_protocol_file(&path)?;
+            fs::remove_file(path)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn sweep_stale_protocol_files_for_lock(child_lock_path: &Path) -> io::Result<()> {
+    let directory = child_lock_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "managed child lock has no parent",
+        )
+    })?;
+    let stem = child_lock_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "merge-operation-child.lock".to_string());
+    sweep_stale_protocol_files(directory, &stem)
+}
+
+fn sweep_stale_protocol_files(directory: &Path, stem: &str) -> io::Result<()> {
+    let prefix = format!(".{stem}-guardian-");
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(OsStr::to_str) else {
+            continue;
+        };
+        if !name.starts_with(&prefix) || (!name.ends_with(".tmp") && !name.ends_with(".write-tmp"))
+        {
+            continue;
+        }
+        validate_protocol_file(&path)?;
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn allocate_protocol_path(directory: &Path, stem: &str, kind: &str) -> io::Result<PathBuf> {
@@ -312,6 +397,10 @@ struct ProtocolFile;
 impl ProtocolFile {
     fn write_new(path: &Path, contents: Vec<u8>) -> io::Result<()> {
         let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        if let Err(error) = ensure_protocol_file_private(path) {
+            let _ = fs::remove_file(path);
+            return Err(error);
+        }
         file.write_all(&contents)?;
         file.sync_all()
     }
@@ -322,16 +411,53 @@ impl ProtocolFile {
             .write(true)
             .create_new(true)
             .open(&temporary)?;
+        if let Err(error) = ensure_protocol_file_private(&temporary) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
         file.write_all(&contents)?;
         file.sync_all()?;
-        fs::rename(temporary, path)
+        if let Err(error) = replace_protocol_file(&temporary, path) {
+            let _ = fs::remove_file(&temporary);
+            return Err(error);
+        }
+        ensure_protocol_file_private(path)
+    }
+}
+
+fn replace_protocol_file(source: &Path, destination: &Path) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        let source = wide_path(source.as_os_str())?;
+        let destination = wide_path(destination.as_os_str())?;
+        if unsafe {
+            windows_sys::Win32::Storage::FileSystem::MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                windows_sys::Win32::Storage::FileSystem::MOVEFILE_REPLACE_EXISTING
+                    | windows_sys::Win32::Storage::FileSystem::MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(source, destination)
     }
 }
 
 struct GuardianConfig {
     nonce: String,
+    operation_id: String,
+    bootstrap_path: PathBuf,
     child_lock_path: PathBuf,
     result_path: PathBuf,
+    status_path: PathBuf,
+    owner_handoff_path: PathBuf,
+    command_handoff_path: PathBuf,
     cwd: PathBuf,
     args: Vec<OsString>,
     environment: Vec<(OsString, OsString)>,
@@ -341,13 +467,16 @@ struct GuardianConfig {
 }
 
 #[derive(Clone, Copy)]
-struct GuardianHandles {
+struct GuardianOwnerHandle {
+    parent_process: HANDLE,
+}
+
+#[derive(Clone, Copy)]
+struct GuardianCommandHandles {
     stdout: HANDLE,
     stderr: HANDLE,
     start_event: HANDLE,
-    ready_event: HANDLE,
     abort_event: HANDLE,
-    parent_process: HANDLE,
 }
 
 struct GuardianResult {
@@ -355,12 +484,34 @@ struct GuardianResult {
     error: Option<String>,
 }
 
+#[derive(Clone, Copy)]
+enum GuardianPhase {
+    Starting = 0,
+    LeaseHeld = 1,
+    Ready = 2,
+    AwaitingCommand = 3,
+    Running = 4,
+    Cleaning = 5,
+}
+
+struct GuardianStatus {
+    nonce: String,
+    operation_id: String,
+    guardian_pid: u32,
+    phase: GuardianPhase,
+}
+
 fn encode_config(config: &GuardianConfig) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     output.extend_from_slice(GUARDIAN_MAGIC);
     write_bytes(&mut output, config.nonce.as_bytes())?;
+    write_bytes(&mut output, config.operation_id.as_bytes())?;
+    write_wide(&mut output, config.bootstrap_path.as_os_str())?;
     write_wide(&mut output, config.child_lock_path.as_os_str())?;
     write_wide(&mut output, config.result_path.as_os_str())?;
+    write_wide(&mut output, config.status_path.as_os_str())?;
+    write_wide(&mut output, config.owner_handoff_path.as_os_str())?;
+    write_wide(&mut output, config.command_handoff_path.as_os_str())?;
     write_wide(&mut output, config.cwd.as_os_str())?;
     write_u32(&mut output, config.creation_flags)?;
     output.push(u8::from(config.fail_after_job));
@@ -399,8 +550,7 @@ fn encode_config(config: &GuardianConfig) -> io::Result<Vec<u8>> {
 fn decode_config(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianConfig> {
     let mut cursor = Cursor::new(contents);
     expect_magic(&mut cursor, GUARDIAN_MAGIC)?;
-    let nonce = read_bytes(&mut cursor)?;
-    let nonce = String::from_utf8(nonce)
+    let nonce = String::from_utf8(read_bytes(&mut cursor)?)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "guardian nonce is not UTF-8"))?;
     if nonce != expected_nonce {
         return Err(io::Error::new(
@@ -408,8 +558,18 @@ fn decode_config(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianCo
             "guardian bootstrap nonce mismatch",
         ));
     }
+    let operation_id = String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian operation id is not UTF-8",
+        )
+    })?;
+    let bootstrap_path = PathBuf::from(read_wide(&mut cursor)?);
     let child_lock_path = PathBuf::from(read_wide(&mut cursor)?);
     let result_path = PathBuf::from(read_wide(&mut cursor)?);
+    let status_path = PathBuf::from(read_wide(&mut cursor)?);
+    let owner_handoff_path = PathBuf::from(read_wide(&mut cursor)?);
+    let command_handoff_path = PathBuf::from(read_wide(&mut cursor)?);
     let cwd = PathBuf::from(read_wide(&mut cursor)?);
     let creation_flags = read_u32(&mut cursor)?;
     let fail_after_job = read_byte(&mut cursor)? != 0;
@@ -425,17 +585,30 @@ fn decode_config(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianCo
         environment.push((read_wide(&mut cursor)?, read_wide(&mut cursor)?));
     }
     ensure_cursor_exhausted(&cursor)?;
-    validate_protocol_path(&child_lock_path)?;
-    validate_protocol_path(&result_path)?;
-    validate_protocol_path(&cwd)?;
+    for path in [
+        &bootstrap_path,
+        &child_lock_path,
+        &result_path,
+        &status_path,
+        &owner_handoff_path,
+        &command_handoff_path,
+        &cwd,
+    ] {
+        validate_protocol_path(path)?;
+    }
     if let Some(path) = &cleanup_gate {
         validate_protocol_path(path)?;
     }
     validate_creation_flags(creation_flags)?;
     Ok(GuardianConfig {
         nonce,
+        operation_id,
+        bootstrap_path,
         child_lock_path,
         result_path,
+        status_path,
+        owner_handoff_path,
+        command_handoff_path,
         cwd,
         args,
         environment,
@@ -445,7 +618,37 @@ fn decode_config(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianCo
     })
 }
 
-fn encode_handoff(nonce: &str, handles: GuardianHandles) -> io::Result<Vec<u8>> {
+fn encode_owner_handoff(nonce: &str, parent_process: HANDLE) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(HANDOFF_MAGIC);
+    write_bytes(&mut output, nonce.as_bytes())?;
+    write_u64(&mut output, parent_process as usize as u64);
+    Ok(output)
+}
+
+fn decode_owner_handoff(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianOwnerHandle> {
+    let mut cursor = Cursor::new(contents);
+    expect_magic(&mut cursor, HANDOFF_MAGIC)?;
+    let nonce = String::from_utf8(read_bytes(&mut cursor)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "guardian owner nonce invalid"))?;
+    if nonce != expected_nonce {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian owner nonce mismatch",
+        ));
+    }
+    let parent_process = read_u64(&mut cursor)? as usize as HANDLE;
+    if parent_process.is_null() || parent_process == INVALID_HANDLE_VALUE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian owner handoff contains an invalid process handle",
+        ));
+    }
+    ensure_cursor_exhausted(&cursor)?;
+    Ok(GuardianOwnerHandle { parent_process })
+}
+
+fn encode_command_handoff(nonce: &str, handles: GuardianCommandHandles) -> io::Result<Vec<u8>> {
     let mut output = Vec::new();
     output.extend_from_slice(HANDOFF_MAGIC);
     write_bytes(&mut output, nonce.as_bytes())?;
@@ -453,46 +656,96 @@ fn encode_handoff(nonce: &str, handles: GuardianHandles) -> io::Result<Vec<u8>> 
         handles.stdout,
         handles.stderr,
         handles.start_event,
-        handles.ready_event,
         handles.abort_event,
-        handles.parent_process,
     ] {
         write_u64(&mut output, handle as usize as u64);
     }
     Ok(output)
 }
 
-fn decode_handoff(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianHandles> {
+fn decode_command_handoff(
+    contents: &[u8],
+    expected_nonce: &str,
+) -> io::Result<GuardianCommandHandles> {
     let mut cursor = Cursor::new(contents);
     expect_magic(&mut cursor, HANDOFF_MAGIC)?;
     let nonce = String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "guardian handoff nonce invalid")
+        io::Error::new(io::ErrorKind::InvalidData, "guardian command nonce invalid")
     })?;
     if nonce != expected_nonce {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "guardian handoff nonce mismatch",
+            "guardian command nonce mismatch",
         ));
     }
-    let mut handles = [std::ptr::null_mut(); 6];
+    let mut handles = [std::ptr::null_mut(); 4];
     for handle in &mut handles {
         let raw = read_u64(&mut cursor)? as usize as HANDLE;
         if raw.is_null() || raw == INVALID_HANDLE_VALUE {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "guardian handoff contains an invalid handle",
+                "guardian command handoff contains an invalid handle",
             ));
         }
         *handle = raw;
     }
     ensure_cursor_exhausted(&cursor)?;
-    Ok(GuardianHandles {
+    Ok(GuardianCommandHandles {
         stdout: handles[0],
         stderr: handles[1],
         start_event: handles[2],
-        ready_event: handles[3],
-        abort_event: handles[4],
-        parent_process: handles[5],
+        abort_event: handles[3],
+    })
+}
+
+fn encode_status(status: &GuardianStatus) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    output.extend_from_slice(GUARDIAN_MAGIC);
+    write_bytes(&mut output, status.nonce.as_bytes())?;
+    write_bytes(&mut output, status.operation_id.as_bytes())?;
+    write_u32(&mut output, status.guardian_pid)?;
+    output.push(status.phase as u8);
+    Ok(output)
+}
+
+fn decode_status(contents: &[u8], expected_nonce: &str) -> io::Result<GuardianStatus> {
+    let mut cursor = Cursor::new(contents);
+    expect_magic(&mut cursor, GUARDIAN_MAGIC)?;
+    let nonce = String::from_utf8(read_bytes(&mut cursor)?)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "guardian status nonce invalid"))?;
+    if nonce != expected_nonce {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "guardian status nonce mismatch",
+        ));
+    }
+    let operation_id = String::from_utf8(read_bytes(&mut cursor)?).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "guardian status operation id invalid",
+        )
+    })?;
+    let guardian_pid = read_u32(&mut cursor)?;
+    let phase = match read_byte(&mut cursor)? {
+        0 => GuardianPhase::Starting,
+        1 => GuardianPhase::LeaseHeld,
+        2 => GuardianPhase::Ready,
+        3 => GuardianPhase::AwaitingCommand,
+        4 => GuardianPhase::Running,
+        5 => GuardianPhase::Cleaning,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "guardian status phase invalid",
+            ))
+        }
+    };
+    ensure_cursor_exhausted(&cursor)?;
+    Ok(GuardianStatus {
+        nonce,
+        operation_id,
+        guardian_pid,
+        phase,
     })
 }
 
@@ -698,7 +951,15 @@ fn validate_protocol_path(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_protocol_file(path: &Path) -> io::Result<()> {
+pub(crate) fn ensure_private_directory_windows(path: &Path) -> io::Result<()> {
+    ensure_windows_owner_only(path)
+}
+
+pub(crate) fn ensure_private_file_windows(path: &Path) -> io::Result<()> {
+    ensure_protocol_file_private(path)
+}
+
+fn ensure_protocol_file_private(path: &Path) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         return Err(io::Error::new(
@@ -706,36 +967,224 @@ fn validate_protocol_file(path: &Path) -> io::Result<()> {
             "guardian protocol file is not a private regular file",
         ));
     }
-    Ok(())
+    ensure_windows_owner_only(path)
+}
+
+fn ensure_windows_owner_only(path: &Path) -> io::Result<()> {
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Security::ACE_HEADER;
+
+    let sid = current_user_sid()?;
+    let acl_size =
+        size_of::<ACL>() + size_of::<ACCESS_ALLOWED_ACE>() - size_of::<u32>() + sid.len();
+    let mut acl = vec![0u8; acl_size];
+    if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl.len() as u32, ACL_REVISION) } == 0 {
+        return Err(last_error());
+    }
+    if unsafe {
+        AddAccessAllowedAce(
+            acl.as_mut_ptr().cast(),
+            ACL_REVISION,
+            FILE_ALL_ACCESS,
+            sid.as_ptr().cast_mut().cast(),
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    let wide = wide_path(path.as_os_str())?;
+    let error = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            sid.as_ptr().cast_mut().cast(),
+            null_mut(),
+            acl.as_ptr().cast(),
+            null_mut(),
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+
+    // Re-read the descriptor rather than trusting SetNamedSecurityInfoW. This
+    // validates both the owner and the effective default DACL used by every
+    // protocol file. SYSTEM can still administer the machine, but no broad or
+    // unowned trustee may read/replace bootstrap or handoff contents.
+    let mut owner: windows_sys::Win32::Security::PSID = null_mut();
+    let mut dacl: *mut ACL = null_mut();
+    let mut descriptor: windows_sys::Win32::Security::PSECURITY_DESCRIPTOR = null_mut();
+    let error = unsafe {
+        GetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            null_mut(),
+            &mut dacl,
+            null_mut(),
+            &mut descriptor,
+        )
+    };
+    if error != 0 {
+        return Err(io::Error::from_raw_os_error(error as i32));
+    }
+    let result = (|| {
+        if owner.is_null() || unsafe { EqualSid(owner, sid.as_ptr().cast_mut().cast()) } == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol owner does not match the current user",
+            ));
+        }
+        let mut present = 0;
+        let mut defaulted = 0;
+        if dacl.is_null()
+            || unsafe {
+                GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted)
+            } == 0
+            || present == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol has no explicit DACL",
+            ));
+        }
+        let mut size = ACL_SIZE_INFORMATION::default();
+        if unsafe {
+            GetAclInformation(
+                dacl,
+                (&mut size as *mut ACL_SIZE_INFORMATION).cast(),
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        } == 0
+        {
+            return Err(last_error());
+        }
+        if size.AceCount != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol DACL is not owner-only",
+            ));
+        }
+        let mut ace = null_mut();
+        if unsafe { GetAce(dacl, 0, &mut ace) } == 0 || ace.is_null() {
+            return Err(last_error());
+        }
+        let header = unsafe { &*(ace as *const ACE_HEADER) };
+        let allowed = unsafe { &*(ace as *const ACCESS_ALLOWED_ACE) };
+        if header.AceType != 0
+            || header.AceFlags != 0
+            || unsafe {
+                EqualSid(
+                    (&allowed.SidStart as *const u32).cast_mut().cast(),
+                    sid.as_ptr().cast_mut().cast(),
+                )
+            } == 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "guardian protocol DACL contains a non-owner ACE",
+            ));
+        }
+        Ok(())
+    })();
+    unsafe {
+        LocalFree(descriptor);
+    }
+    result
+}
+
+fn current_user_sid() -> io::Result<Vec<u8>> {
+    use std::ptr::null_mut;
+    let mut token = null_mut();
+    if unsafe {
+        OpenProcessToken(
+            windows_sys::Win32::System::Threading::GetCurrentProcess(),
+            TOKEN_QUERY,
+            &mut token,
+        )
+    } == 0
+    {
+        return Err(last_error());
+    }
+    let mut needed = 0;
+    unsafe {
+        GetTokenInformation(token, TokenUser, null_mut(), 0, &mut needed);
+    }
+    if needed == 0 {
+        unsafe {
+            CloseHandle(token);
+        }
+        return Err(last_error());
+    }
+    let mut buffer = vec![0u8; needed as usize];
+    if unsafe {
+        GetTokenInformation(
+            token,
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        unsafe {
+            CloseHandle(token);
+        }
+        return Err(last_error());
+    }
+    unsafe {
+        CloseHandle(token);
+    }
+    let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+    let sid = user.User.Sid;
+    if sid.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "current user has no SID",
+        ));
+    }
+    let length = unsafe { windows_sys::Win32::Security::GetLengthSid(sid) } as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), length) };
+    Ok(bytes.to_vec())
+}
+
+fn validate_protocol_file(path: &Path) -> io::Result<()> {
+    ensure_protocol_file_private(path)
 }
 
 fn open_child_lock(path: &Path) -> io::Result<File> {
     let mut options = fs::OpenOptions::new();
     options.read(true).write(true);
-    // Windows opens ordinary Rust file handles non-inheritable.  The guardian
+    // Windows opens ordinary Rust file handles non-inheritable. The guardian
     // never changes that process-wide property.
-    options.open(path)
+    let file = options.open(path)?;
+    ensure_private_file_windows(path)?;
+    Ok(file)
 }
 
-fn duplicate_guardian_handles(
+fn duplicate_guardian_parent_handle(target_process: HANDLE) -> io::Result<HANDLE> {
+    duplicate_into(
+        target_process,
+        // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
+        unsafe { GetCurrentProcess() },
+    )
+}
+
+fn duplicate_guardian_command_handles(
     target_process: HANDLE,
     stdout: HANDLE,
     stderr: HANDLE,
     start_event: HANDLE,
-    ready_event: HANDLE,
     abort_event: HANDLE,
-) -> io::Result<GuardianHandles> {
-    Ok(GuardianHandles {
+) -> io::Result<GuardianCommandHandles> {
+    Ok(GuardianCommandHandles {
         stdout: duplicate_into(target_process, stdout)?,
         stderr: duplicate_into(target_process, stderr)?,
         start_event: duplicate_into(target_process, start_event)?,
-        ready_event: duplicate_into(target_process, ready_event)?,
         abort_event: duplicate_into(target_process, abort_event)?,
-        parent_process: duplicate_into(
-            target_process,
-            // SAFETY: GetCurrentProcess returns the current process pseudo-handle.
-            unsafe { GetCurrentProcess() },
-        )?,
     })
 }
 
@@ -783,20 +1232,65 @@ pub(crate) fn run_launcher_if_requested() {
 }
 
 fn guardian_main(bootstrap_path: PathBuf, handoff_path: PathBuf, expected_nonce: String) -> u32 {
-    let config = match read_config_file(&bootstrap_path, &expected_nonce) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        guardian_main_inner(&bootstrap_path, &handoff_path, &expected_nonce)
+    }));
+    match result {
+        Ok(code) => code,
+        Err(_) => {
+            // A panic before the config is decoded cannot safely run Git. The
+            // next owner also performs a stale sweep, while these paths are
+            // removed immediately on the normal panic-unwind path.
+            let _ = fs::remove_file(&bootstrap_path);
+            let _ = fs::remove_file(&handoff_path);
+            if let Some(directory) = bootstrap_path.parent() {
+                let _ = sweep_all_stale_protocol_files(directory);
+            }
+            1
+        }
+    }
+}
+
+fn guardian_main_inner(bootstrap_path: &Path, handoff_path: &Path, expected_nonce: &str) -> u32 {
+    let config = match read_config_file(bootstrap_path, expected_nonce) {
         Ok(config) => config,
         Err(_) => return 1,
     };
-    let _ = fs::remove_file(&bootstrap_path);
+    let _ = fs::remove_file(bootstrap_path);
 
-    if handoff_path.parent() != bootstrap_path.parent() {
+    let directory = match bootstrap_path.parent() {
+        Some(directory) => directory,
+        None => return 1,
+    };
+    if handoff_path.parent() != Some(directory)
+        || config.owner_handoff_path.parent() != Some(directory)
+        || config.command_handoff_path.parent() != Some(directory)
+        || config.status_path.parent() != Some(directory)
+        || config.result_path.parent() != Some(directory)
+        || config.command_handoff_path != handoff_path
+    {
+        cleanup_protocol_paths(&config);
         return 1;
     }
-    let handoff = match wait_for_handoff(&handoff_path, &expected_nonce) {
-        Ok(handoff) => handoff,
-        Err(_) => return 1,
+    if write_guardian_status(&config, GuardianPhase::Starting).is_err() {
+        cleanup_protocol_paths(&config);
+        return 1;
+    }
+
+    wait_for_test_handshake("guardian-before-lease");
+    let owner = match wait_for_owner_handoff(&config.owner_handoff_path, expected_nonce) {
+        Ok(owner) => owner,
+        Err(_) => {
+            cleanup_protocol_paths(&config);
+            return 1;
+        }
     };
-    let handles = GuardianOwnedHandles::new(handoff);
+    let handles = GuardianOwnedHandles::new(owner);
+    if !parent_is_alive(handles.parent.raw()) {
+        cleanup_protocol_paths(&config);
+        return 0;
+    }
+
     let child_lock = match open_child_lock(&config.child_lock_path) {
         Ok(lock) => lock,
         Err(error) => {
@@ -804,6 +1298,11 @@ fn guardian_main(bootstrap_path: PathBuf, handoff_path: PathBuf, expected_nonce:
             return 0;
         }
     };
+    if !parent_is_alive(handles.parent.raw()) {
+        drop(child_lock);
+        cleanup_protocol_paths(&config);
+        return 0;
+    }
     if !super::try_lock_exclusive(&child_lock).unwrap_or(false) {
         write_guardian_result(
             &config,
@@ -815,99 +1314,182 @@ fn guardian_main(bootstrap_path: PathBuf, handoff_path: PathBuf, expected_nonce:
         return 0;
     }
 
-    let mut job = match Job::new() {
+    let job = match Job::new() {
         Ok(job) => job,
         Err(error) => {
+            drop(child_lock);
             write_guardian_result(&config, guardian_error(error));
             return 0;
         }
     };
-
-    if config.fail_after_job {
-        let cleanup = cleanup_job_until_quiesced(&mut job);
-        drop(job);
-        drop(child_lock);
-        write_guardian_result(
+    let mut resources = GuardianResources::new(job, child_lock);
+    if write_guardian_status(&config, GuardianPhase::LeaseHeld).is_err() {
+        return finish_guardian(
             &config,
-            guardian_error(match cleanup {
-                Ok(()) => io::Error::other("injected setup failure after guardian job creation"),
-                Err(error) => error,
-            }),
+            resources,
+            Some(guardian_error(io::Error::other(
+                "cannot publish lifecycle guardian lease status",
+            ))),
+            handles.parent.raw(),
         );
-        return 0;
     }
 
-    if unsafe { SetEvent(handles.ready.raw()) } == 0 {
-        let error = last_error();
-        let cleanup = cleanup_job_until_quiesced(&mut job);
-        drop(job);
-        drop(child_lock);
-        write_guardian_result(&config, guardian_error(combine_errors(error, cleanup)));
-        return 0;
+    if config.fail_after_job {
+        return finish_guardian(
+            &config,
+            resources,
+            Some(guardian_error(io::Error::other(
+                "injected setup failure after guardian job creation",
+            ))),
+            handles.parent.raw(),
+        );
+    }
+    if !parent_is_alive(handles.parent.raw()) {
+        return finish_guardian(&config, resources, None, handles.parent.raw());
+    }
+
+    wait_for_test_handshake("guardian-after-lease-before-ready");
+    if !parent_is_alive(handles.parent.raw()) {
+        return finish_guardian(&config, resources, None, handles.parent.raw());
+    }
+    if write_guardian_status(&config, GuardianPhase::Ready).is_err() {
+        return finish_guardian(
+            &config,
+            resources,
+            Some(guardian_error(io::Error::other(
+                "cannot publish lifecycle guardian READY status",
+            ))),
+            handles.parent.raw(),
+        );
+    }
+    wait_for_test_handshake("guardian-ready-before-command");
+    if write_guardian_status(&config, GuardianPhase::AwaitingCommand).is_err() {
+        return finish_guardian(
+            &config,
+            resources,
+            Some(guardian_error(io::Error::other(
+                "cannot publish lifecycle guardian command status",
+            ))),
+            handles.parent.raw(),
+        );
+    }
+
+    let command = match wait_for_command_handoff(
+        &config.command_handoff_path,
+        expected_nonce,
+        handles.parent.raw(),
+    ) {
+        Ok(Some(command)) => command,
+        Ok(None) | Err(_) => {
+            return finish_guardian(&config, resources, None, handles.parent.raw());
+        }
+    };
+    let command = GuardianOwnedCommandHandles::new(command);
+    if !parent_is_alive(handles.parent.raw()) {
+        return finish_guardian(&config, resources, None, handles.parent.raw());
+    }
+    if write_guardian_status(&config, GuardianPhase::AwaitingCommand).is_err() {
+        return finish_guardian(
+            &config,
+            resources,
+            Some(guardian_error(io::Error::other(
+                "cannot refresh lifecycle guardian command status",
+            ))),
+            handles.parent.raw(),
+        );
     }
 
     let start = wait_for_start_abort_or_parent(
-        handles.start.raw(),
-        handles.abort.raw(),
+        command.start.raw(),
+        command.abort.raw(),
         handles.parent.raw(),
     );
     if !start {
-        return finish_guardian_start_abort(&config, &mut job, child_lock, handles.parent.raw());
+        return finish_guardian(&config, resources, None, handles.parent.raw());
+    }
+    if write_guardian_status(&config, GuardianPhase::Running).is_err() {
+        return finish_guardian(
+            &config,
+            resources,
+            Some(guardian_error(io::Error::other(
+                "cannot publish lifecycle guardian running status",
+            ))),
+            handles.parent.raw(),
+        );
     }
 
     let git_result = launch_git_inside_job(
-        &mut job,
+        &mut resources.job,
         &config,
-        handles.stdout.raw(),
-        handles.stderr.raw(),
+        command.stdout.raw(),
+        command.stderr.raw(),
         handles.parent.raw(),
     );
     if !parent_is_alive(handles.parent.raw()) {
         wait_for_cleanup_gate(config.cleanup_gate.as_deref());
     }
-    let cleanup = cleanup_job_until_quiesced(&mut job);
-    let result = match (git_result, cleanup) {
-        (Ok(exit_code), Ok(())) => GuardianResult {
+    let result = match git_result {
+        Ok(exit_code) => GuardianResult {
             exit_code: Some(exit_code),
             error: None,
         },
-        (Err(error), Ok(())) => guardian_error(error),
-        (Ok(_), Err(error)) => guardian_error(error),
-        (Err(original), Err(cleanup_error)) => {
-            guardian_error(combine_errors(original, Err(cleanup_error)))
-        }
+        Err(error) => guardian_error(error),
     };
-    drop(job);
-    drop(child_lock);
-    let parent_alive = parent_is_alive(handles.parent.raw());
-    if parent_alive {
-        write_guardian_result(&config, result);
-    } else {
-        let _ = fs::remove_file(&config.result_path);
+    finish_guardian(&config, resources, Some(result), handles.parent.raw())
+}
+
+fn finish_guardian(
+    config: &GuardianConfig,
+    mut resources: GuardianResources,
+    result: Option<GuardianResult>,
+    parent: HANDLE,
+) -> u32 {
+    let _ = write_guardian_status(config, GuardianPhase::Cleaning);
+    // This is deliberately fail-closed: the helper retries while retaining
+    // both the job handle and the child lease until the job is quiescent.
+    let _ = resources.cleanup();
+    drop(resources);
+    if !parent_is_alive(parent) {
+        cleanup_protocol_paths(config);
+        return 0;
+    }
+    if let Some(result) = result {
+        write_guardian_result(config, result);
     }
     0
 }
 
-fn finish_guardian_start_abort(
-    config: &GuardianConfig,
-    job: &mut Job,
-    child_lock: File,
-    parent: HANDLE,
-) -> u32 {
-    let cleanup = cleanup_job_until_quiesced(job);
-    drop(child_lock);
-    if parent_is_alive(parent) {
-        write_guardian_result(
-            config,
-            guardian_error(match cleanup {
-                Ok(()) => io::Error::other("lifecycle guardian start was aborted"),
-                Err(error) => error,
-            }),
-        );
-    } else {
-        let _ = fs::remove_file(&config.result_path);
+struct GuardianResources {
+    job: Job,
+    child_lock: Option<File>,
+}
+
+impl GuardianResources {
+    fn new(job: Job, child_lock: File) -> Self {
+        Self {
+            job,
+            child_lock: Some(child_lock),
+        }
     }
-    0
+
+    fn cleanup(&mut self) -> io::Result<()> {
+        cleanup_job_until_quiesced(&mut self.job)?;
+        drop(self.child_lock.take());
+        Ok(())
+    }
+}
+
+impl Drop for GuardianResources {
+    fn drop(&mut self) {
+        // Catching panics around guardian setup is not enough by itself: a
+        // panic after job creation must still quiesce the job before releasing
+        // the child lease. This Drop path is only reached for such cleanup
+        // paths; deliberate process termination remains covered by job close.
+        if !self.job.quiesced {
+            let _ = self.cleanup();
+        }
+        drop(self.child_lock.take());
+    }
 }
 
 fn read_config_file(path: &Path, nonce: &str) -> io::Result<GuardianConfig> {
@@ -921,8 +1503,16 @@ fn read_config_file(path: &Path, nonce: &str) -> io::Result<GuardianConfig> {
             "guardian bootstrap has no parent",
         )
     })?;
-    if config.child_lock_path.parent() != Some(directory)
-        || config.result_path.parent() != Some(directory)
+    if [
+        &config.bootstrap_path,
+        &config.child_lock_path,
+        &config.result_path,
+        &config.status_path,
+        &config.owner_handoff_path,
+        &config.command_handoff_path,
+    ]
+    .iter()
+    .any(|path| path.parent() != Some(directory))
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -932,32 +1522,83 @@ fn read_config_file(path: &Path, nonce: &str) -> io::Result<GuardianConfig> {
     Ok(config)
 }
 
-fn wait_for_handoff(path: &Path, nonce: &str) -> io::Result<GuardianHandles> {
+fn cleanup_protocol_paths(config: &GuardianConfig) {
+    for path in [
+        &config.bootstrap_path,
+        &config.owner_handoff_path,
+        &config.command_handoff_path,
+        &config.status_path,
+        &config.result_path,
+    ] {
+        let _ = fs::remove_file(path);
+    }
+}
+
+fn write_guardian_status(config: &GuardianConfig, phase: GuardianPhase) -> io::Result<()> {
+    let status = GuardianStatus {
+        nonce: config.nonce.clone(),
+        operation_id: config.operation_id.clone(),
+        guardian_pid: unsafe { windows_sys::Win32::System::Threading::GetCurrentProcessId() },
+        phase,
+    };
+    ProtocolFile::write_atomic(&config.status_path, encode_status(&status)?)
+}
+
+fn wait_for_owner_handoff(path: &Path, nonce: &str) -> io::Result<GuardianOwnerHandle> {
     validate_protocol_path(path)?;
     let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
     loop {
-        let contents = match validate_protocol_file(path).and_then(|()| fs::read(path)) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if Instant::now() >= deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "lifecycle guardian handoff timed out",
-                    ));
+        match validate_protocol_file(path).and_then(|()| fs::read(path)) {
+            Ok(contents) => match decode_owner_handoff(&contents, nonce) {
+                Ok(owner) => {
+                    let _ = fs::remove_file(path);
+                    return Ok(owner);
                 }
-                thread::sleep(GUARDIAN_RETRY_DELAY);
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        if let Ok(handles) = decode_handoff(&contents, nonce) {
-            let _ = fs::remove_file(path);
-            return Ok(handles);
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => {}
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => {}
         }
         if Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "lifecycle guardian handoff timed out",
+                "lifecycle guardian owner handoff timed out",
+            ));
+        }
+        thread::sleep(GUARDIAN_RETRY_DELAY);
+    }
+}
+
+fn wait_for_command_handoff(
+    path: &Path,
+    nonce: &str,
+    parent: HANDLE,
+) -> io::Result<Option<GuardianCommandHandles>> {
+    validate_protocol_path(path)?;
+    let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
+    loop {
+        if !parent_is_alive(parent) {
+            return Ok(None);
+        }
+        match validate_protocol_file(path).and_then(|()| fs::read(path)) {
+            Ok(contents) => match decode_command_handoff(&contents, nonce) {
+                Ok(handles) => {
+                    let _ = fs::remove_file(path);
+                    return Ok(Some(handles));
+                }
+                Err(error) if Instant::now() >= deadline => return Err(error),
+                Err(_) => {}
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) if Instant::now() >= deadline => return Err(error),
+            Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "lifecycle guardian command handoff timed out",
             ));
         }
         thread::sleep(GUARDIAN_RETRY_DELAY);
@@ -1083,12 +1724,21 @@ fn guardian_error(error: io::Error) -> GuardianResult {
     }
 }
 
-fn combine_errors(original: io::Error, cleanup: io::Result<()>) -> io::Error {
-    match cleanup {
-        Ok(()) => original,
-        Err(cleanup_error) => io::Error::other(format!(
-            "{original}; lifecycle cleanup failed: {cleanup_error}"
-        )),
+fn wait_for_test_handshake(phase: &str) {
+    if !cfg!(debug_assertions)
+        || std::env::var_os(TEST_HANDSHAKE_PHASE_ENV).as_deref() != Some(OsStr::new(phase))
+    {
+        return;
+    }
+    let Some(gate) = std::env::var_os(TEST_HANDSHAKE_GATE_ENV).map(PathBuf::from) else {
+        return;
+    };
+    let started = gate.with_extension("started");
+    let release = gate.with_extension("release");
+    let _ = fs::write(&started, format!("{phase}\n"));
+    let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
+    while !release.is_file() && Instant::now() < deadline {
+        thread::sleep(GUARDIAN_RETRY_DELAY);
     }
 }
 
@@ -1118,23 +1768,31 @@ fn cleanup_job_until_quiesced(job: &mut Job) -> io::Result<()> {
 }
 
 struct GuardianOwnedHandles {
-    stdout: OwnedHandle,
-    stderr: OwnedHandle,
-    start: OwnedHandle,
-    ready: OwnedHandle,
-    abort: OwnedHandle,
     parent: OwnedHandle,
 }
 
 impl GuardianOwnedHandles {
-    fn new(handles: GuardianHandles) -> Self {
+    fn new(handles: GuardianOwnerHandle) -> Self {
+        Self {
+            parent: OwnedHandle::new(handles.parent_process),
+        }
+    }
+}
+
+struct GuardianOwnedCommandHandles {
+    stdout: OwnedHandle,
+    stderr: OwnedHandle,
+    start: OwnedHandle,
+    abort: OwnedHandle,
+}
+
+impl GuardianOwnedCommandHandles {
+    fn new(handles: GuardianCommandHandles) -> Self {
         Self {
             stdout: OwnedHandle::new(handles.stdout),
             stderr: OwnedHandle::new(handles.stderr),
             start: OwnedHandle::new(handles.start_event),
-            ready: OwnedHandle::new(handles.ready_event),
             abort: OwnedHandle::new(handles.abort_event),
-            parent: OwnedHandle::new(handles.parent_process),
         }
     }
 }
@@ -1218,15 +1876,39 @@ fn wait_for_git_or_parent(git: HANDLE, parent: HANDLE) -> io::Result<bool> {
     }
 }
 
-fn wait_for_ready_or_process(ready: HANDLE, process: HANDLE) -> io::Result<bool> {
-    let handles = [ready, process];
-    match unsafe { WaitForMultipleObjects(2, handles.as_ptr(), 0, INFINITE) } {
-        WAIT_OBJECT_0 => Ok(true),
-        value if value == WAIT_OBJECT_0 + 1 => Ok(false),
-        WAIT_FAILED => Err(last_error()),
-        _ => Err(io::Error::other(
-            "unexpected lifecycle guardian wait result",
-        )),
+fn guardian_status_is_ready(path: &Path, nonce: &str) -> bool {
+    let Ok(contents) = validate_protocol_file(path).and_then(|()| fs::read(path)) else {
+        return false;
+    };
+    let Ok(status) = decode_status(&contents, nonce) else {
+        return false;
+    };
+    matches!(
+        status.phase,
+        GuardianPhase::Ready
+            | GuardianPhase::AwaitingCommand
+            | GuardianPhase::Running
+            | GuardianPhase::Cleaning
+    )
+}
+
+fn wait_for_ready_or_process(path: &Path, process: HANDLE, nonce: &str) -> io::Result<bool> {
+    validate_protocol_path(path)?;
+    let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
+    loop {
+        if guardian_status_is_ready(path, nonce) {
+            return Ok(true);
+        }
+        if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "lifecycle guardian READY status timed out",
+            ));
+        }
+        thread::sleep(GUARDIAN_RETRY_DELAY);
     }
 }
 
@@ -1236,13 +1918,6 @@ fn wait_for_process(handle: HANDLE) -> io::Result<()> {
     } else {
         Err(last_error())
     }
-}
-
-fn terminate_and_reap_process(handle: HANDLE) {
-    if unsafe { TerminateProcess(handle, 1) } == 0 {
-        return;
-    }
-    let _ = wait_for_process(handle);
 }
 
 fn get_exit_code(handle: HANDLE) -> io::Result<u32> {
@@ -1678,8 +2353,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let config = GuardianConfig {
             nonce: "nonce-значение".to_string(),
+            operation_id: "operation-значение".to_string(),
+            bootstrap_path: directory.path().join("bootstrap"),
             child_lock_path: directory.path().join("child.lock"),
             result_path: directory.path().join("result"),
+            status_path: directory.path().join("status"),
+            owner_handoff_path: directory.path().join("owner-handoff"),
+            command_handoff_path: directory.path().join("command-handoff"),
             cwd: directory.path().join("рабочая папка"),
             args: vec![OsString::from("a b\\"), OsString::from("значение")],
             environment: vec![(OsString::from("A"), OsString::from("значение \\"))],
@@ -1690,6 +2370,8 @@ mod tests {
         let encoded = encode_config(&config).expect("encode config");
         let decoded = decode_config(&encoded, &config.nonce).expect("decode config");
         assert_eq!(decoded.nonce, config.nonce);
+        assert_eq!(decoded.operation_id, config.operation_id);
+        assert_eq!(decoded.bootstrap_path, config.bootstrap_path);
         assert_eq!(decoded.child_lock_path, config.child_lock_path);
         assert_eq!(decoded.cwd, config.cwd);
         assert_eq!(decoded.args, config.args);
