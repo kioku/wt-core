@@ -288,6 +288,38 @@ fn exec_sanitizes_inherited_git_context() {
 
 #[cfg(unix)]
 #[test]
+fn exec_sanitizes_inherited_git_config_injection() {
+    let repo = fixtures::TestRepo::new();
+    add_worktree(&repo, "exec-git-config-env");
+
+    let output = wt_core()
+        .args([
+            "exec",
+            "exec-git-config-env",
+            "--repo",
+            &repo.path().display().to_string(),
+            "--",
+            "sh",
+            "-c",
+            "git config --get core.hooksPath || true",
+        ])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/dev/null'")
+        .output()
+        .expect("exec should start");
+
+    assert!(output.status.success());
+    assert_ne!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "/dev/null",
+        "exec leaked Git config injection into its child"
+    );
+}
+
+#[cfg(unix)]
+#[test]
 fn exec_replacement_receives_parent_signal_without_orphaning_child() {
     use std::os::unix::process::ExitStatusExt;
 

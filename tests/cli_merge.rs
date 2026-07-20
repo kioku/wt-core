@@ -674,6 +674,12 @@ fn merge_lifecycle_lock_blocks_hook_race_but_allows_read_only_status() {
         "status should remain read-only: {}",
         String::from_utf8_lossy(&status.stderr)
     );
+    let status_json: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("busy status JSON");
+    assert_eq!(
+        status_json["state"], "busy",
+        "live owner was misreported as an interrupted operation"
+    );
 
     let continue_output = wt_core()
         .args(["merge", "--continue", "--repo", &repo_str])
@@ -801,6 +807,409 @@ fn wait_for_file(path: &std::path::Path) {
         sleep(Duration::from_millis(10));
     }
     panic!("timed out waiting for {}", path.display());
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_config_injection_cannot_bypass_merge_hooks() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    wt_core()
+        .args(["add", "feature/config-hook", "--repo", &repo_str])
+        .assert()
+        .success();
+    let source = find_worktree_dir(&repo.path(), "feature-config-hook");
+    commit_file(&source, "config-hook.txt", "source", "source");
+    install_hook(
+        &repo,
+        "pre-merge-commit",
+        "#!/bin/sh\necho config hook ran >&2\nexit 42\n",
+    );
+
+    // These are the exact dynamic and packed Git config injection vectors that
+    // a hook-inherited environment can use to set core.hooksPath=/dev/null.
+    // wt-core must remove them from every Git child before the merge starts.
+    let output = wt_core()
+        .args(["merge", "feature/config-hook", "--repo", &repo_str])
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+        .env("GIT_CONFIG_VALUE_0", "/dev/null")
+        .env("GIT_CONFIG_PARAMETERS", "'core.hooksPath=/dev/null'")
+        // Windows treats environment names case-insensitively; these lower
+        // case spellings must be removed there as well.
+        .env("git_config_count", "1")
+        .env("git_config_key_0", "core.hooksPath")
+        .env("git_config_value_0", "/dev/null")
+        .env("git_config_parameters", "'core.hooksPath=/dev/null'")
+        .env("GIT_NAMESPACE", "untrusted-namespace")
+        .output()
+        .expect("merge should run");
+    assert!(
+        !output.status.success(),
+        "hook bypass unexpectedly succeeded"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("config hook ran"),
+        "hook was bypassed: {stderr}"
+    );
+    assert_branch_exists(&repo.path(), "feature/config-hook");
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_destination_ref_lock_blocks_head_race() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-head-boundary");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    let marker = repo.path().join("continue-ref-race");
+    install_hook(
+        &repo,
+        "pre-commit",
+        &format!(
+            "#!/bin/sh\nset -eu\nold={}\nrace=$(git commit-tree \"$(git rev-parse HEAD^{{tree}})\" -p \"$old\" -m race)\nif git update-ref refs/heads/main \"$race\" \"$old\"; then printf raced > {}; else printf blocked > {}; fi\n",
+            shell_quote(&destination_head),
+            shell_quote(&marker.display().to_string()),
+            shell_quote(&marker.display().to_string()),
+        ),
+    );
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::read_to_string(&marker).expect("race marker"),
+        "blocked"
+    );
+    let parents = git_rev_parse(&repo.path(), "main^@");
+    assert!(parents.starts_with(&destination_head));
+    assert!(
+        !source.exists(),
+        "successful continuation should clean source"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_restores_symbolic_head_when_final_cas_fails() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-final-cas");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let shim = tempfile::TempDir::new().expect("git shim directory");
+    let marker = shim.path().join("raced");
+    let script = shim.path().join("git");
+    std::fs::write(
+        &script,
+        r#"#!/bin/sh
+set -eu
+if [ "$#" -ge 4 ] && [ "$1" = "update-ref" ] && [ "$2" = "refs/heads/main" ] && [ ! -e "$WT_RACE_MARKER" ]; then
+    : > "$WT_RACE_MARKER"
+    tree=$("$WT_REAL_GIT" rev-parse HEAD^{tree})
+    race=$("$WT_REAL_GIT" commit-tree "$tree" -p "$4" -m race)
+    "$WT_REAL_GIT" update-ref "$2" "$race" "$4"
+fi
+exec "$WT_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write git shim");
+    let mut permissions = std::fs::metadata(&script)
+        .expect("git shim metadata")
+        .permissions();
+    permissions.set_mode(0o700);
+    std::fs::set_permissions(&script, permissions).expect("chmod git shim");
+    let real_git = {
+        let path = std::env::var_os("PATH").expect("PATH");
+        std::env::split_paths(&path)
+            .map(|component| component.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("git executable")
+    };
+    let path = format!(
+        "{}:{}",
+        shim.path().display(),
+        std::env::var("PATH").expect("PATH")
+    );
+
+    let output = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .env("PATH", path)
+        .env("WT_REAL_GIT", real_git)
+        .env("WT_RACE_MARKER", &marker)
+        .output()
+        .expect("continuation should run");
+    assert!(!output.status.success(), "final CAS race must be refused");
+    assert!(marker.exists(), "final CAS shim did not run");
+    let attached = git_allow_failure(
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &repo.path(),
+    );
+    assert_eq!(
+        String::from_utf8(attached.stdout)
+            .expect("symbolic HEAD should be utf8")
+            .trim(),
+        "main"
+    );
+    assert!(!git_path(&repo.path(), "refs/heads/main.lock").exists());
+    assert!(
+        source.exists(),
+        "failed final CAS must preserve cleanup intent"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn merge_continue_recovers_ref_lock_and_symbolic_head_after_kill() {
+    use std::thread::sleep;
+    use std::time::Duration;
+
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-kill");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    let entered = repo.path().join("continue-kill-entered");
+    let release = repo.path().join("continue-kill-release");
+    install_hook(
+        &repo,
+        "pre-commit",
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf entered > {}\nwhile [ ! -f {} ]; do sleep 0.05; done\n",
+            shell_quote(&entered.display().to_string()),
+            shell_quote(&release.display().to_string()),
+        ),
+    );
+
+    let mut continuation = StdCommand::new(assert_cmd::cargo_bin!("wt-core"));
+    continuation
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut continuation = continuation.spawn().expect("continuation should start");
+    wait_for_file(&entered);
+    let ref_lock = git_path(&repo.path(), "refs/heads/main.lock");
+    assert!(
+        ref_lock.exists(),
+        "continuation should reserve the destination ref"
+    );
+    continuation
+        .kill()
+        .expect("continuation should be terminable");
+    std::fs::write(&release, "release\n").expect("release continuation hook");
+    let _ = continuation.wait_with_output();
+
+    // The orphaned Git child may retain the lifecycle lock briefly. Wait for
+    // it to finish before exercising stale ref-lock/head recovery.
+    for _ in 0..200 {
+        let status = wt_core()
+            .args(["merge", "--status", "--json", "--repo", &repo_str])
+            .output()
+            .expect("status should run");
+        if !String::from_utf8_lossy(&status.stdout).contains("\"state\":\"busy\"") {
+            break;
+        }
+        sleep(Duration::from_millis(20));
+    }
+    assert!(
+        ref_lock.exists(),
+        "the terminated owner should leave a recoverable lock file"
+    );
+    let detached = git_allow_failure(&["symbolic-ref", "--quiet", "HEAD"], &repo.path());
+    assert!(
+        !detached.status.success(),
+        "killed continuation should leave a detached HEAD before recovery"
+    );
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+    assert!(
+        !ref_lock.exists(),
+        "recovery should clear the stale ref lock"
+    );
+    let attached = git_allow_failure(
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+        &repo.path(),
+    );
+    assert_eq!(
+        String::from_utf8(attached.stdout)
+            .expect("symbolic HEAD should be utf8")
+            .trim(),
+        "main"
+    );
+    assert!(
+        !source.exists(),
+        "recovered continuation should finish cleanup"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-kill");
+}
+
+#[test]
+fn merge_continue_recovers_recorded_detached_destination_head() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-recorded-head");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    run_git(
+        &["update-ref", "--no-deref", "HEAD", &destination_head],
+        &repo.path(),
+    );
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(
+        git_rev_parse(&repo.path(), "main"),
+        git_rev_parse(&repo.path(), "HEAD")
+    );
+    assert!(
+        !source.exists(),
+        "recorded detached HEAD should be recovered"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-recorded-head");
+}
+
+#[test]
+fn merge_continue_recovers_detached_expected_result_before_ref_update() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-result-head");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    let source_head = git_rev_parse(&repo.path(), "MERGE_HEAD");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    let tree = git_output(&["write-tree"], &repo.path());
+    let result = git_output(
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &destination_head,
+            "-p",
+            &source_head,
+            "-m",
+            "recovered merge",
+        ],
+        &repo.path(),
+    );
+    run_git(&["update-ref", "--no-deref", "HEAD", &result], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(git_rev_parse(&repo.path(), "main"), result);
+    assert!(
+        !source.exists(),
+        "expected merge result should be recovered"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-result-head");
+}
+
+#[test]
+fn merge_continue_recovers_detached_expected_result_after_ref_update() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-result-ref");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    let source_head = git_rev_parse(&repo.path(), "MERGE_HEAD");
+    std::fs::write(repo.path().join("shared.txt"), "resolved\n").expect("resolve conflict");
+    run_git(&["add", "shared.txt"], &repo.path());
+    let tree = git_output(&["write-tree"], &repo.path());
+    let result = git_output(
+        &[
+            "commit-tree",
+            &tree,
+            "-p",
+            &destination_head,
+            "-p",
+            &source_head,
+            "-m",
+            "recovered merge",
+        ],
+        &repo.path(),
+    );
+    run_git(
+        &["update-ref", "refs/heads/main", &result, &destination_head],
+        &repo.path(),
+    );
+    run_git(&["update-ref", "--no-deref", "HEAD", &result], &repo.path());
+
+    wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert_eq!(git_rev_parse(&repo.path(), "main"), result);
+    assert!(
+        !source.exists(),
+        "updated expected result should be recovered"
+    );
+    assert_branch_deleted(&repo.path(), "feature/continue-result-ref");
+}
+
+#[test]
+fn merge_continue_rejects_an_unrecognized_detached_head() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let source = create_conflicted_merge(&repo, "feature/continue-unrelated-head");
+    let destination_head = git_rev_parse(&repo.path(), "main");
+    let tree = git_rev_parse(&repo.path(), "HEAD^{tree}");
+    let unrelated = git_output(
+        &["commit-tree", &tree, "-m", "unrelated detached state"],
+        &repo.path(),
+    );
+    assert_ne!(unrelated, destination_head);
+    run_git(
+        &["update-ref", "--no-deref", "HEAD", &unrelated],
+        &repo.path(),
+    );
+
+    let output = wt_core()
+        .args(["merge", "--continue", "--repo", &repo_str])
+        .output()
+        .expect("continuation should run");
+    assert!(
+        !output.status.success(),
+        "unrecognized HEAD must be refused"
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("neither the recorded destination"));
+    assert!(
+        !git_allow_failure(&["symbolic-ref", "--quiet", "HEAD"], &repo.path())
+            .status
+            .success(),
+        "unrecognized HEAD must remain detached"
+    );
+    assert_eq!(
+        git_rev_parse(&repo.path(), "refs/heads/main"),
+        destination_head
+    );
+    assert!(
+        source.exists(),
+        "unrecognized HEAD must preserve the source"
+    );
+    assert_branch_exists(&repo.path(), "feature/continue-unrelated-head");
+    assert!(
+        repo.path()
+            .join(".git/wt-core/merge-operation.json")
+            .is_file(),
+        "unrecognized HEAD must preserve the lifecycle journal"
+    );
 }
 
 #[cfg(unix)]
@@ -3129,6 +3538,21 @@ fn git_rev_parse(repo: &std::path::Path, revision: &str) -> String {
     assert!(
         output.status.success(),
         "git rev-parse {revision} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout)
+        .expect("invalid utf8")
+        .trim()
+        .to_string()
+}
+
+/// Run Git and return its trimmed stdout for tests that need an object ID.
+fn git_output(args: &[&str], cwd: &std::path::Path) -> String {
+    let output = git_allow_failure(args, cwd);
+    assert!(
+        output.status.success(),
+        "git {} failed: {}",
+        args.join(" "),
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8(output.stdout)

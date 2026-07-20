@@ -227,6 +227,21 @@ if ($env.PWD | path expand) == $matrix_root {
     fail "matrix remove --json: cwd was not reset"
 }
 
+# An inherited GIT_COMMON_DIR must not redirect Nu's repository discovery.
+wt add matrix-wrong | ignore
+cd $matrix_root
+let wrong_repo = ($work | path join "nu-wrong-repo")
+let wrong_path = (^find ($matrix_root | path join ".worktrees") -maxdepth 1 -type d -name "matrix-wrong--*" -print | str trim)
+^git init -b main $wrong_repo o+e>| ignore
+$env.GIT_COMMON_DIR = ($wrong_repo | path join ".git")
+let wrong_json = (wt remove matrix-wrong --json)
+hide-env GIT_COMMON_DIR
+if ($wrong_json | str contains '"branch":"matrix-wrong"') and not ($wrong_path | path exists) and ($wrong_repo | path exists) {
+    pass "wt remove --json: sanitized repo resolution ignores GIT_COMMON_DIR"
+} else {
+    fail $"wt remove --json: wrong-repository mutation: ($wrong_json)"
+}
+
 wt add matrix-partial | ignore
 "partial" | save --force partial.txt
 ^git add partial.txt
@@ -237,6 +252,11 @@ if $partial_output.exit_code == 0 and ($partial_output.stdout | str contains "ke
     pass "matrix remove: partial cleanup reports kept branch"
 } else {
     fail $"matrix remove: partial cleanup claimed branch deletion: ($partial_output.stdout)"
+}
+if ($partial_output.stderr | str contains "worktree removed but branch deletion failed") {
+    pass "matrix remove: successful stderr warning preserved"
+} else {
+    fail $"matrix remove: successful stderr warning was discarded: ($partial_output.stderr)"
 }
 if (^git show-ref --verify --quiet refs/heads/matrix-partial | complete).exit_code == 0 {
     pass "matrix remove: partial cleanup retains branch"
@@ -263,8 +283,26 @@ if ($env.PWD | path expand) == $matrix_root {
 }
 
 # A failed JSON command must still fail when invoked from a child Nu script.
-# The binding re-raises wt-core's external-command error after its stderr has
-# already been rendered, rather than returning success from a catch block.
+# Conflict responses are structured on stdout; the binding must forward that
+# stream before re-raising the child failure.
+wt add matrix-conflict | ignore
+"source conflict" | save --force conflict.txt
+^git add conflict.txt
+^git commit -m "source conflict" o+e>| ignore
+cd $matrix_root
+"destination conflict" | save --force conflict.txt
+^git add conflict.txt
+^git commit -m "destination conflict" o+e>| ignore
+let conflict_script = $"source ($binding_path); wt merge matrix-conflict --json"
+let conflict_output = (^nu -c $conflict_script | complete)
+if $conflict_output.exit_code != 0 and ($conflict_output.stdout | str contains '"ok":false') and ($conflict_output.stdout | str contains 'content_conflict') {
+    pass "wt merge --json: forwards structured conflict stdout on failure"
+} else {
+    fail $"wt merge --json: expected structured conflict stdout, got ($conflict_output.exit_code), ($conflict_output.stdout), ($conflict_output.stderr)"
+}
+^wt-core merge --abort --repo $matrix_root o+e>| ignore
+wt remove matrix-conflict --force | ignore
+
 let failure_repo = ($work | path join "repo")
 let remove_failure_script = $"source ($binding_path); wt remove missing --json --repo ($failure_repo)"
 let remove_failure = (^nu -c $remove_failure_script | complete)

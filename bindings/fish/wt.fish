@@ -200,12 +200,34 @@ function wt --description "Git worktree manager"
                 end
             end
 
-            # Status, continue, and abort are lifecycle reports, not the
-            # legacy navigation protocol or path-only output protocol.
+            # Status and abort do not remove a worktree. Continue can finish
+            # source cleanup, so consume the navigation side channel even in
+            # its lifecycle output modes.
             for arg in $argv
-                if test "$arg" = "--status" -o "$arg" = "--continue" -o "$arg" = "--abort"
+                if test "$arg" = "--status" -o "$arg" = "--abort"
                     wt-core merge $argv
                     return $status
+                else if test "$arg" = "--continue"
+                    set -l cwd_before (pwd)
+                    set -l nav_file (wt__navigation_file)
+                    if test $status -ne 0
+                        return 1
+                    end
+                    set -l output (wt-core merge $argv --navigation-file "$nav_file")
+                    set -l rc $status
+                    if test $rc -eq 0 -a -f "$nav_file"
+                        set -l navigation (string split0 < "$nav_file")
+                        if test "$navigation[1]" = reset \
+                            -a -n "$navigation[2]" \
+                            -a -n "$navigation[3]"
+                            if wt__path_is_within "$cwd_before" "$navigation[2]"
+                                cd "$navigation[3]"; or true
+                            end
+                        end
+                    end
+                    rm -f -- "$nav_file"
+                    printf '%s\n' $output
+                    return $rc
                 end
             end
 
@@ -260,7 +282,9 @@ function wt --description "Git worktree manager"
                 set -l removed_path $lines[5]
                 set -l pushed $lines[6]
                 set -l destination_path $lines[7]
-                if test "$cleaned_up" = "true" -a -n "$removed_path"
+                # A worktree may be gone even when branch cleanup is pending;
+                # never leave the caller inside that deleted directory.
+                if test -n "$removed_path"
                     if wt__path_is_within "$cwd_before" "$removed_path"
                         cd "$repo_root"; or true
                     end

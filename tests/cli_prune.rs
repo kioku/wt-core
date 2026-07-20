@@ -26,6 +26,25 @@ fn prune_dry_run_no_worktrees() {
 }
 
 #[test]
+fn prune_dry_run_does_not_create_lifecycle_lock_state() {
+    let repo = fixtures::TestRepo::new();
+    let repo_str = repo.path().display().to_string();
+    let state_dir = repo.path().join(".git/wt-core");
+    assert!(!state_dir.exists());
+
+    wt_core()
+        .args(["prune", "--repo", &repo_str])
+        .assert()
+        .success();
+
+    assert!(
+        !state_dir.exists(),
+        "read-only prune created lifecycle state at {}",
+        state_dir.display()
+    );
+}
+
+#[test]
 fn prune_dry_run_shows_integrated_merged() {
     let repo = fixtures::TestRepo::new();
     let repo_str = repo.path().display().to_string();

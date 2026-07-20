@@ -1114,6 +1114,7 @@ fn pick_action_worktree_entry(
 }
 
 /// Capitalize the first character of a string (ASCII only).
+#[cfg(feature = "interactive")]
 fn capitalize(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {

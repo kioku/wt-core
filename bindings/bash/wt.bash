@@ -171,13 +171,34 @@ wt() {
                 esac
             done
 
-            # Status, continue, and abort are lifecycle reports, not the
-            # legacy navigation protocol or path-only output protocol.
+            # Status and abort do not remove a worktree. Continue can finish
+            # source cleanup, so consume the navigation side channel even in
+            # its lifecycle output modes.
             for arg in "$@"; do
                 case "$arg" in
-                    --status|--continue|--abort)
+                    --status|--abort)
                         wt-core merge "$@"
                         return $?
+                        ;;
+                    --continue)
+                        local cwd_before nav_file output rc
+                        cwd_before=$(pwd -P)
+                        nav_file=$(mktemp "${TMPDIR:-/tmp}/wt-core-nav.XXXXXX") || return 1
+                        output=$(wt-core merge "$@" --navigation-file "$nav_file")
+                        rc=$?
+                        if [ $rc -eq 0 ] && [ -f "$nav_file" ]; then
+                            local -a navigation
+                            mapfile -d '' -t navigation < "$nav_file"
+                            if [ "${navigation[0]-}" = reset ] \
+                                && [ -n "${navigation[1]-}" ] \
+                                && [ -n "${navigation[2]-}" ] \
+                                && wt__path_is_within "$cwd_before" "${navigation[1]}"; then
+                                cd "${navigation[2]}" || true
+                            fi
+                        fi
+                        rm -f "$nav_file"
+                        printf '%s\n' "$output"
+                        return $rc
                         ;;
                 esac
             done
@@ -232,7 +253,9 @@ wt() {
                 removed_path=$(printf '%s\n' "$result" | sed -n '5p')
                 pushed=$(printf '%s\n' "$result" | sed -n '6p')
                 destination_path=$(printf '%s\n' "$result" | sed -n '7p')
-                if [ "$cleaned_up" = "true" ] && [ -n "$removed_path" ]; then
+                # A worktree may be gone even when branch cleanup is pending;
+                # never leave the caller inside that deleted directory.
+                if [ -n "$removed_path" ]; then
                     if wt__path_is_within "$cwd_before" "$removed_path"; then
                         cd "$repo_root" || true
                     fi
