@@ -1876,28 +1876,28 @@ fn wait_for_git_or_parent(git: HANDLE, parent: HANDLE) -> io::Result<bool> {
     }
 }
 
-fn guardian_status_is_ready(path: &Path, nonce: &str) -> bool {
+fn guardian_status_phase(path: &Path, nonce: &str) -> Option<GuardianPhase> {
     let Ok(contents) = validate_protocol_file(path).and_then(|()| fs::read(path)) else {
-        return false;
+        return None;
     };
-    let Ok(status) = decode_status(&contents, nonce) else {
-        return false;
-    };
-    matches!(
-        status.phase,
-        GuardianPhase::Ready
-            | GuardianPhase::AwaitingCommand
-            | GuardianPhase::Running
-            | GuardianPhase::Cleaning
-    )
+    decode_status(&contents, nonce)
+        .ok()
+        .map(|status| status.phase)
 }
 
 fn wait_for_ready_or_process(path: &Path, process: HANDLE, nonce: &str) -> io::Result<bool> {
     validate_protocol_path(path)?;
     let deadline = Instant::now() + GUARDIAN_SETUP_TIMEOUT;
     loop {
-        if guardian_status_is_ready(path, nonce) {
-            return Ok(true);
+        match guardian_status_phase(path, nonce) {
+            Some(
+                GuardianPhase::Ready | GuardianPhase::AwaitingCommand | GuardianPhase::Running,
+            ) => return Ok(true),
+            // Cleaning is a terminal setup failure, not authorization. Return
+            // through the normal result-reporting path so injected and real
+            // setup errors remain deterministic.
+            Some(GuardianPhase::Cleaning) => return Ok(false),
+            Some(GuardianPhase::Starting | GuardianPhase::LeaseHeld) | None => {}
         }
         if unsafe { WaitForSingleObject(process, 0) } == WAIT_OBJECT_0 {
             return Ok(false);

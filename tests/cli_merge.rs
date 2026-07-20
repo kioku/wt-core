@@ -1039,28 +1039,52 @@ fn windows_lifecycle_owner_death_at_each_pre_authorization_handshake_phase_is_sa
         let mut merge = merge.spawn().expect("handshake merge should start");
         wait_for_file(&started);
         merge.kill().expect("handshake owner should be terminable");
+        let owner_output = merge
+            .wait_with_output()
+            .expect("handshake owner should be reaped");
+        assert!(
+            !owner_output.status.success(),
+            "killed handshake owner unexpectedly succeeded"
+        );
 
         let status = wt_core()
             .args(["merge", "--status", "--json", "--repo", &repo_str])
             .output()
             .expect("handshake status should run after owner death");
-        let status_text = String::from_utf8_lossy(&status.stdout);
+        let status_json: serde_json::Value =
+            serde_json::from_slice(&status.stdout).expect("handshake status JSON");
         let lease_phase =
             phase.contains("after-lease") || phase.contains("ready") || phase.contains("command");
         if lease_phase {
             assert!(
-                status_text.contains("\"state\":\"busy\""),
-                "new wt must see the surviving guardian as busy in {phase}: {status_text}"
+                status.status.success(),
+                "status failed after the killed owner was reaped in {phase}: {}",
+                String::from_utf8_lossy(&status.stderr)
+            );
+            assert!(
+                !try_child_lock(&child_lock_path(&repo.path())),
+                "post-lease status was busy without the surviving guardian child lock in {phase}"
+            );
+            assert_eq!(
+                status_json["state"], "busy",
+                "new wt must see the surviving guardian as busy in {phase}: {status_json}"
             );
         } else {
+            assert_eq!(
+                status_json["state"], "interrupted",
+                "pre-lease owner death must report deterministic interruption in {phase}: {status_json}"
+            );
+            assert_eq!(
+                status_json["ok"], false,
+                "pre-lease status must be an explicit safe outcome in {phase}: {status_json}"
+            );
             assert!(
-                status_text.contains("\"state\":\"busy\"") || !git_started.exists(),
-                "pre-lease owner death must not start stale Git in {phase}: {status_text}"
+                !git_started.exists(),
+                "pre-lease owner death must not start stale Git in {phase}"
             );
         }
 
         std::fs::write(&release, "release\n").expect("release handshake gate");
-        let _ = merge.wait_with_output();
         wait_for_child_lock(&child_lock_path(&repo.path()), true);
         assert!(
             !git_started.exists(),
