@@ -169,30 +169,31 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
 }
 
 /// List all worktrees via `git worktree list --porcelain`.
-pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
-    // Prune stale worktrees first (matches current behavior expectation).
-    let _ = git(&["worktree", "prune"], repo.as_ref());
-    list_worktrees_readonly(repo)
-}
-
-/// List worktrees while retaining the lifecycle child lease across Git's
-/// metadata prune. This is required whenever the caller already owns a
-/// mutating merge lifecycle lock.
-pub fn list_worktrees_with_lifecycle_lock(
-    repo: &RepoRoot,
-    lifecycle_lock: &operation_state::MergeLifecycleLock,
-) -> Result<Vec<Worktree>> {
-    let _ = git_with_lifecycle_lock(&["worktree", "prune"], repo.as_ref(), lifecycle_lock);
-    list_worktrees_readonly(repo)
-}
-
-/// List worktrees without pruning Git's worktree metadata.
 ///
-/// Merge preflight and `--inspect` use this variant so inspection never
-/// changes repository state, including stale-worktree administrative files.
-pub fn list_worktrees_readonly(repo: &RepoRoot) -> Result<Vec<Worktree>> {
+/// Listing is deliberately read-only. In particular, it must not invoke
+/// `git worktree prune`: callers may be resolving a target before acquiring
+/// the lifecycle lock, and status/navigation commands must never mutate Git
+/// metadata as a side effect.
+pub fn list_worktrees(repo: &RepoRoot) -> Result<Vec<Worktree>> {
     let raw = git(&["worktree", "list", "--porcelain"], repo.as_ref())?;
     parse_worktree_porcelain(&raw, repo)
+}
+
+/// Explicitly prune stale Git worktree metadata while holding the lifecycle
+/// child lease. This is the only wt-core path that invokes `git worktree
+/// prune`; callers must use it only from a workflow that already owns the
+/// repository lifecycle lock.
+pub fn prune_worktree_metadata_with_lifecycle_lock(
+    repo: &RepoRoot,
+    lifecycle_lock: &operation_state::MergeLifecycleLock,
+) -> Result<()> {
+    git_with_lifecycle_lock(&["worktree", "prune"], repo.as_ref(), lifecycle_lock).map(|_| ())
+}
+
+/// Compatibility name for callers that need to document a read-only list.
+/// This delegates to `list_worktrees`, which is also strictly read-only.
+pub fn list_worktrees_readonly(repo: &RepoRoot) -> Result<Vec<Worktree>> {
+    list_worktrees(repo)
 }
 
 /// A raw worktree entry parsed from porcelain lines.
@@ -918,30 +919,18 @@ fn resolve_origin_head(repo: &RepoRoot) -> Option<String> {
 /// 3. Local branch named `master`
 /// 4. The main worktree's branch (first entry from `git worktree list`)
 pub fn resolve_mainline(repo: &RepoRoot) -> Result<String> {
-    resolve_mainline_with_worktree_listing(repo, true, None)
+    resolve_mainline_with_worktree_listing(repo)
 }
 
-/// Resolve the mainline while retaining a lifecycle child lease across stale
-/// worktree metadata pruning.
-pub fn resolve_mainline_with_lifecycle_lock(
-    repo: &RepoRoot,
-    lifecycle_lock: &operation_state::MergeLifecycleLock,
-) -> Result<String> {
-    resolve_mainline_with_worktree_listing(repo, true, Some(lifecycle_lock))
-}
-
-/// Resolve the mainline without pruning worktree metadata.
+/// Resolve the mainline without changing worktree metadata.
 ///
-/// This is used by merge preflight because inspection must be read-only.
+/// Any workflow that needs stale metadata pruned must perform that explicit
+/// action under its lifecycle lock before resolving the mainline.
 pub fn resolve_mainline_readonly(repo: &RepoRoot) -> Result<String> {
-    resolve_mainline_with_worktree_listing(repo, false, None)
+    resolve_mainline(repo)
 }
 
-fn resolve_mainline_with_worktree_listing(
-    repo: &RepoRoot,
-    prune: bool,
-    lifecycle_lock: Option<&operation_state::MergeLifecycleLock>,
-) -> Result<String> {
+fn resolve_mainline_with_worktree_listing(repo: &RepoRoot) -> Result<String> {
     // 1. Try origin/HEAD — prefer the local branch name if it exists,
     //    otherwise use the full remote ref so git commands can resolve it
     //    even when there is no local tracking branch.
@@ -961,12 +950,10 @@ fn resolve_mainline_with_worktree_listing(
         return Ok("master".to_string());
     }
 
-    // 4. Fall back to main worktree's branch
-    let worktrees = match (prune, lifecycle_lock) {
-        (true, Some(lock)) => list_worktrees_with_lifecycle_lock(repo, lock)?,
-        (true, None) => list_worktrees(repo)?,
-        (false, _) => list_worktrees_readonly(repo)?,
-    };
+    // 4. Fall back to main worktree's branch. Listing remains read-only;
+    // callers that need metadata cleanup do that explicitly under the
+    // lifecycle lock before reaching this point.
+    let worktrees = list_worktrees(repo)?;
     worktrees
         .iter()
         .find(|wt| wt.is_main)

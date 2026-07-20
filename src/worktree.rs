@@ -328,11 +328,13 @@ fn remove_with_branch_context(
     // also owns its source and destination until continue/abort finishes.
     let lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     let active_merge = active_merge_operation(repo)?;
-    let worktrees = if active_merge.is_some() {
-        git::list_worktrees_readonly(repo)?
-    } else {
-        git::list_worktrees_with_lifecycle_lock(repo, &lifecycle_lock)?
-    };
+    if active_merge.is_none() {
+        // Removal is an explicit mutating workflow. Prune stale Git metadata
+        // only after the lifecycle lock is held; target selection before this
+        // point is always a read-only observation.
+        git::prune_worktree_metadata_with_lifecycle_lock(repo, &lifecycle_lock)?;
+    }
+    let worktrees = git::list_worktrees_readonly(repo)?;
 
     // Resolve which branch to remove.
     let target_branch = match branch {
@@ -670,16 +672,10 @@ fn local_branch_revision(repo: &RepoRoot, revision: &str) -> Option<String> {
 fn resolve_integration_target(
     repo: &RepoRoot,
     mainline_override: Option<&str>,
-    readonly: bool,
-    lifecycle_lock: Option<&operation_state::MergeLifecycleLock>,
 ) -> Result<IntegrationTarget> {
     let requested = match mainline_override {
         Some(revision) => revision.to_string(),
-        None if readonly => git::resolve_mainline_readonly(repo)?,
-        None => match lifecycle_lock {
-            Some(lock) => git::resolve_mainline_with_lifecycle_lock(repo, lock)?,
-            None => git::resolve_mainline(repo)?,
-        },
+        None => git::resolve_mainline(repo)?,
     };
 
     if let Some(branch) = local_branch_revision(repo, &requested) {
@@ -729,13 +725,7 @@ fn prune_dry_run_inner(
     lifecycle_lock: Option<&operation_state::MergeLifecycleLock>,
     active_merge: Option<&ActiveMergeOperation>,
 ) -> Result<PruneDryRun> {
-    let repair_stale_markers = lifecycle_lock.is_some();
-    let target = resolve_integration_target(
-        repo,
-        mainline_override,
-        !repair_stale_markers,
-        lifecycle_lock,
-    )?;
+    let target = resolve_integration_target(repo, mainline_override)?;
     let mainline = target.revision.clone();
 
     let worktrees = git::list_worktrees_readonly(repo)?;
@@ -1068,10 +1058,10 @@ pub fn prune_execute(
     mainline_override: Option<&str>,
     force: bool,
 ) -> Result<PruneExecuteResult> {
-    // Hold the repository lifecycle lock across planning, stale-marker repair,
-    // worktree removal, and branch deletion. A managed merge owns its source
-    // and destination until recovery completes, so fail closed rather than
-    // allowing prune to invalidate that journal.
+    // Hold the repository lifecycle lock across metadata pruning, planning,
+    // stale-marker repair, worktree removal, and branch deletion. A managed
+    // merge owns its source and destination until recovery completes, so fail
+    // closed rather than allowing prune to invalidate that journal.
     let lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
     if let Some(active_merge) = active_merge_operation(repo)? {
         return Err(AppError::conflict(format!(
@@ -1079,6 +1069,7 @@ pub fn prune_execute(
             active_merge.source, active_merge.destination
         )));
     }
+    git::prune_worktree_metadata_with_lifecycle_lock(repo, &lifecycle_lock)?;
     let dry_run = prune_dry_run_inner(repo, mainline_override, Some(&lifecycle_lock), None)?;
     let mainline = dry_run.mainline;
 
@@ -1132,7 +1123,9 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
         return Ok(diags);
     }
 
-    // List worktrees and check for orphaned directories.
+    // List worktrees and check for orphaned directories. Listing is
+    // intentionally read-only; stale metadata is diagnosed below instead of
+    // being silently removed by a health check.
     let worktrees = git::list_worktrees(repo)?;
 
     let managed_paths: Vec<_> = worktrees.iter().map(|wt| &wt.path).collect();
@@ -1157,6 +1150,15 @@ pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
     for wt in &worktrees {
         if wt.is_main {
             continue;
+        }
+        if !wt.path.exists() {
+            diags.push(Diagnostic {
+                level: DiagLevel::Warn,
+                message: format!(
+                    "stale worktree metadata for {} (run `wt prune --execute` to remove it safely)",
+                    wt.path.display()
+                ),
+            });
         }
         if wt.branch.is_none() {
             diags.push(Diagnostic {
@@ -2195,8 +2197,7 @@ fn topology_refusal(
 /// Validate a worktree record before using it for a merge and capture its
 /// stable Git registration identity.
 ///
-/// Normal merges prune stale Git metadata before this check. Keeping the
-/// explicit identity validation here also handles locked or otherwise
+/// The explicit identity validation here also handles locked or otherwise
 /// replaced records without falling through to a low-level Git mutation.
 fn validate_merge_worktree(
     repo: &RepoRoot,
@@ -2331,15 +2332,14 @@ fn validate_preflight_worktrees(
 
 /// Inspect the merge topology without changing repository state.
 ///
-/// `readonly` is true for `--inspect`. Normal merges deliberately prune
-/// stale worktree metadata before selecting either side of the merge.
+/// Normal merges explicitly prune stale worktree metadata after acquiring the
+/// lifecycle lock and before calling this read-only planner.
 pub fn merge_preflight(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
     into: Option<&str>,
-    readonly: bool,
 ) -> Result<MergePreflight> {
-    merge_preflight_inner(repo, branch, into, readonly, None)
+    merge_preflight_inner(repo, branch, into)
 }
 
 pub(crate) fn merge_preflight_with_lifecycle_lock(
@@ -2348,24 +2348,22 @@ pub(crate) fn merge_preflight_with_lifecycle_lock(
     into: Option<&str>,
     lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<MergePreflight> {
-    merge_preflight_inner(repo, branch, into, false, Some(lifecycle_lock))
+    // The caller acquired the lifecycle lock before entering normal merge
+    // preflight. Keep the explicit Git metadata mutation separate from the
+    // read-only listing so selection can never prune before lock acquisition.
+    git::prune_worktree_metadata_with_lifecycle_lock(repo, lifecycle_lock)?;
+    merge_preflight_inner(repo, branch, into)
 }
 
 fn merge_preflight_inner(
     repo: &RepoRoot,
     branch: Option<&BranchName>,
     into: Option<&str>,
-    readonly: bool,
-    lifecycle_lock: Option<&operation_state::MergeLifecycleLock>,
 ) -> Result<MergePreflight> {
-    let worktrees = if readonly {
-        git::list_worktrees_readonly(repo)?
-    } else {
-        match lifecycle_lock {
-            Some(lock) => git::list_worktrees_with_lifecycle_lock(repo, lock)?,
-            None => git::list_worktrees(repo)?,
-        }
-    };
+    // All listings are read-only. Normal merge callers perform the explicit
+    // contained metadata prune in `merge_preflight_with_lifecycle_lock`
+    // before reaching this planner.
+    let worktrees = git::list_worktrees_readonly(repo)?;
 
     let target_branch = match branch {
         Some(branch) => branch.clone(),

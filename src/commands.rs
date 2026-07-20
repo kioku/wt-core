@@ -995,12 +995,10 @@ fn pick_worktree(_worktrees: &[domain::Worktree]) -> Result<BranchName> {
 ///
 /// `is_json` — whether the output format is machine-only (JSON).
 /// `action`  — verb shown in picker prompt and error messages (e.g. "remove", "merge").
-/// `readonly` — avoid pruning worktree metadata for inspection.
 fn resolve_action_branch(
     repo: &domain::RepoRoot,
     is_json: bool,
     action: &str,
-    readonly: bool,
 ) -> Result<Option<BranchName>> {
     if is_json {
         return Ok(None);
@@ -1010,11 +1008,10 @@ fn resolve_action_branch(
         return Ok(None);
     }
 
-    let worktrees = if readonly {
-        git::list_worktrees_readonly(repo)?
-    } else {
-        git::list_worktrees(repo)?
-    };
+    // Target selection happens before destructive commands acquire their
+    // lifecycle lock. Keep this observation strictly read-only; the command
+    // performs any required metadata prune after it owns the lock.
+    let worktrees = git::list_worktrees(repo)?;
     let candidates: Vec<_> = worktrees.iter().filter(|wt| !wt.is_main).collect();
 
     if candidates.is_empty() {
@@ -1334,11 +1331,11 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
 
     let resolved_branch = match branch {
         Some(branch) => Some(branch),
-        None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge", inspect)?,
+        None => resolve_action_branch(&repo, fmt == MergeFormat::Json, "merge")?,
     };
     if inspect {
         let preflight =
-            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref(), true)?;
+            worktree::merge_preflight(&repo, resolved_branch.as_ref(), into.as_deref())?;
         return print_merge_inspection(&repo, &preflight, fmt);
     }
 
@@ -1828,7 +1825,7 @@ fn cmd_remove(
 
     let resolved_branch = match branch {
         Some(b) => Some(b),
-        None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove", false)?,
+        None => resolve_action_branch(&repo, fmt == RemoveFormat::Json, "remove")?,
     };
 
     let result = if keep_branch {
