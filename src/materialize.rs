@@ -672,9 +672,14 @@ fn preserve_directory_access(
     fs::set_permissions(path, metadata.permissions())?;
     #[cfg(target_os = "linux")]
     {
-        // Listing first also works on filesystems that do not support POSIX ACLs.
+        // No ACLs can exist when the source filesystem rejects xattrs entirely.
+        // Retain fail-safe behavior for all other inspection/copy errors.
+        let names = match xattr::list(source) {
+            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => return Ok(()),
+            names => names?,
+        };
         // Do not copy unrelated attributes (for example, security labels).
-        for name in xattr::list(source)? {
+        for name in names {
             if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
                 let value = xattr::get(source, &name)?
                     .ok_or_else(|| io::Error::other("workspace ACL changed during publication"))?;

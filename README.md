@@ -288,8 +288,9 @@ remains independent of later source pruning or removal. Sources with object
 alternates or symlinked repository/object paths are rejected; Git's local-clone
 ownership checks also apply. Keep an external `--object-source` stable during
 materialization (do not concurrently refresh or prune it). Managed cache refresh
-and checkout remain serialized by the cache lock. Failed local checkouts clean up
-private staging directories without deleting destination contents.
+and checkout remain serialized by the cache lock. Local materialization requires
+a writable workspace parent for private sibling staging. Failed local checkouts
+clean up staging directories without deleting destination contents.
 
 ```
 wt materialize \
