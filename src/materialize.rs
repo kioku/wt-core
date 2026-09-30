@@ -110,6 +110,9 @@ pub fn materialize(options: MaterializeOptions) -> Result<MaterializeResult> {
 
     let source_result = materialize_from_best_source(&request, &cache_path, &mut timings)?;
     let resolved_commit = verify_workspace(&request.workspace_root, &request.sha)?;
+    if let Some(root) = &source_result.workspace_identity {
+        verify_new_workspace_identity(&request.workspace_root, root)?;
+    }
     timings.total = elapsed_ms(started);
 
     Ok(MaterializeResult {
@@ -129,6 +132,9 @@ pub fn materialize(options: MaterializeOptions) -> Result<MaterializeResult> {
 struct SourceResult {
     cache_status: &'static str,
     source: &'static str,
+    // Retain fresh-root ownership through the public entry point's final Git
+    // verification, not just through the local clone helper.
+    workspace_identity: Option<same_file::Handle>,
 }
 
 fn materialize_from_best_source(
@@ -137,18 +143,21 @@ fn materialize_from_best_source(
     timings: &mut MaterializeTimings,
 ) -> Result<SourceResult> {
     if let Some(source) = &request.object_source {
-        materialize_from_object_source(source, request, timings)?;
+        let workspace_identity = materialize_from_object_source(source, request, timings)?;
         return Ok(SourceResult {
             cache_status: "bypassed",
             source: "object_source",
+            workspace_identity,
         });
     }
 
     if let Some(cache_path) = cache_path {
-        let cache_status = materialize_from_cache(cache_path, request, timings)?;
+        let (cache_status, workspace_identity) =
+            materialize_from_cache(cache_path, request, timings)?;
         return Ok(SourceResult {
             cache_status,
             source: "cache",
+            workspace_identity,
         });
     }
 
@@ -156,6 +165,7 @@ fn materialize_from_best_source(
     Ok(SourceResult {
         cache_status: "bypassed",
         source: "remote",
+        workspace_identity: None,
     })
 }
 
@@ -163,20 +173,20 @@ fn materialize_from_object_source(
     source: &Path,
     request: &ValidatedOptions,
     timings: &mut MaterializeTimings,
-) -> Result<()> {
+) -> Result<Option<same_file::Handle>> {
     verify_bare_repo(source)?;
     verify_commit_exists(source, &request.sha)?;
     let started = Instant::now();
-    clone_local_bare(source, &request.workspace_root, &request.sha)?;
+    let identity = clone_local_bare(source, &request.workspace_root, &request.sha)?;
     timings.workspace_checkout = elapsed_ms(started);
-    Ok(())
+    Ok(identity)
 }
 
 fn materialize_from_cache(
     cache_path: &Path,
     request: &ValidatedOptions,
     timings: &mut MaterializeTimings,
-) -> Result<&'static str> {
+) -> Result<(&'static str, Option<same_file::Handle>)> {
     let remote_url = request
         .remote_url
         .as_deref()
@@ -198,9 +208,9 @@ fn materialize_from_cache(
 
     verify_commit_exists(cache_path, &request.sha)?;
     let checkout_started = Instant::now();
-    clone_local_bare(cache_path, &request.workspace_root, &request.sha)?;
+    let identity = clone_local_bare(cache_path, &request.workspace_root, &request.sha)?;
     timings.workspace_checkout = elapsed_ms(checkout_started);
-    Ok(cache_status)
+    Ok((cache_status, identity))
 }
 
 fn materialize_from_remote(
@@ -580,7 +590,11 @@ fn independent_local_source(source: &Path) -> Result<PathBuf> {
     }
 }
 
-fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+fn clone_local_bare(
+    source: &Path,
+    workspace: &Path,
+    sha: &str,
+) -> Result<Option<same_file::Handle>> {
     // Treat a final `/.` as the directory entry for creation and cloning.
     let normalized_workspace: PathBuf = workspace.components().collect();
     let workspace = normalized_workspace.as_path();
@@ -591,7 +605,7 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
         .parent()
         .ok_or_else(|| AppError::usage("--workspace-root has no parent directory"))?;
     if !workspace.exists() {
-        return clone_new_workspace(&source, workspace, sha);
+        return clone_new_workspace(&source, workspace, sha).map(Some);
     }
     // Preverify existing-directory checkouts privately. Keep the cache lock
     // throughout, and remove only this task-owned staging tree on failure.
@@ -629,11 +643,11 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     independent_local_source(&workspace.join(".git"))?;
     checkout_detached(workspace, sha)?;
     verify_workspace(workspace, sha)?;
-    Ok(())
+    Ok(None)
 }
 
 /// Claim a fresh root at its final path and clean only our own output on failure.
-fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<same_file::Handle> {
     // Creating under the actual parent preserves one-generation native ACLs and
     // path-based labels; renaming a nested checkout would not re-inherit them.
     fs::create_dir(workspace).map_err(|e| match e.kind() {
@@ -652,7 +666,7 @@ fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<()>
         fs::remove_dir_all(workspace)
             .map_err(|e| AppError::git(format!("cannot clean failed new workspace: {e}")))?;
     }
-    result
+    result.map(|()| root)
 }
 
 /// Fail closed if the requested entry disappeared, became a symlink, or changed

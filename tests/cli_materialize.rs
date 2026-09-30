@@ -951,7 +951,13 @@ fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() 
         .expect("locate git");
     assert!(real_git.status.success());
     let real_git = String::from_utf8(real_git.stdout).expect("git path");
-    for phase in ["symbolic-ref", "clone", "symlink", "missing"] {
+    for phase in [
+        "symbolic-ref",
+        "final-verification",
+        "clone",
+        "symlink",
+        "missing",
+    ] {
         let root = tempfile::tempdir().expect("temp dir");
         let workspace = root.path().join("workspace");
         let moved = root.path().join("moved");
@@ -961,6 +967,10 @@ fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() 
         std::fs::write(
             &wrapper,
             r#"#!/bin/sh
+if [ "$1" = symbolic-ref ] && [ "$WT_REPLACEMENT" = final-verification ] && [ ! -e "$WT_MOVED_ROOT.verified" ]; then
+    touch "$WT_MOVED_ROOT.verified" || exit 94
+    exec "$WT_REAL_GIT" "$@"
+fi
 if [ "$1" = "$WT_REPLACE_PHASE" ] && [ ! -e "$WT_MOVED_ROOT" ]; then
     if [ "$WT_REPLACEMENT" = symlink ] || [ "$WT_REPLACEMENT" = missing ]; then
         mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
@@ -1003,8 +1013,8 @@ exec "$WT_REAL_GIT" "$@"
             .env("WT_REAL_GIT", real_git.trim())
             .env(
                 "WT_REPLACE_PHASE",
-                if phase == "symbolic-ref" {
-                    phase
+                if matches!(phase, "symbolic-ref" | "final-verification") {
+                    "symbolic-ref"
                 } else {
                     "clone"
                 },
