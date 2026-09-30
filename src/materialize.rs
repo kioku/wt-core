@@ -673,6 +673,10 @@ fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<sam
 /// identity. This bounds ordinary root-replacement cleanup; it is not a lock
 /// against a same-privilege actor racing every filesystem operation.
 fn verify_new_workspace_identity(workspace: &Path, root: &same_file::Handle) -> Result<()> {
+    // Inspect the root entry itself even when the public request ends in `/`
+    // or `/.`; those spellings otherwise make lstat follow a replacement link.
+    let workspace: PathBuf = workspace.components().collect();
+    let workspace = workspace.as_path();
     let metadata = fs::symlink_metadata(workspace)
         .map_err(|e| AppError::git(format!("cannot inspect new workspace identity: {e}")))?;
     if !metadata.is_dir() || metadata.file_type().is_symlink() {

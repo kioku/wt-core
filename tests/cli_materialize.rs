@@ -954,6 +954,8 @@ fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() 
     for phase in [
         "symbolic-ref",
         "final-verification",
+        "final-symlink-dot",
+        "final-symlink-slash",
         "clone",
         "symlink",
         "missing",
@@ -967,15 +969,15 @@ fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() 
         std::fs::write(
             &wrapper,
             r#"#!/bin/sh
-if [ "$1" = symbolic-ref ] && [ "$WT_REPLACEMENT" = final-verification ] && [ ! -e "$WT_MOVED_ROOT.verified" ]; then
+if [ "$1" = symbolic-ref ] && [ ! -e "$WT_MOVED_ROOT.verified" ] && { [ "$WT_REPLACEMENT" = final-verification ] || [ "$WT_REPLACEMENT" = final-symlink-dot ] || [ "$WT_REPLACEMENT" = final-symlink-slash ]; }; then
     touch "$WT_MOVED_ROOT.verified" || exit 94
     exec "$WT_REAL_GIT" "$@"
 fi
 if [ "$1" = "$WT_REPLACE_PHASE" ] && [ ! -e "$WT_MOVED_ROOT" ]; then
-    if [ "$WT_REPLACEMENT" = symlink ] || [ "$WT_REPLACEMENT" = missing ]; then
+    if [ "$WT_REPLACEMENT" = symlink ] || [ "$WT_REPLACEMENT" = missing ] || [ "$WT_REPLACEMENT" = final-symlink-dot ] || [ "$WT_REPLACEMENT" = final-symlink-slash ]; then
         mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
         printf 'unrelated data' > "$WT_MOVED_ROOT/user-data"
-        if [ "$WT_REPLACEMENT" = symlink ]; then
+        if [ "$WT_REPLACEMENT" != missing ]; then
             ln -s "$WT_MOVED_ROOT" "$WT_WORKSPACE" || exit 91
         fi
         exit 93
@@ -1008,12 +1010,23 @@ exec "$WT_REAL_GIT" "$@"
             &std::env::var_os("PATH").expect("PATH"),
         )))
         .expect("wrapper PATH");
-        materialize_object(&repo.origin_path(), &sha, &workspace)
+        let spelling = match phase {
+            "final-symlink-dot" => PathBuf::from(format!("{}/.", workspace.display())),
+            "final-symlink-slash" => PathBuf::from(format!("{}/", workspace.display())),
+            _ => workspace.clone(),
+        };
+        materialize_object(&repo.origin_path(), &sha, &spelling)
             .env("PATH", paths)
             .env("WT_REAL_GIT", real_git.trim())
             .env(
                 "WT_REPLACE_PHASE",
-                if matches!(phase, "symbolic-ref" | "final-verification") {
+                if matches!(
+                    phase,
+                    "symbolic-ref"
+                        | "final-verification"
+                        | "final-symlink-dot"
+                        | "final-symlink-slash"
+                ) {
                     "symbolic-ref"
                 } else {
                     "clone"
@@ -1033,7 +1046,10 @@ exec "$WT_REAL_GIT" "$@"
             std::fs::read_to_string(preserved.join("user-data")).expect("preserved replacement"),
             "unrelated data"
         );
-        if phase == "symlink" {
+        if matches!(
+            phase,
+            "symlink" | "final-symlink-dot" | "final-symlink-slash"
+        ) {
             assert!(std::fs::symlink_metadata(&workspace)
                 .expect("preserved symlink")
                 .file_type()
