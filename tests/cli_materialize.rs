@@ -729,3 +729,64 @@ fn local_copy_preserves_empty_destination_access_and_default_acls() {
     assert_checkout(&workspace, &sha);
     assert_no_staging(root.path());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_copy_does_not_add_parent_acls_to_existing_destination() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .expect("temp dir");
+    let owner = std::fs::metadata(root.path()).expect("metadata").uid();
+    let extra_user = if owner == 65534 { 65533 } else { 65534 };
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (1_u16, 7_u16, u32::MAX),
+        (2, 7, extra_user),
+        (4, 5, u32::MAX),
+        (16, 7, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    if let Err(error) = xattr::set(root.path(), "system.posix_acl_default", &acl) {
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        panic!("set parent default ACL: {error}");
+    }
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    // Deliberately opt this destination out of the parent's named-user grant.
+    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+        xattr::remove(&workspace, name).expect("remove inherited ACL");
+    }
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o770))
+        .expect("group-private workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    for path in [
+        &workspace,
+        &workspace.join(".git"),
+        &workspace.join(".git/config"),
+    ] {
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            assert_eq!(xattr::get(path, name).expect("inspect ACL"), None);
+        }
+    }
+    assert_eq!(
+        std::fs::metadata(&workspace)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o770
+    );
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}

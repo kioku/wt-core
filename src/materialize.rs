@@ -678,12 +678,24 @@ fn preserve_directory_access(
             Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => return Ok(()),
             names => names?,
         };
+        let names: Vec<_> = names.collect();
+        // Match ACL absence too: staging can inherit grants from the parent
+        // which the existing destination deliberately does not inherit.
         // Do not copy unrelated attributes (for example, security labels).
-        for name in names {
-            if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
-                let value = xattr::get(source, &name)?
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            if names.iter().any(|present| present == name) {
+                let value = xattr::get(source, name)?
                     .ok_or_else(|| io::Error::other("workspace ACL changed during publication"))?;
-                xattr::set(path, &name, &value)?;
+                xattr::set(path, name, &value)?;
+            } else {
+                match xattr::remove(path, name) {
+                    Err(error)
+                        if matches!(
+                            error.raw_os_error(),
+                            Some(libc::ENODATA | libc::EOPNOTSUPP)
+                        ) => {}
+                    result => result?,
+                }
             }
         }
     }
