@@ -597,6 +597,17 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
         .tempdir_in(parent)
         .map_err(|e| AppError::git(format!("cannot stage local checkout: {e}")))?;
     let checkout = staging.path().join("workspace");
+    if workspace.exists() {
+        let metadata = fs::metadata(workspace).map_err(|e| {
+            AppError::conflict(format!("cannot inspect workspace permissions: {e}"))
+        })?;
+        fs::create_dir(&checkout)
+            .map_err(|e| AppError::git(format!("cannot create staged workspace: {e}")))?;
+        // Apply default ACLs before Git creates children, preserving inheritance
+        // as well as access restrictions on the destination itself.
+        preserve_directory_access(&checkout, workspace, &metadata)
+            .map_err(|e| AppError::git(format!("cannot preserve workspace permissions: {e}")))?;
+    }
     run_git_owned(
         vec![
             os("clone"),
@@ -622,7 +633,7 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
         let metadata = fs::metadata(workspace).map_err(|e| {
             AppError::conflict(format!("cannot inspect workspace permissions: {e}"))
         })?;
-        preserve_directory_access(&checkout, &metadata)
+        preserve_directory_access(&checkout, workspace, &metadata)
             .map_err(|e| AppError::git(format!("cannot preserve workspace permissions: {e}")))?;
         fs::remove_dir(workspace)
             .map_err(|e| AppError::conflict(format!("cannot replace empty workspace: {e}")))?;
@@ -633,7 +644,7 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     if existed {
         let _ = fs::metadata(&checkout).and_then(|metadata| {
             fs::create_dir(workspace)?;
-            preserve_directory_access(workspace, &metadata)
+            preserve_directory_access(workspace, &checkout, &metadata)
         });
     }
     Err(AppError::git(format!(
@@ -643,7 +654,13 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
 
 /// Apply ownership before mode, since chown can clear set-ID permission bits.
 /// If ownership cannot be retained, fail before removing the empty destination.
-fn preserve_directory_access(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+fn preserve_directory_access(
+    path: &Path,
+    source: &Path,
+    metadata: &fs::Metadata,
+) -> io::Result<()> {
+    // Other platforms retain the existing ownership/mode behavior.
+    let _ = source;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -652,7 +669,20 @@ fn preserve_directory_access(path: &Path, metadata: &fs::Metadata) -> io::Result
             std::os::unix::fs::chown(path, Some(metadata.uid()), Some(metadata.gid()))?;
         }
     }
-    fs::set_permissions(path, metadata.permissions())
+    fs::set_permissions(path, metadata.permissions())?;
+    #[cfg(target_os = "linux")]
+    {
+        // Listing first also works on filesystems that do not support POSIX ACLs.
+        // Do not copy unrelated attributes (for example, security labels).
+        for name in xattr::list(source)? {
+            if name == "system.posix_acl_access" || name == "system.posix_acl_default" {
+                let value = xattr::get(source, &name)?
+                    .ok_or_else(|| io::Error::other("workspace ACL changed during publication"))?;
+                xattr::set(path, &name, &value)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn checkout_from_remote(

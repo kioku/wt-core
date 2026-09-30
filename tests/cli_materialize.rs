@@ -671,3 +671,61 @@ fn remote_only_materialization_keeps_detached_clean_contract() {
     assert_eq!(json["cache_status"], "bypassed");
     assert_checkout(&workspace, &sha);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_copy_preserves_empty_destination_access_and_default_acls() {
+    use std::os::unix::fs::MetadataExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    // The normal test filesystem may have ACLs disabled; Linux tmpfs supports
+    // them, so exercise the security regression there when available.
+    let root = tempfile::tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let owner = std::fs::metadata(&workspace).expect("metadata").uid();
+    let denied_user = if owner == 65534 { 65533 } else { 65534 };
+    // Linux POSIX ACL xattr format: version 2, then (tag, permissions, id).
+    // A named-user deny must survive even though mode bits permit others.
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (1_u16, 7_u16, u32::MAX),
+        (2, 0, denied_user),
+        (4, 5, u32::MAX),
+        (16, 5, u32::MAX),
+        (32, 5, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    if let Err(error) = xattr::set(&workspace, "system.posix_acl_access", &acl) {
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        panic!("set access ACL: {error}");
+    }
+    xattr::set(&workspace, "system.posix_acl_default", &acl).expect("set default ACL");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    for path in [&workspace, &workspace.join(".git")] {
+        assert_eq!(
+            xattr::get(path, "system.posix_acl_access").expect("access ACL"),
+            Some(acl.clone())
+        );
+        assert_eq!(
+            xattr::get(path, "system.posix_acl_default").expect("default ACL"),
+            Some(acl.clone())
+        );
+    }
+    // Regular files inherit the named-user restriction, with a narrower mask.
+    let file_acl = xattr::get(workspace.join(".git/config"), "system.posix_acl_access")
+        .expect("file ACL")
+        .expect("inherited file ACL");
+    assert_eq!(&file_acl[12..20], &acl[12..20]);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
