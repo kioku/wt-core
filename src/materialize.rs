@@ -581,7 +581,7 @@ fn independent_local_source(source: &Path) -> Result<PathBuf> {
 }
 
 fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
-    // Treat a final `/.` as the directory entry for staging and publication.
+    // Treat a final `/.` as the directory entry for creation and cloning.
     let normalized_workspace: PathBuf = workspace.components().collect();
     let workspace = normalized_workspace.as_path();
     ensure_workspace_available(workspace)?;
@@ -590,13 +590,65 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     let parent = workspace
         .parent()
         .ok_or_else(|| AppError::usage("--workspace-root has no parent directory"))?;
-    // Stage on the destination filesystem: failures remove only our private tree,
-    // and publishing does not copy objects again. Keep the cache lock throughout.
+    if !workspace.exists() {
+        return clone_new_workspace(&source, workspace, sha);
+    }
+    // Preverify existing-directory checkouts privately. Keep the cache lock
+    // throughout, and remove only this task-owned staging tree on failure.
     let staging = tempfile::Builder::new()
         .prefix(".wt-materialize-")
         .tempdir_in(parent)
         .map_err(|e| AppError::git(format!("cannot stage local checkout: {e}")))?;
     let checkout = staging.path().join("workspace");
+    clone_independent_checkout(&source, &checkout, sha)?;
+    ensure_workspace_available(workspace)?;
+    // Populate the original directory in place: replacing it would lose
+    // native ACLs, security labels, and other filesystem-specific controls.
+    // Clone the verified private snapshot via the protocol so even an old,
+    // now-unreferenced requested commit (the snapshot's HEAD) is transferred.
+    // Do not recursively clean this user-owned destination on failure.
+    run_git_owned(
+        vec![
+            os("clone"),
+            os("--no-local"),
+            os("--no-checkout"),
+            checkout.join(".git").as_os_str().to_os_string(),
+            workspace.as_os_str().to_os_string(),
+        ],
+        None,
+    )?;
+    run_git_owned(
+        vec![
+            os("remote"),
+            os("set-url"),
+            os("origin"),
+            source.as_os_str().to_os_string(),
+        ],
+        Some(workspace),
+    )?;
+    independent_local_source(&workspace.join(".git"))?;
+    checkout_detached(workspace, sha)?;
+    verify_workspace(workspace, sha)?;
+    Ok(())
+}
+
+/// Claim a fresh root at its final path and clean only our own output on failure.
+fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+    // Creating under the actual parent preserves one-generation native ACLs and
+    // path-based labels; renaming a nested checkout would not re-inherit them.
+    fs::create_dir(workspace)
+        .map_err(|e| AppError::conflict(format!("cannot claim new workspace: {e}")))?;
+    let result = clone_independent_checkout(source, workspace, sha);
+    if result.is_err() {
+        // Existing user directories never enter this recursive cleanup path.
+        fs::remove_dir_all(workspace)
+            .map_err(|e| AppError::git(format!("cannot clean failed new workspace: {e}")))?;
+    }
+    result
+}
+
+/// Copy objects and mutable metadata independently, then verify before success.
+fn clone_independent_checkout(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     run_git_owned(
         vec![
             os("clone"),
@@ -604,47 +656,15 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
             os("--no-hardlinks"),
             os("--no-checkout"),
             source.as_os_str().to_os_string(),
-            checkout.as_os_str().to_os_string(),
+            workspace.as_os_str().to_os_string(),
         ],
         None,
     )?;
     // Defense in depth: never publish a clone that depends on source objects.
-    independent_local_source(&checkout.join(".git"))?;
-    checkout_detached(&checkout, sha)?;
-    verify_workspace(&checkout, sha)?;
-    ensure_workspace_available(workspace)?;
-    if workspace.exists() {
-        // Populate the original directory in place: replacing it would lose
-        // native ACLs, security labels, and other filesystem-specific controls.
-        // Clone the verified private snapshot via the protocol so even an old,
-        // now-unreferenced requested commit (the snapshot's HEAD) is transferred.
-        // Do not recursively clean this user-owned destination on failure.
-        run_git_owned(
-            vec![
-                os("clone"),
-                os("--no-local"),
-                os("--no-checkout"),
-                checkout.join(".git").as_os_str().to_os_string(),
-                workspace.as_os_str().to_os_string(),
-            ],
-            None,
-        )?;
-        run_git_owned(
-            vec![
-                os("remote"),
-                os("set-url"),
-                os("origin"),
-                source.as_os_str().to_os_string(),
-            ],
-            Some(workspace),
-        )?;
-        independent_local_source(&workspace.join(".git"))?;
-        checkout_detached(workspace, sha)?;
-        verify_workspace(workspace, sha)?;
-        return Ok(());
-    }
-    fs::rename(&checkout, workspace)
-        .map_err(|error| AppError::git(format!("cannot publish local checkout: {error}")))
+    independent_local_source(&workspace.join(".git"))?;
+    checkout_detached(workspace, sha)?;
+    verify_workspace(workspace, sha)?;
+    Ok(())
 }
 
 fn checkout_from_remote(

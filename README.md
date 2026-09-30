@@ -289,11 +289,13 @@ alternates or symlinked repository/object paths are rejected; Git's local-clone
 ownership checks also apply. Keep an external `--object-source` stable during
 materialization (do not concurrently refresh or prune it). Managed cache refresh
 and checkout remain serialized by the cache lock. Local materialization requires
-a writable workspace parent for private sibling staging. Existing empty destinations
+a writable workspace parent. New destinations are atomically claimed at their
+requested path, so native parent access controls apply directly; failed checkouts
+remove only that newly created task-owned directory. Existing empty destinations
 are populated in place via a protocol clone of the verified snapshot, retaining
 native access controls and directory identity on every platform. This compatibility
-path does not receive the local-copy speedup. Failed local checkouts clean up
-staging without deleting destination contents; an in-place publication failure
+path uses private sibling staging and does not receive the local-copy speedup.
+Failures clean up staging without deleting existing destination contents; an in-place failure
 can leave partial Git output in an existing destination.
 
 ```

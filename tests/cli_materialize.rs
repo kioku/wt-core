@@ -873,3 +873,65 @@ fn existing_destination_receives_unreferenced_commit_from_verified_snapshot() {
     assert_checkout(&workspace, &sha);
     assert_no_staging(root.path());
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+fn new_destination_inherits_one_generation_native_deny_like_direct_clone() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    // The parent ACE is not effective on the parent, but denies traversal of
+    // immediate children. limit_inherit prevents inheritance by grandchildren.
+    assert!(StdCommand::new("chmod")
+        .args([
+            "+a",
+            "nobody deny read,execute,directory_inherit,only_inherit,limit_inherit",
+        ])
+        .arg(root.path())
+        .status()
+        .expect("set one-generation native ACL")
+        .success());
+    let protocol = root.path().join("protocol");
+    git_output(
+        &[
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            &repo.origin_path().display().to_string(),
+            &protocol.display().to_string(),
+        ],
+        root.path(),
+    );
+    let entries = |path: &Path| {
+        let output = StdCommand::new("ls")
+            .arg("-lde")
+            .arg(path)
+            .output()
+            .expect("inspect native ACL");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("native ACL text")
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let expected = entries(&protocol);
+    assert!(expected.contains("nobody deny"), "{expected}");
+    // Demonstrate why nesting then renaming is incompatible: the second
+    // generation lacks the deny, and moving it does not restore inheritance.
+    let staging = root.path().join("staging");
+    std::fs::create_dir(&staging).expect("staging");
+    let nested = staging.join("workspace");
+    std::fs::create_dir(&nested).expect("nested root");
+    let moved = root.path().join("moved");
+    std::fs::rename(&nested, &moved).expect("move nested root");
+    assert!(!entries(&moved).contains("nobody deny"));
+    let workspace = root.path().join("workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    assert_eq!(entries(&workspace), expected);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
