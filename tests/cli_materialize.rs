@@ -454,7 +454,8 @@ fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() 
             git_output(&["repack", "-ad"], &source);
         }
         let workspace = root.path().join("workspace");
-        // Existing empty destinations remain supported.
+        // Linux supports existing empty destinations with ACL preservation.
+        #[cfg(target_os = "linux")]
         std::fs::create_dir(&workspace).expect("empty workspace");
         materialize_object(&source, &sha, &workspace)
             .assert()
@@ -477,6 +478,7 @@ fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() 
     }
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn local_copy_accepts_empty_destination_with_trailing_dot() {
     let repo = fixtures::ClonedTestRepo::new();
@@ -492,7 +494,7 @@ fn local_copy_accepts_empty_destination_with_trailing_dot() {
     assert_no_staging(root.path());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn local_copy_preserves_private_empty_destination_permissions() {
     use std::os::unix::fs::PermissionsExt;
@@ -518,7 +520,7 @@ fn local_copy_preserves_private_empty_destination_permissions() {
     assert_no_staging(root.path());
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn local_copy_preserves_empty_destination_group() {
     use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
@@ -600,12 +602,17 @@ fn local_checkout_failure_preserves_empty_destination_and_cleans_staging() {
         if existed {
             std::fs::create_dir(&workspace).expect("empty workspace");
         }
+        let expected_code = if existed && !cfg!(target_os = "linux") {
+            5 // Fail safely before copying an unsupported existing directory.
+        } else {
+            4
+        };
         // Git accepts uppercase full SHAs, but the existing exact-SHA contract
         // rejects the lowercase resolved HEAD. This fails after clone/checkout.
         materialize_object(&repo.origin_path(), &sha, &workspace)
             .assert()
             .failure()
-            .code(4);
+            .code(expected_code);
         assert_eq!(workspace.exists(), existed);
         if existed {
             assert_eq!(
@@ -788,5 +795,58 @@ fn local_copy_does_not_add_parent_acls_to_existing_destination() {
         0o770
     );
     assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn local_copy_rejects_existing_destination_without_changing_access_controls() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    #[cfg(target_os = "macos")]
+    {
+        // A named-user deny is not represented by fs::Permissions or uid/gid.
+        assert!(StdCommand::new("chmod")
+            .args(["+a", "nobody deny read,execute"])
+            .arg(&workspace)
+            .status()
+            .expect("set native ACL")
+            .success());
+    }
+    let before = std::fs::metadata(&workspace).expect("metadata");
+    #[cfg(target_os = "macos")]
+    let acl_before = StdCommand::new("ls")
+        .arg("-lde")
+        .arg(&workspace)
+        .output()
+        .expect("inspect native ACL");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .failure()
+        .code(5)
+        .stderr(predicate::str::contains(
+            "existing directory access controls",
+        ));
+    assert_eq!(std::fs::read_dir(&workspace).expect("workspace").count(), 0);
+    let after = std::fs::metadata(&workspace).expect("metadata");
+    assert_eq!(before.permissions(), after.permissions());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let acl_after = StdCommand::new("ls")
+            .arg("-lde")
+            .arg(&workspace)
+            .output()
+            .expect("inspect native ACL");
+        assert!(acl_before.status.success() && acl_after.status.success());
+        assert_eq!(acl_before.stdout, acl_after.stdout);
+    }
     assert_no_staging(root.path());
 }

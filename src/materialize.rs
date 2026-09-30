@@ -585,6 +585,7 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     // remove_dir must receive its entry path rather than the special `.` entry.
     let normalized_workspace: PathBuf = workspace.components().collect();
     let workspace = normalized_workspace.as_path();
+    ensure_local_workspace_available(workspace)?;
     let source = independent_local_source(source)?;
     create_workspace_parent(workspace)?;
     let parent = workspace
@@ -623,7 +624,7 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     independent_local_source(&checkout.join(".git"))?;
     checkout_detached(&checkout, sha)?;
     verify_workspace(&checkout, sha)?;
-    ensure_workspace_available(workspace)?;
+    ensure_local_workspace_available(workspace)?;
     // rename replaces an empty directory on Unix. Removing only an empty
     // directory also supports Windows and never recursively deletes user data.
     let existed = workspace.exists();
@@ -650,6 +651,21 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     Err(AppError::git(format!(
         "cannot publish local checkout: {error}"
     )))
+}
+
+/// Replacing an existing directory requires retaining its access controls.
+/// Only Linux ACL preservation is supported; mode bits do not encode native
+/// macOS ACLs or Windows DACLs. Reject before staging and again at publication
+/// so a destination created during checkout is not replaced either.
+fn ensure_local_workspace_available(workspace: &Path) -> Result<()> {
+    ensure_workspace_available(workspace)?;
+    #[cfg(not(target_os = "linux"))]
+    if workspace.exists() {
+        return Err(AppError::conflict(
+            "local materialization requires a nonexistent workspace on this platform; existing directory access controls cannot be preserved",
+        ));
+    }
+    Ok(())
 }
 
 /// Apply ownership before mode, since chown can clear set-ID permission bits.
