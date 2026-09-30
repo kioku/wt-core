@@ -503,6 +503,43 @@ fn local_copy_preserves_private_empty_destination_permissions() {
     assert_no_staging(root.path());
 }
 
+#[cfg(unix)]
+#[test]
+fn local_copy_preserves_empty_destination_group() {
+    use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let original_group = std::fs::metadata(&workspace).expect("metadata").gid();
+    let groups = StdCommand::new("id")
+        .arg("-G")
+        .output()
+        .expect("list groups");
+    assert!(groups.status.success());
+    let Some(group) = String::from_utf8(groups.stdout)
+        .expect("group ids")
+        .split_whitespace()
+        .filter_map(|group| group.parse::<u32>().ok())
+        .find(|group| *group != original_group)
+    else {
+        // Changing directory groups requires membership in another group.
+        return;
+    };
+    chown(&workspace, None, Some(group)).expect("set workspace group");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o770))
+        .expect("group-private workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    let metadata = std::fs::metadata(&workspace).expect("workspace metadata");
+    assert_eq!(metadata.gid(), group);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o770);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
 #[test]
 fn local_copy_rejects_alternates_without_leaving_workspace_or_staging() {
     let repo = fixtures::ClonedTestRepo::new();

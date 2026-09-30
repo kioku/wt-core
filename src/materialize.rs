@@ -613,12 +613,12 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     // directory also supports Windows and never recursively deletes user data.
     let existed = workspace.exists();
     if existed {
-        // Replacing an existing private directory must not broaden access to
-        // the checkout (for example, from Unix mode 0700 to clone's 0755).
-        let permissions = fs::metadata(workspace)
-            .map_err(|e| AppError::conflict(format!("cannot inspect workspace permissions: {e}")))?
-            .permissions();
-        fs::set_permissions(&checkout, permissions)
+        // Preserve both mode and Unix ownership: retaining 0770 while changing
+        // its group would grant access to a different set of users.
+        let metadata = fs::metadata(workspace).map_err(|e| {
+            AppError::conflict(format!("cannot inspect workspace permissions: {e}"))
+        })?;
+        preserve_directory_access(&checkout, &metadata)
             .map_err(|e| AppError::git(format!("cannot preserve workspace permissions: {e}")))?;
         fs::remove_dir(workspace)
             .map_err(|e| AppError::conflict(format!("cannot replace empty workspace: {e}")))?;
@@ -629,12 +629,26 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     if existed {
         let _ = fs::metadata(&checkout).and_then(|metadata| {
             fs::create_dir(workspace)?;
-            fs::set_permissions(workspace, metadata.permissions())
+            preserve_directory_access(workspace, &metadata)
         });
     }
     Err(AppError::git(format!(
         "cannot publish local checkout: {error}"
     )))
+}
+
+/// Apply ownership before mode, since chown can clear set-ID permission bits.
+/// If ownership cannot be retained, fail before removing the empty destination.
+fn preserve_directory_access(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let current = fs::metadata(path)?;
+        if current.uid() != metadata.uid() || current.gid() != metadata.gid() {
+            std::os::unix::fs::chown(path, Some(metadata.uid()), Some(metadata.gid()))?;
+        }
+    }
+    fs::set_permissions(path, metadata.permissions())
 }
 
 fn checkout_from_remote(
