@@ -581,6 +581,10 @@ fn independent_local_source(source: &Path) -> Result<PathBuf> {
 }
 
 fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+    // An existing destination spelled with a final `/.` is still that directory;
+    // remove_dir must receive its entry path rather than the special `.` entry.
+    let normalized_workspace: PathBuf = workspace.components().collect();
+    let workspace = normalized_workspace.as_path();
     let source = independent_local_source(source)?;
     create_workspace_parent(workspace)?;
     let parent = workspace
