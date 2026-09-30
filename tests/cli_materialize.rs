@@ -917,7 +917,10 @@ fn new_destination_inherits_one_generation_native_deny_like_direct_clone() {
             .join("\n")
     };
     let expected = entries(&protocol);
-    assert!(expected.contains("nobody deny"), "{expected}");
+    assert!(
+        expected.contains("user:nobody inherited deny list,search"),
+        "{expected}"
+    );
     // Demonstrate why nesting then renaming is incompatible: the second
     // generation lacks the deny, and moving it does not restore inheritance.
     let staging = root.path().join("staging");
@@ -926,7 +929,7 @@ fn new_destination_inherits_one_generation_native_deny_like_direct_clone() {
     std::fs::create_dir(&nested).expect("nested root");
     let moved = root.path().join("moved");
     std::fs::rename(&nested, &moved).expect("move nested root");
-    assert!(!entries(&moved).contains("nobody deny"));
+    assert!(!entries(&moved).contains("user:nobody"));
     let workspace = root.path().join("workspace");
     materialize_object(&repo.origin_path(), &sha, &workspace)
         .assert()
