@@ -557,14 +557,17 @@ fn verify_commit_exists(git_dir: &Path, sha: &str) -> Result<()> {
 /// Local clones must own their objects, including when the source uses alternates.
 /// Git additionally rejects foreign-owned sources and symlinks in the object tree.
 fn independent_local_source(source: &Path) -> Result<PathBuf> {
-    let metadata = fs::symlink_metadata(source)
+    // Strip trailing separators and `.` components before lstat: otherwise
+    // the OS follows a final repository symlink despite symlink_metadata.
+    let source: PathBuf = source.components().collect();
+    let metadata = fs::symlink_metadata(&source)
         .map_err(|e| AppError::git(format!("cannot inspect local source: {e}")))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
         return Err(AppError::usage(
             "local source must be a non-symlink directory",
         ));
     }
-    let source = fs::canonicalize(source)
+    let source = fs::canonicalize(&source)
         .map_err(|e| AppError::git(format!("cannot resolve local source: {e}")))?;
     match fs::symlink_metadata(source.join("objects/info/alternates")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(source),

@@ -551,10 +551,15 @@ fn local_copy_rejects_symlink_source_and_object_paths() {
     let source_link = root.path().join("source.git");
     symlink(repo.origin_path(), &source_link).expect("source symlink");
     let workspace = root.path().join("workspace");
-    materialize_object(&source_link, &sha, &workspace)
-        .assert()
-        .failure();
-    assert!(!workspace.exists());
+    for suffix in ["", "/", "/."] {
+        let spelling = PathBuf::from(format!("{}{suffix}", source_link.display()));
+        materialize_object(&spelling, &sha, &workspace)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("non-symlink directory"));
+        assert!(!workspace.exists());
+        assert_no_staging(root.path());
+    }
     let objects = repo.origin_path().join("objects");
     let moved = repo.origin_path().join("original-objects");
     std::fs::rename(&objects, &moved).expect("move objects");
