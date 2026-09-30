@@ -581,11 +581,10 @@ fn independent_local_source(source: &Path) -> Result<PathBuf> {
 }
 
 fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
-    // An existing destination spelled with a final `/.` is still that directory;
-    // remove_dir must receive its entry path rather than the special `.` entry.
+    // Treat a final `/.` as the directory entry for staging and publication.
     let normalized_workspace: PathBuf = workspace.components().collect();
     let workspace = normalized_workspace.as_path();
-    ensure_local_workspace_available(workspace)?;
+    ensure_workspace_available(workspace)?;
     let source = independent_local_source(source)?;
     create_workspace_parent(workspace)?;
     let parent = workspace
@@ -598,17 +597,6 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
         .tempdir_in(parent)
         .map_err(|e| AppError::git(format!("cannot stage local checkout: {e}")))?;
     let checkout = staging.path().join("workspace");
-    if workspace.exists() {
-        let metadata = fs::metadata(workspace).map_err(|e| {
-            AppError::conflict(format!("cannot inspect workspace permissions: {e}"))
-        })?;
-        fs::create_dir(&checkout)
-            .map_err(|e| AppError::git(format!("cannot create staged workspace: {e}")))?;
-        // Apply default ACLs before Git creates children, preserving inheritance
-        // as well as access restrictions on the destination itself.
-        preserve_directory_access(&checkout, workspace, &metadata)
-            .map_err(|e| AppError::git(format!("cannot preserve workspace permissions: {e}")))?;
-    }
     run_git_owned(
         vec![
             os("clone"),
@@ -624,98 +612,39 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     independent_local_source(&checkout.join(".git"))?;
     checkout_detached(&checkout, sha)?;
     verify_workspace(&checkout, sha)?;
-    ensure_local_workspace_available(workspace)?;
-    // rename replaces an empty directory on Unix. Removing only an empty
-    // directory also supports Windows and never recursively deletes user data.
-    let existed = workspace.exists();
-    if existed {
-        // Preserve both mode and Unix ownership: retaining 0770 while changing
-        // its group would grant access to a different set of users.
-        let metadata = fs::metadata(workspace).map_err(|e| {
-            AppError::conflict(format!("cannot inspect workspace permissions: {e}"))
-        })?;
-        preserve_directory_access(&checkout, workspace, &metadata)
-            .map_err(|e| AppError::git(format!("cannot preserve workspace permissions: {e}")))?;
-        fs::remove_dir(workspace)
-            .map_err(|e| AppError::conflict(format!("cannot replace empty workspace: {e}")))?;
-    }
-    let Err(error) = fs::rename(&checkout, workspace) else {
-        return Ok(());
-    };
-    if existed {
-        let _ = fs::metadata(&checkout).and_then(|metadata| {
-            fs::create_dir(workspace)?;
-            preserve_directory_access(workspace, &checkout, &metadata)
-        });
-    }
-    Err(AppError::git(format!(
-        "cannot publish local checkout: {error}"
-    )))
-}
-
-/// Replacing an existing directory requires retaining its access controls.
-/// Only Linux ACL preservation is supported; mode bits do not encode native
-/// macOS ACLs or Windows DACLs. Reject before staging and again at publication
-/// so a destination created during checkout is not replaced either.
-fn ensure_local_workspace_available(workspace: &Path) -> Result<()> {
     ensure_workspace_available(workspace)?;
-    #[cfg(not(target_os = "linux"))]
     if workspace.exists() {
-        return Err(AppError::conflict(
-            "local materialization requires a nonexistent workspace on this platform; existing directory access controls cannot be preserved",
-        ));
+        // Populate the original directory in place: replacing it would lose
+        // native ACLs, security labels, and other filesystem-specific controls.
+        // Clone the verified private snapshot via the protocol so even an old,
+        // now-unreferenced requested commit (the snapshot's HEAD) is transferred.
+        // Do not recursively clean this user-owned destination on failure.
+        run_git_owned(
+            vec![
+                os("clone"),
+                os("--no-local"),
+                os("--no-checkout"),
+                checkout.join(".git").as_os_str().to_os_string(),
+                workspace.as_os_str().to_os_string(),
+            ],
+            None,
+        )?;
+        run_git_owned(
+            vec![
+                os("remote"),
+                os("set-url"),
+                os("origin"),
+                source.as_os_str().to_os_string(),
+            ],
+            Some(workspace),
+        )?;
+        independent_local_source(&workspace.join(".git"))?;
+        checkout_detached(workspace, sha)?;
+        verify_workspace(workspace, sha)?;
+        return Ok(());
     }
-    Ok(())
-}
-
-/// Apply ownership before mode, since chown can clear set-ID permission bits.
-/// If ownership cannot be retained, fail before removing the empty destination.
-fn preserve_directory_access(
-    path: &Path,
-    source: &Path,
-    metadata: &fs::Metadata,
-) -> io::Result<()> {
-    // Other platforms retain the existing ownership/mode behavior.
-    let _ = source;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let current = fs::metadata(path)?;
-        if current.uid() != metadata.uid() || current.gid() != metadata.gid() {
-            std::os::unix::fs::chown(path, Some(metadata.uid()), Some(metadata.gid()))?;
-        }
-    }
-    fs::set_permissions(path, metadata.permissions())?;
-    #[cfg(target_os = "linux")]
-    {
-        // No ACLs can exist when the source filesystem rejects xattrs entirely.
-        // Retain fail-safe behavior for all other inspection/copy errors.
-        let names = match xattr::list(source) {
-            Err(error) if error.raw_os_error() == Some(libc::EOPNOTSUPP) => return Ok(()),
-            names => names?,
-        };
-        let names: Vec<_> = names.collect();
-        // Match ACL absence too: staging can inherit grants from the parent
-        // which the existing destination deliberately does not inherit.
-        // Do not copy unrelated attributes (for example, security labels).
-        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
-            if names.iter().any(|present| present == name) {
-                let value = xattr::get(source, name)?
-                    .ok_or_else(|| io::Error::other("workspace ACL changed during publication"))?;
-                xattr::set(path, name, &value)?;
-            } else {
-                match xattr::remove(path, name) {
-                    Err(error)
-                        if matches!(
-                            error.raw_os_error(),
-                            Some(libc::ENODATA | libc::EOPNOTSUPP)
-                        ) => {}
-                    result => result?,
-                }
-            }
-        }
-    }
-    Ok(())
+    fs::rename(&checkout, workspace)
+        .map_err(|error| AppError::git(format!("cannot publish local checkout: {error}")))
 }
 
 fn checkout_from_remote(
