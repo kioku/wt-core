@@ -520,6 +520,7 @@ fn verify_bare_repo(path: &Path) -> Result<()> {
         )));
     }
 
+    let path = independent_local_source(path)?;
     let output = run_git_owned(
         vec![
             os("--git-dir"),
@@ -553,19 +554,74 @@ fn verify_commit_exists(git_dir: &Path, sha: &str) -> Result<()> {
     Ok(())
 }
 
+/// Local clones must own their objects, including when the source uses alternates.
+/// Git additionally rejects foreign-owned sources and symlinks in the object tree.
+fn independent_local_source(source: &Path) -> Result<PathBuf> {
+    let metadata = fs::symlink_metadata(source)
+        .map_err(|e| AppError::git(format!("cannot inspect local source: {e}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::usage(
+            "local source must be a non-symlink directory",
+        ));
+    }
+    let source = fs::canonicalize(source)
+        .map_err(|e| AppError::git(format!("cannot resolve local source: {e}")))?;
+    match fs::symlink_metadata(source.join("objects/info/alternates")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(source),
+        Err(e) => Err(AppError::git(format!(
+            "cannot inspect source alternates: {e}"
+        ))),
+        Ok(_) => Err(AppError::usage(
+            "local source must not use object alternates",
+        )),
+    }
+}
+
 fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+    let source = independent_local_source(source)?;
     create_workspace_parent(workspace)?;
+    let parent = workspace
+        .parent()
+        .ok_or_else(|| AppError::usage("--workspace-root has no parent directory"))?;
+    // Stage on the destination filesystem: failures remove only our private tree,
+    // and publishing does not copy objects again. Keep the cache lock throughout.
+    let staging = tempfile::Builder::new()
+        .prefix(".wt-materialize-")
+        .tempdir_in(parent)
+        .map_err(|e| AppError::git(format!("cannot stage local checkout: {e}")))?;
+    let checkout = staging.path().join("workspace");
     run_git_owned(
         vec![
             os("clone"),
-            os("--no-local"),
+            os("--local"),
+            os("--no-hardlinks"),
             os("--no-checkout"),
             source.as_os_str().to_os_string(),
-            workspace.as_os_str().to_os_string(),
+            checkout.as_os_str().to_os_string(),
         ],
         None,
     )?;
-    checkout_detached(workspace, sha)
+    // Defense in depth: never publish a clone that depends on source objects.
+    independent_local_source(&checkout.join(".git"))?;
+    checkout_detached(&checkout, sha)?;
+    verify_workspace(&checkout, sha)?;
+    ensure_workspace_available(workspace)?;
+    // rename replaces an empty directory on Unix. Removing only an empty
+    // directory also supports Windows and never recursively deletes user data.
+    let existed = workspace.exists();
+    if existed {
+        fs::remove_dir(workspace)
+            .map_err(|e| AppError::conflict(format!("cannot replace empty workspace: {e}")))?;
+    }
+    let Err(error) = fs::rename(&checkout, workspace) else {
+        return Ok(());
+    };
+    if existed {
+        let _ = fs::create_dir(workspace);
+    }
+    Err(AppError::git(format!(
+        "cannot publish local checkout: {error}"
+    )))
 }
 
 fn checkout_from_remote(

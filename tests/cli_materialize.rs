@@ -331,15 +331,29 @@ fn concurrent_cached_materializations_share_cache_safely() {
     let workspace_one = root.path().join("workspace-one");
     let workspace_two = root.path().join("workspace-two");
     let origin_url = file_url(&repo.origin_path());
+    git_output(
+        &["push", "origin", "HEAD:refs/heads/obsolete"],
+        &repo.path(),
+    );
+    let initial = root.path().join("initial");
+    materialize_cached(&repo, &sha, &cache_root, &initial);
+    git_output(&["push", "origin", ":refs/heads/obsolete"], &repo.path());
 
     let first = spawn_materialize(&sha, &origin_url, &cache_root, &workspace_one);
     let second = spawn_materialize(&sha, &origin_url, &cache_root, &workspace_two);
     first.join().expect("first thread panicked");
     second.join().expect("second thread panicked");
 
-    assert_eq!(git_output(&["rev-parse", "HEAD"], &workspace_one), sha);
-    assert_eq!(git_output(&["rev-parse", "HEAD"], &workspace_two), sha);
-    assert!(cache_root.join("owner__repo.git").is_dir());
+    assert_checkout(&workspace_one, &sha);
+    assert_checkout(&workspace_two, &sha);
+    let cache = cache_root.join("owner__repo.git");
+    assert!(!git_success(
+        &["show-ref", "--verify", "refs/heads/obsolete"],
+        &cache
+    ));
+    #[cfg(unix)]
+    assert_independent_files(&cache, &workspace_one.join(".git"));
+    assert!(!cache_root.join("owner__repo.git.lock").exists());
 }
 
 fn spawn_materialize(
@@ -371,4 +385,206 @@ fn spawn_materialize(
             .assert()
             .success();
     })
+}
+
+fn materialize_object(source: &Path, sha: &str, workspace: &Path) -> Command {
+    let mut command = wt_core();
+    command
+        .args([
+            "materialize",
+            "--repo-slug",
+            "owner/repo",
+            "--object-source",
+        ])
+        .arg(source)
+        .args(["--sha", sha, "--workspace-root"])
+        .arg(workspace);
+    command
+}
+
+fn assert_checkout(workspace: &Path, sha: &str) {
+    assert_eq!(git_output(&["rev-parse", "HEAD"], workspace), sha);
+    assert_eq!(git_output(&["status", "--porcelain"], workspace), "");
+    assert!(!git_success(&["symbolic-ref", "-q", "HEAD"], workspace));
+    assert!(!workspace.join(".git/objects/info/alternates").exists());
+    git_output(&["fsck", "--full"], workspace);
+}
+
+#[cfg(unix)]
+fn assert_independent_files(source: &Path, destination: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(destination).expect("read directory") {
+        let entry = entry.expect("directory entry");
+        let src = source.join(entry.file_name());
+        let dst = entry.path();
+        let metadata = std::fs::symlink_metadata(&dst).expect("metadata");
+        if metadata.is_dir() {
+            assert_independent_files(&src, &dst);
+        } else if metadata.is_file() && src.is_file() {
+            let original = std::fs::metadata(&src).expect("source metadata");
+            assert_ne!(
+                (metadata.dev(), metadata.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(metadata.nlink(), 1, "shared file: {}", dst.display());
+        }
+    }
+}
+
+#[test]
+fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() {
+    for packed in [false, true] {
+        let repo = fixtures::ClonedTestRepo::new();
+        let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+        fixtures::commit_file(&repo.path(), "new.txt", "new head", "new commit");
+        git_output(&["push", "origin", "main"], &repo.path());
+        let root = tempfile::tempdir().expect("temp dir");
+        let source = root.path().join("source.git");
+        git_output(
+            &[
+                "clone",
+                "--bare",
+                "--no-hardlinks",
+                &repo.origin_path().display().to_string(),
+                &source.display().to_string(),
+            ],
+            root.path(),
+        );
+        if packed {
+            git_output(&["repack", "-ad"], &source);
+        }
+        let workspace = root.path().join("workspace");
+        // Existing empty destinations remain supported.
+        std::fs::create_dir(&workspace).expect("empty workspace");
+        materialize_object(&source, &sha, &workspace)
+            .assert()
+            .success();
+        assert_checkout(&workspace, &sha);
+        #[cfg(unix)]
+        assert_independent_files(&source, &workspace.join(".git"));
+        let original_config = std::fs::read(source.join("config")).expect("source config");
+        git_output(&["config", "materialize.test", "changed"], &workspace);
+        assert_eq!(
+            std::fs::read(source.join("config")).expect("source config"),
+            original_config
+        );
+        git_output(&["update-ref", "-d", "refs/heads/main"], &source);
+        git_output(&["reflog", "expire", "--expire=now", "--all"], &source);
+        git_output(&["gc", "--prune=now"], &source);
+        assert_checkout(&workspace, &sha);
+        std::fs::remove_dir_all(&source).expect("remove private source");
+        assert_checkout(&workspace, &sha);
+    }
+}
+
+#[test]
+fn local_copy_rejects_alternates_without_leaving_workspace_or_staging() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let source = root.path().join("shared.git");
+    git_output(
+        &[
+            "clone",
+            "--bare",
+            "--shared",
+            &repo.origin_path().display().to_string(),
+            &source.display().to_string(),
+        ],
+        root.path(),
+    );
+    let workspace = root.path().join("workspace");
+    materialize_object(&source, &sha, &workspace)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("alternates"));
+    assert!(!workspace.exists());
+    assert_no_staging(root.path());
+}
+
+fn assert_no_staging(parent: &Path) {
+    assert!(std::fs::read_dir(parent)
+        .expect("read parent")
+        .all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".wt-materialize-")));
+}
+
+#[test]
+fn local_checkout_failure_preserves_empty_destination_and_cleans_staging() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path()).to_uppercase();
+    let root = tempfile::tempdir().expect("temp dir");
+    for existed in [false, true] {
+        let workspace = root.path().join(if existed { "empty" } else { "missing" });
+        if existed {
+            std::fs::create_dir(&workspace).expect("empty workspace");
+        }
+        // Git accepts uppercase full SHAs, but the existing exact-SHA contract
+        // rejects the lowercase resolved HEAD. This fails after clone/checkout.
+        materialize_object(&repo.origin_path(), &sha, &workspace)
+            .assert()
+            .failure()
+            .code(4);
+        assert_eq!(workspace.exists(), existed);
+        if existed {
+            assert_eq!(
+                std::fs::read_dir(&workspace)
+                    .expect("empty workspace")
+                    .count(),
+                0
+            );
+        }
+        assert_no_staging(root.path());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_rejects_symlink_source_and_object_paths() {
+    use std::os::unix::fs::symlink;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let source_link = root.path().join("source.git");
+    symlink(repo.origin_path(), &source_link).expect("source symlink");
+    let workspace = root.path().join("workspace");
+    materialize_object(&source_link, &sha, &workspace)
+        .assert()
+        .failure();
+    assert!(!workspace.exists());
+    let objects = repo.origin_path().join("objects");
+    let moved = repo.origin_path().join("original-objects");
+    std::fs::rename(&objects, &moved).expect("move objects");
+    symlink(&moved, &objects).expect("objects symlink");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .failure();
+    assert!(!workspace.exists());
+    assert_no_staging(root.path());
+}
+
+#[test]
+fn remote_only_materialization_keeps_detached_clean_contract() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    let output = wt_core()
+        .args(["materialize", "--repo-slug", "owner/repo", "--remote-url"])
+        .arg(file_url(&repo.origin_path()))
+        .args(["--sha", &sha, "--workspace-root"])
+        .arg(&workspace)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(json["source"], "remote");
+    assert_eq!(json["cache_status"], "bypassed");
+    assert_checkout(&workspace, &sha);
 }
