@@ -477,6 +477,32 @@ fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() 
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn local_copy_preserves_private_empty_destination_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700))
+        .expect("private workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::metadata(&workspace)
+            .expect("workspace metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
 #[test]
 fn local_copy_rejects_alternates_without_leaving_workspace_or_staging() {
     let repo = fixtures::ClonedTestRepo::new();

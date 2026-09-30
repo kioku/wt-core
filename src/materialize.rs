@@ -613,6 +613,13 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     // directory also supports Windows and never recursively deletes user data.
     let existed = workspace.exists();
     if existed {
+        // Replacing an existing private directory must not broaden access to
+        // the checkout (for example, from Unix mode 0700 to clone's 0755).
+        let permissions = fs::metadata(workspace)
+            .map_err(|e| AppError::conflict(format!("cannot inspect workspace permissions: {e}")))?
+            .permissions();
+        fs::set_permissions(&checkout, permissions)
+            .map_err(|e| AppError::git(format!("cannot preserve workspace permissions: {e}")))?;
         fs::remove_dir(workspace)
             .map_err(|e| AppError::conflict(format!("cannot replace empty workspace: {e}")))?;
     }
@@ -620,7 +627,10 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
         return Ok(());
     };
     if existed {
-        let _ = fs::create_dir(workspace);
+        let _ = fs::metadata(&checkout).and_then(|metadata| {
+            fs::create_dir(workspace)?;
+            fs::set_permissions(workspace, metadata.permissions())
+        });
     }
     Err(AppError::git(format!(
         "cannot publish local checkout: {error}"
