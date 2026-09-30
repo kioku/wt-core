@@ -636,15 +636,44 @@ fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
 fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
     // Creating under the actual parent preserves one-generation native ACLs and
     // path-based labels; renaming a nested checkout would not re-inherit them.
-    fs::create_dir(workspace)
-        .map_err(|e| AppError::conflict(format!("cannot claim new workspace: {e}")))?;
+    fs::create_dir(workspace).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => {
+            AppError::conflict(format!("cannot claim new workspace: {e}"))
+        }
+        _ => AppError::git(format!("cannot create new workspace: {e}")),
+    })?;
+    // Keep the handle open so directory IDs cannot be recycled during Git's
+    // execution. If capture fails, preserve the root rather than guess ownership.
+    let root = same_file::Handle::from_path(workspace)
+        .map_err(|e| AppError::git(format!("cannot capture new workspace identity: {e}")))?;
     let result = clone_independent_checkout(source, workspace, sha);
+    verify_new_workspace_identity(workspace, &root)?;
     if result.is_err() {
-        // Existing user directories never enter this recursive cleanup path.
         fs::remove_dir_all(workspace)
             .map_err(|e| AppError::git(format!("cannot clean failed new workspace: {e}")))?;
     }
     result
+}
+
+/// Fail closed if the requested entry disappeared, became a symlink, or changed
+/// identity. This bounds ordinary root-replacement cleanup; it is not a lock
+/// against a same-privilege actor racing every filesystem operation.
+fn verify_new_workspace_identity(workspace: &Path, root: &same_file::Handle) -> Result<()> {
+    let metadata = fs::symlink_metadata(workspace)
+        .map_err(|e| AppError::git(format!("cannot inspect new workspace identity: {e}")))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AppError::conflict(
+            "new workspace root was replaced; preserving unexpected destination",
+        ));
+    }
+    let current = same_file::Handle::from_path(workspace)
+        .map_err(|e| AppError::git(format!("cannot inspect new workspace identity: {e}")))?;
+    if &current != root {
+        return Err(AppError::conflict(
+            "new workspace root was replaced; preserving unexpected destination",
+        ));
+    }
+    Ok(())
 }
 
 /// Copy objects and mutable metadata independently, then verify before success.

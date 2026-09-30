@@ -291,7 +291,10 @@ materialization (do not concurrently refresh or prune it). Managed cache refresh
 and checkout remain serialized by the cache lock. Local materialization requires
 a writable workspace parent. New destinations are atomically claimed at their
 requested path, so native parent access controls apply directly; failed checkouts
-remove only that newly created task-owned directory. Existing empty destinations
+remove that newly created task-owned directory only after checking its captured
+identity. If the root is moved, replaced, or cannot be identified, materialization
+fails without deleting the unexpected destination or chasing the moved root.
+Existing empty destinations
 are populated in place via a protocol clone of the verified snapshot, retaining
 native access controls and directory identity on every platform. This compatibility
 path uses private sibling staging and does not receive the local-copy speedup.

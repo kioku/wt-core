@@ -938,3 +938,128 @@ fn new_destination_inherits_one_generation_native_deny_like_direct_clone() {
     assert_checkout(&workspace, &sha);
     assert_no_staging(root.path());
 }
+
+#[cfg(unix)]
+#[test]
+fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let real_git = StdCommand::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).expect("git path");
+    for phase in ["symbolic-ref", "clone", "symlink", "missing"] {
+        let root = tempfile::tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let moved = root.path().join("moved");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("wrapper directory");
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+if [ "$1" = "$WT_REPLACE_PHASE" ] && [ ! -e "$WT_MOVED_ROOT" ]; then
+    if [ "$WT_REPLACEMENT" = symlink ] || [ "$WT_REPLACEMENT" = missing ]; then
+        mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
+        printf 'unrelated data' > "$WT_MOVED_ROOT/user-data"
+        if [ "$WT_REPLACEMENT" = symlink ]; then
+            ln -s "$WT_MOVED_ROOT" "$WT_WORKSPACE" || exit 91
+        fi
+        exit 93
+    fi
+    if [ "$1" = symbolic-ref ]; then
+        "$WT_REAL_GIT" "$@"
+        result=$?
+        mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
+        mkdir "$WT_WORKSPACE" || exit 91
+        cp -R "$WT_MOVED_ROOT/." "$WT_WORKSPACE" || exit 92
+    else
+        mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
+        mkdir "$WT_WORKSPACE" || exit 91
+        result=93
+    fi
+    printf 'unrelated data' > "$WT_WORKSPACE/user-data"
+    # Keep a substituted successful checkout clean as well as exact/detached.
+    if [ "$1" = symbolic-ref ]; then
+        printf '\n/user-data\n' >> "$WT_WORKSPACE/.git/info/exclude"
+    fi
+    exit "$result"
+fi
+exec "$WT_REAL_GIT" "$@"
+"#,
+        )
+        .expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("executable wrapper");
+        let paths = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )))
+        .expect("wrapper PATH");
+        materialize_object(&repo.origin_path(), &sha, &workspace)
+            .env("PATH", paths)
+            .env("WT_REAL_GIT", real_git.trim())
+            .env(
+                "WT_REPLACE_PHASE",
+                if phase == "symbolic-ref" {
+                    phase
+                } else {
+                    "clone"
+                },
+            )
+            .env("WT_REPLACEMENT", phase)
+            .env("WT_WORKSPACE", &workspace)
+            .env("WT_MOVED_ROOT", &moved)
+            .assert()
+            .failure();
+        let preserved = if phase == "missing" {
+            &moved
+        } else {
+            &workspace
+        };
+        assert_eq!(
+            std::fs::read_to_string(preserved.join("user-data")).expect("preserved replacement"),
+            "unrelated data"
+        );
+        if phase == "symlink" {
+            assert!(std::fs::symlink_metadata(&workspace)
+                .expect("preserved symlink")
+                .file_type()
+                .is_symlink());
+        }
+        if phase == "missing" {
+            assert!(!workspace.exists());
+        }
+        assert!(moved.is_dir(), "do not chase and delete a moved task root");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_reports_new_root_io_failure_as_git_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let permissions = std::fs::metadata(root.path())
+        .expect("metadata")
+        .permissions();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("read-only parent");
+    let workspace = root.path().join("workspace");
+    // Privileged users can bypass the fixture's write restriction.
+    let probe = std::fs::create_dir(root.path().join("probe"));
+    let output = if probe.is_err() {
+        Some(materialize_object(&repo.origin_path(), &sha, &workspace).output())
+    } else {
+        None
+    };
+    std::fs::set_permissions(root.path(), permissions).expect("restore parent permissions");
+    if let Some(output) = output {
+        let output = output.expect("run materialize");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!workspace.exists());
+    }
+}
