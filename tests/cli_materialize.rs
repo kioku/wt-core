@@ -1721,16 +1721,29 @@ fn managed_existing_snapshot_rechecks_root_and_verification() {
         .output()
         .expect("locate git");
     assert!(real_git.status.success());
-    for mode in ["replace", "dirt", "private", "final", "public"] {
+    for (mode, use_alias) in ["replace", "dirt", "private", "final", "public"]
+        .into_iter()
+        .flat_map(|mode| [(mode, false), (mode, true)])
+    {
         let root = tempfile::tempdir().expect("fixture");
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace).expect("existing root");
         let bin = root.path().join("bin");
         std::fs::create_dir(&bin).expect("bin");
         let wrapper = bin.join("git");
+        // Only the harness expectation uses an alias; production receives the real path
+        // so this exercises cwd identity without relaxing workspace symlink validation.
+        let expected_workspace = if use_alias {
+            let alias = root.path().join("workspace-alias");
+            std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
+            alias
+        } else {
+            workspace.clone()
+        };
         std::fs::write(&wrapper, r#"#!/bin/sh
 if [ "$1" = symbolic-ref ]; then
-    if [ "$PWD" != "$WT_WORKSPACE" ]; then
+    # macOS may resolve /var to /private/var in cwd; compare directory identity.
+    if ! [ . -ef "$WT_EXPECTED_WORKSPACE" ]; then
         case "$WT_MODE" in
             replace) mv "$WT_WORKSPACE" "$WT_WORKSPACE.saved"; mkdir "$WT_WORKSPACE"; printf user > "$WT_WORKSPACE/user" ;;
             dirt) printf user > "$WT_WORKSPACE/user" ;;
@@ -1763,6 +1776,7 @@ exec "$WT_REAL_GIT" "$@"
                     .trim(),
             )
             .env("WT_WORKSPACE", &workspace)
+            .env("WT_EXPECTED_WORKSPACE", &expected_workspace)
             .env("WT_MODE", mode)
             .assert()
             .failure();
@@ -1777,6 +1791,98 @@ exec "$WT_REAL_GIT" "$@"
             }
             "private" => assert_eq!(std::fs::read_dir(&workspace).expect("root").count(), 0),
             _ => assert!(workspace.join(".git").exists()),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_existing_checkout_rejects_hook_object_tree_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    for mode in ["auto", "copy"] {
+        for (mutation, use_alias) in ["alternates", "symlink", "fifo"]
+            .into_iter()
+            .flat_map(|mutation| [(mutation, false), (mutation, true)])
+        {
+            let root = tempfile::tempdir().expect("fixture");
+            let workspace = root.path().join("workspace");
+            std::fs::create_dir(&workspace).expect("caller-owned destination");
+            // Alias only the hook's target; production still receives the allowed real path.
+            let expected_workspace = if use_alias {
+                let alias = root.path().join("workspace-alias");
+                std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
+                alias
+            } else {
+                workspace.clone()
+            };
+            let identity = same_file::Handle::from_path(&workspace).expect("root identity");
+            std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o750))
+                .expect("destination permissions");
+            let home = root.path().join("home");
+            let template = root.path().join("template");
+            std::fs::create_dir(&home).expect("isolated home");
+            std::fs::create_dir_all(template.join("hooks")).expect("template hooks");
+            std::fs::write(
+                home.join(".gitconfig"),
+                format!("[init]\n\ttemplateDir = {}\n", template.display()),
+            )
+            .expect("isolated template config");
+            let hook = template.join("hooks/post-checkout");
+            // The real template hook only mutates the final workspace, never
+            // the cache or privately verified snapshot.
+            std::fs::write(
+                &hook,
+                r#"#!/bin/sh
+# macOS may resolve /var to /private/var in cwd; compare directory identity.
+[ . -ef "$WT_HOOK_WORKSPACE" ] || exit 0
+case "$WT_HOOK_MUTATION" in
+    alternates) printf '%s\n' "$WT_HOOK_OBJECTS" > .git/objects/info/alternates ;;
+    symlink) ln -s "$WT_HOOK_OBJECTS" .git/objects/hook-entry ;;
+    fifo) mkfifo .git/objects/hook-entry ;;
+esac
+"#,
+            )
+            .expect("template hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("executable hook");
+            let error = if mutation == "alternates" {
+                "local source must not use object alternates"
+            } else {
+                "object tree must not contain symlinks or special files"
+            };
+            managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+                .args(["--copy-mode", mode])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join("xdg"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("WT_HOOK_WORKSPACE", &expected_workspace)
+                .env("WT_HOOK_MUTATION", mutation)
+                .env("WT_HOOK_OBJECTS", repo.path().join(".git/objects"))
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(error));
+            assert_eq!(
+                identity,
+                same_file::Handle::from_path(&workspace).expect("preserved root")
+            );
+            assert_eq!(
+                std::fs::metadata(&workspace)
+                    .expect("root metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+            assert!(workspace.join(".git").is_dir(), "never clean caller output");
+            let entry = if mutation == "alternates" {
+                "info/alternates"
+            } else {
+                "hook-entry"
+            };
+            assert!(std::fs::symlink_metadata(workspace.join(".git/objects").join(entry)).is_ok());
         }
     }
 }
