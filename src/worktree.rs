@@ -1651,9 +1651,8 @@ fn write_operation_state_inner(
             // the synchronization boundary, while this generation check makes
             // stale callers fail closed even if they bypass that boundary.
             if let Some(expected) = expected {
-                verify_operation_generation(repo, expected).map_err(|error| {
+                verify_operation_generation(repo, expected).inspect_err(|_| {
                     let _ = fs::remove_file(&temp);
-                    error
                 })?;
             }
             if let Err(error) = operation_state::ensure_private_file(&path) {

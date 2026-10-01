@@ -235,9 +235,8 @@ pub(crate) fn acquire_merge_lifecycle_lock(path: &Path) -> Result<MergeLifecycle
                 child_lock_path.display()
             ))
         })?;
-        ensure_private_file(&child_lock_path).map_err(|error| {
+        ensure_private_file(&child_lock_path).inspect_err(|_| {
             release_parent_lock(&file);
-            error
         })?;
         let child_available = try_lock_exclusive(&child_file).map_err(|error| {
             release_parent_lock(&file);
