@@ -1888,7 +1888,10 @@ fn merge_json_output_structure() {
     assert_eq!(json["event"], "reset");
     assert_eq!(json["branch"], "feature/json-merge");
     assert_eq!(json["mainline"], "main");
-    assert_eq!(json["destination_path"], repo_str);
+    assert_eq!(
+        std::path::Path::new(json["destination_path"].as_str().expect("destination path")),
+        repo.path()
+    );
     assert!(json["repo_root"].as_str().is_some());
     assert_eq!(json["cleaned_up"], true);
     assert!(
@@ -2079,7 +2082,7 @@ fn merge_print_paths_v2_appends_destination_path() {
     assert_eq!(lines[2], "main");
     assert_eq!(lines[3], "true");
     assert_eq!(lines[5], "false");
-    assert_eq!(lines[6], repo_str);
+    assert_eq!(std::path::Path::new(lines[6]), repo.path());
 }
 
 #[test]
@@ -2270,7 +2273,8 @@ fn merge_into_linked_worktree_succeeds_and_cleans_only_source() {
             "Merged 'feature/linked' into release/linked",
         ))
         .stdout(predicate::str::contains(format!(
-            "Destination worktree: {destination_str}"
+            "Destination worktree: {}",
+            fixtures::git_path_string(&destination)
         )))
         .stdout(predicate::str::contains("Pushed release/linked to origin"));
 
@@ -3208,8 +3212,12 @@ fn merge_inspect_reports_linked_destination_topology() {
 
     assert_eq!(json["preflight"]["destination"], "release/inspect");
     assert_eq!(
-        json["preflight"]["destination_path"],
-        destination.display().to_string()
+        std::path::Path::new(
+            json["preflight"]["destination_path"]
+                .as_str()
+                .expect("destination path")
+        ),
+        destination
     );
     assert_eq!(json["preflight"]["topology"], "synchronized");
     assert_eq!(git_rev_parse(&destination, "HEAD"), destination_before);
@@ -3992,14 +4000,13 @@ fn worktree_admin_snapshot(repo: &std::path::Path) -> Vec<(String, String)> {
 /// the stale record during a normal merge preflight.
 fn lock_worktree_metadata(repo: &std::path::Path, worktree: &std::path::Path) {
     let admin_dir = repo.join(".git/worktrees");
-    let worktree_prefix = worktree.display().to_string();
     for entry in std::fs::read_dir(&admin_dir)
         .expect("worktree admin directory")
         .flatten()
     {
         let path = entry.path();
         let gitdir = std::fs::read_to_string(path.join("gitdir")).unwrap_or_default();
-        if gitdir.trim().starts_with(&worktree_prefix) {
+        if std::path::Path::new(gitdir.trim()).starts_with(worktree) {
             std::fs::write(path.join("locked"), "repair test").expect("lock worktree");
             return;
         }

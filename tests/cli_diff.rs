@@ -45,6 +45,16 @@ impl IsolatedDifftoolEnv {
             .env("XDG_CONFIG_HOME", &self.xdg_config_home)
             .env("GIT_CONFIG_GLOBAL", os_null_path())
             .env("GIT_CONFIG_NOSYSTEM", "1");
+        #[cfg(windows)]
+        {
+            let original_path = std::env::var_os("PATH").expect("original Git PATH");
+            let git = std::env::split_paths(&original_path)
+                .map(|directory| directory.join("git.exe"))
+                .find(|path| path.is_file())
+                .expect("real Git executable");
+            cmd.env("WT_TEST_GIT_PATH", original_path)
+                .env("WT_TEST_REAL_GIT", git);
+        }
     }
 }
 
@@ -67,9 +77,47 @@ fn link_git_binary(bin: &Path) {
         .expect("failed to link git into isolated PATH");
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn link_git_binary(bin: &Path) {
+    // Git for Windows needs install-relative DLLs and shell scripts. A native
+    // proxy keeps real repository commands in their normal environment while
+    // making the unavailable-difftool response deterministic for these tests.
+    let source = bin.join("git.rs");
+    std::fs::write(
+        &source,
+        r#"fn main() {
+    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    if args.len() == 2 && args[0] == "difftool" && args[1] == "--tool-help" {
+        println!("The following tools are valid, but not currently available:");
+        return;
+    }
+    let status = std::process::Command::new(std::env::var_os("WT_TEST_REAL_GIT").expect("real Git"))
+        .args(args)
+        .env("PATH", std::env::var_os("WT_TEST_GIT_PATH").expect("original Git PATH"))
+        .status()
+        .expect("real Git should start");
+    std::process::exit(status.code().unwrap_or(1));
+}
+"#,
+    )
+    .expect("write native Git proxy");
+    let output = std::process::Command::new("rustc")
+        .arg("--edition=2021")
+        .arg(&source)
+        .arg("-o")
+        .arg(bin.join("git.exe"))
+        .output()
+        .expect("compile native Git proxy");
+    assert!(
+        output.status.success(),
+        "Git proxy compilation failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(not(any(unix, windows)))]
 fn link_git_binary(_bin: &Path) {
-    panic!("isolated difftool PATH tests require unix symlinks");
+    panic!("isolated difftool PATH tests require a supported platform");
 }
 
 fn os_null_path() -> &'static str {
@@ -334,7 +382,7 @@ fn diff_dirty_dry_run_explicit_branch_uses_worktree_path() {
         .success()
         .stdout(predicate::str::contains(format!(
             "git -C {} difftool",
-            worktree.display()
+            fixtures::git_path_string(&worktree)
         )))
         .stdout(predicate::str::contains("--dir-diff HEAD"));
 }
@@ -366,7 +414,7 @@ fn diff_staged_and_unstaged_dry_run_construct_worktree_commands() {
         .success()
         .stdout(predicate::str::contains(format!(
             "git -C {} difftool --tool vimdiff --dir-diff --staged",
-            worktree.display()
+            fixtures::git_path_string(&worktree)
         )));
 
     wt_core()
@@ -382,7 +430,7 @@ fn diff_staged_and_unstaged_dry_run_construct_worktree_commands() {
         .success()
         .stdout(predicate::str::contains(format!(
             "git -C {} difftool --dir-diff",
-            worktree.display()
+            fixtures::git_path_string(&worktree)
         )))
         .stdout(predicate::str::contains("--staged").not())
         .stdout(predicate::str::contains(" HEAD").not());

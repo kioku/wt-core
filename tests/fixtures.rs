@@ -171,3 +171,16 @@ pub fn find_worktree_dir(repo: &std::path::Path, slug_prefix: &str) -> std::path
         worktrees_dir.display()
     );
 }
+
+/// Match Git porcelain path spelling without changing native path semantics.
+pub fn git_path_string(path: &std::path::Path) -> String {
+    let path = path.display().to_string();
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
