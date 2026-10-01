@@ -5,6 +5,120 @@ All notable changes to this project will be documented in this file.
 This changelog is generated automatically by [git-cliff](https://git-cliff.org/)
 during the release workflow and is append-only — existing entries are never modified.
 
+## [0.5.0](https://github.com/kioku/wt-core/releases/tag/v0.5.0) — 2026-10-01
+
+### Bug Fixes
+
+- Preserve merge state and expose linked targets
+- Harden cleanup lifecycle guards
+- Preserve valid cleanup markers on retry
+- Make worktree execution signal-safe
+- Unify navigation output selection
+- Harden shell navigation protocol
+- Preserve shell binding failure statuses
+- Unify machine-readable output selection
+- Harden merge preflight and failure reporting
+- Verify merge worktree identities
+- Preserve stable merge worktree identities
+- Harden resumable merge recovery
+- Serialize merge lifecycle ownership
+- Keep merge status read-only without journal
+- Harden lifecycle cleanup and git context isolation
+- Harden integrated lifecycle safety
+- Scope worktree lifecycle safety
+- Close scoped lifecycle recovery gaps
+- Scope worktree lifecycle safety
+- Scope lifecycle lock inheritance
+- Restrict lifecycle lock inheritance on windows
+- Contain windows lifecycle git atomically
+- Harden Windows lifecycle launcher containment
+- Fail closed Windows lifecycle cleanup
+- Keep Windows lifecycle lease with surviving guardian
+- Close Windows guardian handshake race
+- Harden guardian handshake readiness tests
+- Contain every lifecycle Git mutation
+- Contain worktree metadata pruning
+- Handle stale worktree navigation safely
+- Shell-quote stale worktree guidance
+- Harden Windows lifecycle ACL policy
+- Close Windows ACL lifecycle review findings
+- Make Windows restricted ACL tests account-aware
+- Scope Windows ACL test imports
+- Avoid Windows ACL owner reassignment
+- Reject Windows ACL setup under impersonation
+- Simplify Windows lifecycle handling
+- Contain lifecycle Git mutations
+- Reject trailing components on symlink materialize sources
+- Preserve private materialize destination permissions
+- Preserve empty materialize destination ownership
+- Normalize local materialize publication paths
+- Preserve linux materialize destination acls
+- Allow materialize on filesystems without xattrs
+- Remove inherited materialize destination acl grants
+- Reject unsupported destination access control replacement
+- Preserve existing materialize directories in place
+- Inherit native controls at new materialize paths
+- Guard new materialize root cleanup by identity
+- Retain materialize root identity through final verification
+- Normalize materialize root identity inspection
+- Preserve materialize validation under git preferences
+- Fail closed during materialize verification
+- Enforce byte writes for forced materialize copies
+- Integrate materialize validation and portable reflink requests
+- Preserve complete materialize snapshots in existing roots
+- Inspect branch locks through their owning handle
+- Use git-compatible canonical paths on windows
+- Support native windows worktree removal and path assertions
+- Distinguish lifecycle ownership from read-only lock probes
+- Enforce supported rust minimum and portable nushell navigation
+- Report doctor failures and bound paths with json error fallback
+- Align validation with supported rust minimum
+- Normalize surviving navigation ancestors on windows
+- Recover cache ownership safely across process lifetimes
+
+### Documentation
+
+- Update changelog for v0.4.0
+- Clarify exec json stderr contract
+
+### Features
+
+- Merge into linked worktree targets
+- Add linked-worktree merge targets
+- Separate worktree and branch cleanup
+- Separate worktree and branch cleanup
+- Add worktree command execution
+- Add worktree command execution
+- Add merge topology preflight
+- Add merge topology preflight
+- Add resumable merge lifecycle
+- Add resumable merge lifecycle
+
+### Miscellaneous
+
+- Bump libc from 0.2.182 to 0.2.189
+- Integrate reviewed libc update
+- Bump serde_json from 1.0.149 to 1.0.151
+- Integrate reviewed serde json update
+- Bump serde from 1.0.228 to 1.0.229
+- Integrate reviewed serde update
+- Bump clap from 4.6.1 to 4.6.6
+- Integrate reviewed clap update
+- Bump codecov/codecov-action from 6 to 7
+- Integrate reviewed codecov action update
+- Bump actions/checkout from 6 to 7
+- Integrate reviewed checkout action update
+- Bump actions/cache from 5 to 6
+- Integrate reviewed cache action update
+
+### Performance
+
+- Copy local materialize objects independently
+- Parallelize materialize checkout with bounded workers
+- Parallelize large workspace cleanliness verification
+- Automatically reflink independent materialize objects
+- Collect ordered worktree stats with bounded workers
+
 ## [0.4.0](https://github.com/kioku/wt-core/releases/tag/v0.4.0) — 2026-07-04
 
 ### Bug Fixes
