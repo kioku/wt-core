@@ -1440,6 +1440,7 @@ fn cached_checkout_releases_lock_before_independent_checkout() {
     let root = tempfile::tempdir().expect("fixture");
     let cache = root.path().join("cache");
     let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("existing empty workspace");
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).expect("wrapper directory");
     let real_git = StdCommand::new("sh")
@@ -1451,7 +1452,13 @@ fn cached_checkout_releases_lock_before_independent_checkout() {
     std::fs::write(
         &wrapper,
         r#"#!/bin/sh
+if [ "$1" = clone ] && [ "$2" = --local ] && [ "$3" = --shared ]; then
+    printf '%s\n' transfer >> "$WT_CACHE_GATE/transfers"
+fi
 for arg do
+    case "$arg" in
+        */.wt-materialize-*) printf redundant > "$WT_CACHE_GATE/redundant" ;;
+    esac
     if [ "$arg" = checkout ]; then
         printf ready > "$WT_CACHE_GATE/ready"
         while [ ! -f "$WT_CACHE_GATE/finish" ]; do sleep 0.05; done
@@ -1497,12 +1504,25 @@ exec "$WT_REAL_GIT" "$@"
     // The first checkout remains blocked, but another caller must finish.
     materialize_cached(&repo, &sha, &cache, &root.path().join("second"));
     assert!(owner.try_wait().expect("still blocked").is_none());
+    // Remove the live cache's objects while private checkout is still blocked.
+    // Neither checkout nor final population may read them after lock release.
+    std::fs::remove_dir_all(cache.join("owner__repo.git/objects"))
+        .expect("prune live cache objects");
     std::fs::write(root.path().join("finish"), "").expect("release checkout");
     let result = owner.wait_with_output().expect("checkout result");
     assert!(
         result.status.success(),
         "{}",
         String::from_utf8_lossy(&result.stderr)
+    );
+    assert!(!root.path().join("redundant").exists());
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("transfers"))
+            .expect("transfer log")
+            .matches("transfer")
+            .count(),
+        2,
+        "cache snapshot and final destination must be the only object transfers"
     );
     assert_checkout(&workspace, &sha);
     assert_eq!(
@@ -1511,4 +1531,358 @@ exec "$WT_REAL_GIT" "$@"
             .expect("cache identity")
             .to_string_lossy()
     );
+}
+
+#[test]
+fn managed_existing_snapshot_preserves_all_objects_in_both_modes() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("fixture");
+    let cache = root.path().join("cache");
+    materialize_cached(&repo, &sha, &cache, &root.path().join("warm"));
+    let source = cache.join("owner__repo.git");
+    let blob_file = root.path().join("blob");
+    std::fs::write(&blob_file, "unreachable cache object\n").expect("blob");
+    let blob = git_output(
+        &["hash-object", "-w", &blob_file.display().to_string()],
+        &source,
+    );
+    for mode in ["auto", "copy"] {
+        let workspace = root.path().join(mode);
+        std::fs::create_dir(&workspace).expect("existing destination");
+        wt_core()
+            .args(["materialize", "--repo-slug", "owner/repo", "--remote-url"])
+            .arg(file_url(&repo.origin_path()))
+            .args(["--sha", &sha, "--copy-mode", mode, "--cache-root"])
+            .arg(&cache)
+            .arg("--workspace-root")
+            .arg(&workspace)
+            .assert()
+            .success();
+        assert_checkout(&workspace, &sha);
+        #[cfg(unix)]
+        assert_independent_files(&source, &workspace.join(".git"));
+    }
+    std::fs::remove_dir_all(&source).expect("remove cache");
+    for mode in ["auto", "copy"] {
+        assert_eq!(
+            git_output(&["cat-file", "blob", &blob], &root.path().join(mode)),
+            "unreachable cache object"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_local_copy_preserves_private_empty_destination_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700))
+        .expect("private workspace");
+    managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::metadata(&workspace)
+            .expect("workspace metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_local_copy_preserves_empty_destination_group() {
+    use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let original_group = std::fs::metadata(&workspace).expect("metadata").gid();
+    let groups = StdCommand::new("id")
+        .arg("-G")
+        .output()
+        .expect("list groups");
+    assert!(groups.status.success());
+    let Some(group) = String::from_utf8(groups.stdout)
+        .expect("group ids")
+        .split_whitespace()
+        .filter_map(|group| group.parse::<u32>().ok())
+        .find(|group| *group != original_group)
+    else {
+        // Changing directory groups requires membership in another group.
+        return;
+    };
+    chown(&workspace, None, Some(group)).expect("set workspace group");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o770))
+        .expect("group-private workspace");
+    managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+        .assert()
+        .success();
+    let metadata = std::fs::metadata(&workspace).expect("workspace metadata");
+    assert_eq!(metadata.gid(), group);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o770);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_local_copy_preserves_empty_destination_access_and_default_acls() {
+    use std::os::unix::fs::MetadataExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    // The normal test filesystem may have ACLs disabled; Linux tmpfs supports
+    // them, so exercise the security regression there when available.
+    let root = tempfile::tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let owner = std::fs::metadata(&workspace).expect("metadata").uid();
+    let denied_user = if owner == 65534 { 65533 } else { 65534 };
+    // Linux POSIX ACL xattr format: version 2, then (tag, permissions, id).
+    // A named-user deny must survive even though mode bits permit others.
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (1_u16, 7_u16, u32::MAX),
+        (2, 0, denied_user),
+        (4, 5, u32::MAX),
+        (16, 5, u32::MAX),
+        (32, 5, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    if let Err(error) = xattr::set(&workspace, "system.posix_acl_access", &acl) {
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        panic!("set access ACL: {error}");
+    }
+    xattr::set(&workspace, "system.posix_acl_default", &acl).expect("set default ACL");
+    managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+        .assert()
+        .success();
+    for path in [&workspace, &workspace.join(".git")] {
+        assert_eq!(
+            xattr::get(path, "system.posix_acl_access").expect("access ACL"),
+            Some(acl.clone())
+        );
+        assert_eq!(
+            xattr::get(path, "system.posix_acl_default").expect("default ACL"),
+            Some(acl.clone())
+        );
+    }
+    // Regular files inherit the named-user restriction, with a narrower mask.
+    let file_acl = xattr::get(workspace.join(".git/config"), "system.posix_acl_access")
+        .expect("file ACL")
+        .expect("inherited file ACL");
+    assert_eq!(&file_acl[12..20], &acl[12..20]);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+fn managed_command(
+    repo: &fixtures::ClonedTestRepo,
+    sha: &str,
+    cache: &Path,
+    workspace: &Path,
+) -> Command {
+    let mut command = wt_core();
+    command
+        .args(["materialize", "--repo-slug", "owner/repo", "--remote-url"])
+        .arg(file_url(&repo.origin_path()))
+        .args(["--sha", sha, "--cache-root"])
+        .arg(cache)
+        .arg("--workspace-root")
+        .arg(workspace);
+    command
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_existing_snapshot_rechecks_root_and_verification() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let real_git = StdCommand::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(real_git.status.success());
+    for (mode, use_alias) in ["replace", "dirt", "private", "final", "public"]
+        .into_iter()
+        .flat_map(|mode| [(mode, false), (mode, true)])
+    {
+        let root = tempfile::tempdir().expect("fixture");
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir(&workspace).expect("existing root");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("bin");
+        let wrapper = bin.join("git");
+        // Only the harness expectation uses an alias; production receives the real path
+        // so this exercises cwd identity without relaxing workspace symlink validation.
+        let expected_workspace = if use_alias {
+            let alias = root.path().join("workspace-alias");
+            std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
+            alias
+        } else {
+            workspace.clone()
+        };
+        std::fs::write(&wrapper, r#"#!/bin/sh
+if [ "$1" = symbolic-ref ]; then
+    # macOS may resolve /var to /private/var in cwd; compare directory identity.
+    if ! [ . -ef "$WT_EXPECTED_WORKSPACE" ]; then
+        case "$WT_MODE" in
+            replace) mv "$WT_WORKSPACE" "$WT_WORKSPACE.saved"; mkdir "$WT_WORKSPACE"; printf user > "$WT_WORKSPACE/user" ;;
+            dirt) printf user > "$WT_WORKSPACE/user" ;;
+            private) exit 99 ;;
+        esac
+    else
+        case "$WT_MODE" in
+            final) exit 99 ;;
+            public)
+                if [ -e "$WT_WORKSPACE.checked" ]; then exit 99; fi
+                touch "$WT_WORKSPACE.checked"
+                ;;
+        esac
+    fi
+fi
+exec "$WT_REAL_GIT" "$@"
+"#).expect("wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("executable");
+        let paths = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )))
+        .expect("PATH");
+        managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+            .env("PATH", paths)
+            .env(
+                "WT_REAL_GIT",
+                String::from_utf8(real_git.stdout.clone())
+                    .expect("git path")
+                    .trim(),
+            )
+            .env("WT_WORKSPACE", &workspace)
+            .env("WT_EXPECTED_WORKSPACE", &expected_workspace)
+            .env("WT_MODE", mode)
+            .assert()
+            .failure();
+        assert!(workspace.is_dir());
+        match mode {
+            "replace" | "dirt" => {
+                assert_eq!(
+                    std::fs::read_to_string(workspace.join("user")).expect("user data"),
+                    "user"
+                );
+                assert!(!workspace.join(".git").exists());
+            }
+            "private" => assert_eq!(std::fs::read_dir(&workspace).expect("root").count(), 0),
+            _ => assert!(workspace.join(".git").exists()),
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_existing_checkout_rejects_hook_object_tree_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    for mode in ["auto", "copy"] {
+        for (mutation, use_alias) in ["alternates", "symlink", "fifo"]
+            .into_iter()
+            .flat_map(|mutation| [(mutation, false), (mutation, true)])
+        {
+            let root = tempfile::tempdir().expect("fixture");
+            let workspace = root.path().join("workspace");
+            std::fs::create_dir(&workspace).expect("caller-owned destination");
+            // Alias only the hook's target; production still receives the allowed real path.
+            let expected_workspace = if use_alias {
+                let alias = root.path().join("workspace-alias");
+                std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
+                alias
+            } else {
+                workspace.clone()
+            };
+            let identity = same_file::Handle::from_path(&workspace).expect("root identity");
+            std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o750))
+                .expect("destination permissions");
+            let home = root.path().join("home");
+            let template = root.path().join("template");
+            std::fs::create_dir(&home).expect("isolated home");
+            std::fs::create_dir_all(template.join("hooks")).expect("template hooks");
+            std::fs::write(
+                home.join(".gitconfig"),
+                format!("[init]\n\ttemplateDir = {}\n", template.display()),
+            )
+            .expect("isolated template config");
+            let hook = template.join("hooks/post-checkout");
+            // The real template hook only mutates the final workspace, never
+            // the cache or privately verified snapshot.
+            std::fs::write(
+                &hook,
+                r#"#!/bin/sh
+# macOS may resolve /var to /private/var in cwd; compare directory identity.
+[ . -ef "$WT_HOOK_WORKSPACE" ] || exit 0
+case "$WT_HOOK_MUTATION" in
+    alternates) printf '%s\n' "$WT_HOOK_OBJECTS" > .git/objects/info/alternates ;;
+    symlink) ln -s "$WT_HOOK_OBJECTS" .git/objects/hook-entry ;;
+    fifo) mkfifo .git/objects/hook-entry ;;
+esac
+"#,
+            )
+            .expect("template hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("executable hook");
+            let error = if mutation == "alternates" {
+                "local source must not use object alternates"
+            } else {
+                "object tree must not contain symlinks or special files"
+            };
+            managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+                .args(["--copy-mode", mode])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join("xdg"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("WT_HOOK_WORKSPACE", &expected_workspace)
+                .env("WT_HOOK_MUTATION", mutation)
+                .env("WT_HOOK_OBJECTS", repo.path().join(".git/objects"))
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(error));
+            assert_eq!(
+                identity,
+                same_file::Handle::from_path(&workspace).expect("preserved root")
+            );
+            assert_eq!(
+                std::fs::metadata(&workspace)
+                    .expect("root metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+            assert!(workspace.join(".git").is_dir(), "never clean caller output");
+            let entry = if mutation == "alternates" {
+                "info/alternates"
+            } else {
+                "hook-entry"
+            };
+            assert!(std::fs::symlink_metadata(workspace.join(".git/objects").join(entry)).is_ok());
+        }
+    }
 }

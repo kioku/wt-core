@@ -387,7 +387,7 @@ pub fn materialize(options: MaterializeOptions) -> Result<MaterializeResult> {
 struct SourceResult {
     cache_status: &'static str,
     source: &'static str,
-    // Retain fresh-root ownership through the public entry point's final Git
+    // Retain root identity through the public entry point's final Git
     // verification, not just through the local clone helper.
     workspace_identity: Option<same_file::Handle>,
 }
@@ -456,6 +456,15 @@ fn materialize_from_cache(
         .as_ref()
         .ok_or_else(|| AppError::invariant("cache path exists without cache root"))?;
 
+    let workspace: PathBuf = request.workspace_root.components().collect();
+    let existing_root = if workspace.exists() {
+        ensure_existing_workspace_available(&workspace)?;
+        Some(same_file::Handle::from_path(&workspace).map_err(|e| {
+            AppError::git(format!("cannot capture existing workspace identity: {e}"))
+        })?)
+    } else {
+        None
+    };
     create_dir_all(cache_root, "cache root")?;
     let lock_path = cache_path.with_extension("git.lock");
     let lock_started = Instant::now();
@@ -487,12 +496,22 @@ fn materialize_from_cache(
     // All source reads are complete. Checkout, both verification passes, and
     // copying into an existing destination use only the independent snapshot.
     drop(lock);
-    let identity = clone_local_bare(
-        &staged.join(".git"),
-        &request.workspace_root,
-        &request.sha,
-        request.copy_mode,
-    )?;
+    let identity = if let Some(root) = existing_root {
+        checkout_detached(&staged, &request.sha)?;
+        // Checkout hooks can invalidate the snapshot's pre-checkout safety.
+        // Revalidate before using it as an independent transfer source.
+        independent_local_source(&staged.join(".git"))?;
+        verify_workspace(&staged, &request.sha)?;
+        populate_verified_checkout(&staged, &workspace, &request.sha, request.copy_mode, &root)?;
+        Some(root)
+    } else {
+        clone_local_bare(
+            &staged.join(".git"),
+            &request.workspace_root,
+            &request.sha,
+            request.copy_mode,
+        )?
+    };
     run_git_owned(
         vec![os("remote"), os("set-url"), os("origin"), os(&source)],
         Some(&request.workspace_root),
@@ -939,6 +958,26 @@ fn clone_local_bare(
     checkout_detached(workspace, sha)?;
     verify_workspace(workspace, sha)?;
     Ok(None)
+}
+
+/// Populate in place from a privately verified independent checkout. Regenerate
+/// files under the destination's native controls; never transplant staged files
+/// or recursively clean a user-owned root after a failure.
+fn populate_verified_checkout(
+    checkout: &Path,
+    workspace: &Path,
+    sha: &str,
+    copy_mode: MaterializeCopyMode,
+    root: &same_file::Handle,
+) -> Result<()> {
+    verify_new_workspace_identity(workspace, root)?;
+    ensure_existing_workspace_available(workspace)?;
+    clone_independent_checkout(&checkout.join(".git"), workspace, sha, copy_mode)?;
+    verify_new_workspace_identity(workspace, root)?;
+    // Final checkout hooks run after object copying and may recreate alternates
+    // or unsafe entries that HEAD/cleanliness verification does not inspect.
+    independent_local_source(&workspace.join(".git"))?;
+    Ok(())
 }
 
 /// Claim a fresh root at its final path and clean only our own output on failure.
