@@ -87,7 +87,7 @@ fn link_git_binary(bin: &Path) {
         &source,
         r#"fn main() {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
-    if args.len() == 2 && args[0] == "difftool" && args[1] == "--tool-help" {
+    if args.ends_with(&["difftool".into(), "--tool-help".into()]) {
         println!("The following tools are valid, but not currently available:");
         return;
     }
