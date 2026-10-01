@@ -152,7 +152,6 @@ fn list_from_subdirectory_of_main_worktree() {
 #[test]
 fn add_from_subdirectory_of_main_worktree() {
     let repo = fixtures::TestRepo::new();
-    let repo_str = repo.path().display().to_string();
 
     let subdir = repo.path().join("subdir").join("deep");
     std::fs::create_dir_all(&subdir).expect("create subdir");

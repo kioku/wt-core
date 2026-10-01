@@ -2245,7 +2245,6 @@ fn merge_into_linked_worktree_succeeds_and_cleans_only_source() {
     let (repo, upstream) = setup_repo_with_upstream();
     let repo_str = repo.path().display().to_string();
     let destination = add_linked_destination(&repo, "release/linked");
-    let destination_str = destination.display().to_string();
 
     run_git(&["push", "-u", "origin", "release/linked"], &repo.path());
 
