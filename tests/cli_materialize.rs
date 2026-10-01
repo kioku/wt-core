@@ -200,6 +200,208 @@ fn materialize_from_object_source_without_permanent_alternates() {
 }
 
 #[test]
+fn materialize_large_checkout_preserves_older_sha_and_file_modes() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let nested = repo.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested directory");
+    // Exceed Git's default checkout and status parallelism thresholds.
+    for index in 0..1_200 {
+        std::fs::write(
+            nested.join(format!("file-{index}.txt")),
+            format!("content {index}\n"),
+        )
+        .expect("write checkout fixture");
+    }
+    git_output(&["add", "."], &repo.path());
+    git_output(
+        &["update-index", "--chmod=+x", "nested/file-0.txt"],
+        &repo.path(),
+    );
+    git_output(&["commit", "-m", "large checkout fixture"], &repo.path());
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    fixtures::commit_file(&repo.path(), "later.txt", "not requested", "later commit");
+    git_output(&["push", "origin", "main"], &repo.path());
+
+    let root = tempfile::tempdir().expect("temp dir");
+    for mode in ["object_source", "cache", "remote"] {
+        let workspace = root.path().join(mode);
+        let mut command = wt_core();
+        command.args(["materialize", "--repo-slug", "owner/repo", "--sha", &sha]);
+        if mode == "object_source" {
+            command.arg("--object-source").arg(repo.origin_path());
+        } else {
+            command
+                .arg("--remote-url")
+                .arg(file_url(&repo.origin_path()));
+        }
+        if mode == "cache" {
+            command
+                .arg("--cache-root")
+                .arg(root.path().join("cache-root"));
+        }
+        command
+            .arg("--workspace-root")
+            .arg(&workspace)
+            .arg("--json")
+            .assert()
+            .success();
+        assert_eq!(git_output(&["rev-parse", "HEAD"], &workspace), sha);
+        assert_eq!(git_output(&["status", "--porcelain"], &workspace), "");
+        assert!(!git_success(&["symbolic-ref", "-q", "HEAD"], &workspace));
+        assert!(!workspace.join("later.txt").exists());
+        assert!(!workspace.join(".git/objects/info/alternates").exists());
+        // The optimization must not persist a repository config override.
+        assert!(!git_success(
+            &["config", "--local", "--get", "checkout.workers"],
+            &workspace
+        ));
+        assert!(
+            git_output(&["ls-files", "--stage", "nested/file-0.txt"], &workspace)
+                .starts_with("100755 ")
+        );
+        for index in 0..1_200 {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("nested/file-{index}.txt")))
+                    .expect("read materialized file"),
+                format!("content {index}\n")
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn parallel_materialize_status_rejects_dirty_paths_and_worker_failures() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::ClonedTestRepo::new();
+    for index in 0..1_000 {
+        std::fs::write(
+            repo.path().join(format!("file-{index}")),
+            "clean contents\n",
+        )
+        .expect("write large fixture");
+    }
+    std::fs::create_dir(repo.path().join("nested")).expect("nested directory");
+    let paths = [
+        "alpha",
+        "fox",
+        "november",
+        "sierra",
+        ".hidden",
+        "123",
+        "Éclair",
+        "nested/é\nfile",
+    ];
+    for path in paths {
+        std::fs::write(repo.path().join(path), "clean contents\n").expect("write probe");
+    }
+    git_output(&["add", "."], &repo.path());
+    git_output(&["commit", "-m", "large dirty-state fixture"], &repo.path());
+    git_output(&["push", "origin", "main"], &repo.path());
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let real_git = StdCommand::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).expect("git path");
+    let root = tempfile::tempdir().expect("temp dir");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).expect("wrapper directory");
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+if [ "$1" = rev-parse ] && [ "$2" = HEAD ] && [ ! -e "$WT_MUTATED" ]; then
+    touch "$WT_MUTATED" || exit 90
+    case "$WT_PROBE_MODE" in
+        edit)
+            cp -p "$WT_WORKSPACE/$WT_PROBE_PATH" "$WT_TIMESTAMP" || exit 91
+            printf 'dirty contents\n' > "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 92
+            touch -r "$WT_TIMESTAMP" "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 93
+            ;;
+        untracked)
+            "$WT_REAL_GIT" -C "$WT_WORKSPACE" config status.showUntrackedFiles no || exit 94
+            printf 'untracked' > "$WT_WORKSPACE/$WT_PROBE_PATH-new" || exit 94
+            ;;
+        delete) rm "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 95 ;;
+        staged) "$WT_REAL_GIT" -C "$WT_WORKSPACE" mv alpha sierra-staged || exit 96 ;;
+        symlink) rm "$WT_WORKSPACE/alpha" && ln -s fox "$WT_WORKSPACE/alpha" || exit 97 ;;
+    esac
+fi
+if [ "$1" = symbolic-ref ] && [ "$WT_PROBE_MODE" = detached_failure ]; then
+    echo 'injected detached check failure' >&2
+    exit 99
+fi
+if [ "$1" = --no-optional-locks ]; then
+    printf 'worker\n' >> "$WT_WORKERS" || exit 98
+    if [ "$WT_PROBE_MODE" = failure ]; then
+        echo 'injected status worker failure' >&2
+        exit 99
+    fi
+fi
+exec "$WT_REAL_GIT" "$@"
+"#,
+    )
+    .expect("write wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("executable wrapper");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").expect("PATH"));
+    let probes: Vec<_> = paths
+        .iter()
+        .flat_map(|path| [("edit", *path), ("untracked", *path)])
+        .chain([
+            ("delete", "alpha"),
+            ("staged", "alpha"),
+            ("symlink", "alpha"),
+            ("failure", "alpha"),
+            ("detached_failure", "alpha"),
+        ])
+        .collect();
+    for (index, (mode, probe_path)) in probes.into_iter().enumerate() {
+        let workspace = root.path().join(format!("workspace-{index}"));
+        let workers = root.path().join(format!("workers-{index}"));
+        let mut command = materialize_object(&repo.origin_path(), &sha, &workspace);
+        let pathspec_override = [
+            "GIT_LITERAL_PATHSPECS",
+            "GIT_GLOB_PATHSPECS",
+            "GIT_NOGLOB_PATHSPECS",
+            "GIT_ICASE_PATHSPECS",
+        ][index % 4];
+        command
+            .env("PATH", &path)
+            .env(pathspec_override, "1")
+            .env("WT_REAL_GIT", real_git.trim())
+            .env("WT_WORKSPACE", &workspace)
+            .env("WT_PROBE_PATH", probe_path)
+            .env("WT_PROBE_MODE", mode)
+            .env("WT_MUTATED", root.path().join(format!("mutated-{index}")))
+            .env(
+                "WT_TIMESTAMP",
+                root.path().join(format!("timestamp-{index}")),
+            )
+            .env("WT_WORKERS", &workers);
+        let assertion = command.assert().failure();
+        if mode == "failure" {
+            assertion.stderr(predicate::str::contains("injected status worker failure"));
+        } else if mode == "detached_failure" {
+            assertion.stderr(predicate::str::contains("injected detached check failure"));
+        } else {
+            assertion.stderr(predicate::str::contains("not clean"));
+        }
+        assert_eq!(
+            std::fs::read_to_string(workers)
+                .expect("worker log")
+                .lines()
+                .count(),
+            4
+        );
+        assert!(!workspace.exists(), "failed owned checkout must be cleaned");
+    }
+}
+
+#[test]
 fn materialize_rejects_existing_non_empty_workspace() {
     let repo = fixtures::ClonedTestRepo::new();
     let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
@@ -944,6 +1146,20 @@ fn new_destination_inherits_one_generation_native_deny_like_direct_clone() {
 fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() {
     use std::os::unix::fs::PermissionsExt;
     let repo = fixtures::ClonedTestRepo::new();
+    // Exercise root-identity protection with the concurrent status path too.
+    for index in 0..1_000 {
+        std::fs::write(
+            repo.path().join(format!("file-{index}")),
+            "root identity fixture",
+        )
+        .expect("write large fixture");
+    }
+    git_output(&["add", "."], &repo.path());
+    git_output(
+        &["commit", "-m", "large root identity fixture"],
+        &repo.path(),
+    );
+    git_output(&["push", "origin", "main"], &repo.path());
     let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
     let real_git = StdCommand::new("sh")
         .args(["-c", "command -v git"])

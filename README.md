@@ -282,6 +282,18 @@ workspace path. This is intended for automation that needs to materialize an
 exact repository state without creating or managing a local branch. `--cache-root`
 keeps a conservative bare mirror cache per repository slug; `--object-source`
 uses a read-only bare repository instead and takes precedence over cache use.
+Checkout uses up to four Git workers, retaining Git's small-checkout threshold.
+This setting applies only to the checkout command; it does not change repository
+configuration, cache refresh policy, or object-copy independence.
+For checkouts with at least 1,000 indexed entries, each cleanliness verification
+uses four read-only Git status processes. Git's timestamp and content checks
+remain enabled, and both verification passes still run. These checks do not
+refresh the on-disk index's stat cache; a later Git status may perform that refresh.
+Smaller checkouts use the normal single-process status check. Verification always
+reports untracked files regardless of `status.showUntrackedFiles`; checkout also
+disables `core.ignoreStat` for that command so it cannot create assume-unchanged
+entries that conceal tracked edits. Verification disables `core.fsmonitor`
+command-locally so stale monitor results cannot hide tracked or untracked changes.
 
 Local sources are copied without hardlinks or object alternates, so the workspace
 remains independent of later source pruning or removal. Sources with object

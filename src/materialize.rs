@@ -12,6 +12,19 @@ use crate::git;
 
 const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_LOCK_RETRY: Duration = Duration::from_millis(50);
+const PARALLEL_STATUS_THRESHOLD: usize = 1_000;
+// Match final path components, not repository-specific directory names. The
+// exclusion-only shard is the complement, including punctuation and Unicode.
+const STATUS_PATH_GROUPS: [&[&str]; 4] = [
+    &[":(top,glob)**/[a-eA-E]*"],
+    &[":(top,glob)**/[f-mF-M]*"],
+    &[":(top,glob)**/[n-rN-R]*"],
+    &[
+        ":(top,glob,exclude)**/[a-eA-E]*",
+        ":(top,glob,exclude)**/[f-mF-M]*",
+        ":(top,glob,exclude)**/[n-rN-R]*",
+    ],
+];
 
 #[derive(Debug)]
 pub struct MaterializeOptions {
@@ -735,8 +748,21 @@ fn checkout_from_remote(
 }
 
 fn checkout_detached(workspace: &Path, sha: &str) -> Result<()> {
+    // Bound parallelism instead of using every available CPU. Git retains its
+    // small-checkout threshold and handles ineligible entries serially. Keep
+    // this command-local so workspace and caller configuration are unchanged.
     run_git_owned(
-        vec![os("checkout"), os("--detach"), os(sha)],
+        vec![
+            os("-c"),
+            os("checkout.workers=4"),
+            // Never create assume-unchanged entries through caller preferences:
+            // both verification passes must retain Git's content validation.
+            os("-c"),
+            os("core.ignoreStat=false"),
+            os("checkout"),
+            os("--detach"),
+            os(sha),
+        ],
         Some(workspace),
     )?;
     Ok(())
@@ -751,8 +777,7 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
         )));
     }
 
-    let status = run_git_owned(vec![os("status"), os("--porcelain")], Some(workspace))?;
-    if !status.is_empty() {
+    if workspace_is_dirty(workspace)? {
         return Err(AppError::conflict(
             "materialized workspace is not clean".to_string(),
         ));
@@ -761,7 +786,7 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
     if run_git_success(
         vec![os("symbolic-ref"), os("-q"), os("HEAD")],
         Some(workspace),
-    ) {
+    )? {
         return Err(AppError::invariant(
             "materialized workspace is not detached".to_string(),
         ));
@@ -770,9 +795,82 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
     Ok(head)
 }
 
+/// Keep Git's racy-index/content validation, but split large checks across four
+/// read-only processes. Optional index writes must be disabled: concurrent
+/// writers contend on index.lock and can revalidate other shards while writing.
+/// Both public and prepublication verification still run; no timestamps or
+/// assume-unchanged flags are modified. Small checkouts retain normal status.
+fn workspace_is_dirty(workspace: &Path) -> Result<bool> {
+    let entries = run_git_owned(vec![os("ls-files"), os("-z")], Some(workspace))?;
+    if entries.bytes().filter(|byte| *byte == 0).count() < PARALLEL_STATUS_THRESHOLD {
+        let status = run_git_owned(
+            vec![
+                os("-c"),
+                os("core.fsmonitor=false"),
+                os("status"),
+                os("--porcelain"),
+                os("--untracked-files=all"),
+            ],
+            Some(workspace),
+        )?;
+        return Ok(!status.is_empty());
+    }
+
+    let results = thread::scope(|scope| {
+        let workers: Vec<_> = STATUS_PATH_GROUPS
+            .iter()
+            .map(|paths| scope.spawn(move || status_for_paths(workspace, paths)))
+            .collect();
+        // Join every worker even if another reports dirt or a Git failure.
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(AppError::invariant("workspace status worker panicked"))
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let statuses = results.into_iter().collect::<Result<Vec<_>>>()?;
+    Ok(statuses.iter().any(|status| !status.is_empty()))
+}
+
+fn status_for_paths(workspace: &Path, paths: &[&str]) -> Result<String> {
+    let mut args = vec![
+        os("--no-optional-locks"),
+        // Verify contents without trusting a caller's potentially stale monitor.
+        os("-c"),
+        os("core.fsmonitor=false"),
+        os("status"),
+        os("--porcelain"),
+        // Cleanliness is an invariant, independent of status display preferences.
+        os("--untracked-files=all"),
+        os("--"),
+    ];
+    args.extend(paths.iter().map(os));
+    let mut command = Command::new("git");
+    command.args(args);
+    // These are internal magic pathspecs. In particular, inherited literal
+    // mode would treat every shard as a nonexistent literal path and falsely
+    // report a dirty workspace clean.
+    for name in [
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        command.env_remove(name);
+    }
+    run_git_command(command, Some(workspace))
+}
+
 fn run_git_owned(args: Vec<OsString>, cwd: Option<&Path>) -> Result<String> {
     let mut command = Command::new("git");
     command.args(args);
+    run_git_command(command, cwd)
+}
+
+fn run_git_command(mut command: Command, cwd: Option<&Path>) -> Result<String> {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
@@ -789,17 +887,24 @@ fn run_git_owned(args: Vec<OsString>, cwd: Option<&Path>) -> Result<String> {
     Err(AppError::git(redact_credentials(&stderr)))
 }
 
-fn run_git_success(args: Vec<OsString>, cwd: Option<&Path>) -> bool {
+/// `symbolic-ref -q` uses exit 1 for a detached HEAD; other failures are errors.
+fn run_git_success(args: Vec<OsString>, cwd: Option<&Path>) -> Result<bool> {
     let mut command = Command::new("git");
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     git::sanitize_git_environment(&mut command);
-    command
+    let output = command
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .map_err(|e| AppError::git(format!("failed to run git: {e}")))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(AppError::git(redact_credentials(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ))),
+    }
 }
 
 fn redact_credentials(message: &str) -> String {
@@ -845,4 +950,78 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 fn os(value: impl Into<OsString>) -> OsString {
     value.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanliness_ignores_status_and_stat_preferences() {
+        for count in [1, PARALLEL_STATUS_THRESHOLD] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let path = workspace.path();
+            run_git_owned(vec![os("init")], Some(path)).expect("init");
+            run_git_owned(
+                vec![os("config"), os("status.showUntrackedFiles"), os("no")],
+                Some(path),
+            )
+            .expect("configure status preference");
+            for index in 0..count {
+                fs::write(path.join(format!("file-{index}")), "clean\n").expect("write file");
+            }
+            run_git_owned(vec![os("add"), os(".")], Some(path)).expect("stage");
+            run_git_owned(
+                vec![
+                    os("-c"),
+                    os("user.name=Test"),
+                    os("-c"),
+                    os("user.email=test@example.invalid"),
+                    os("commit"),
+                    os("-m"),
+                    os("fixture"),
+                ],
+                Some(path),
+            )
+            .expect("commit");
+            run_git_owned(
+                vec![os("config"), os("core.ignoreStat"), os("true")],
+                Some(path),
+            )
+            .expect("configure stat preference");
+            let sha =
+                run_git_owned(vec![os("rev-parse"), os("HEAD")], Some(path)).expect("fixture SHA");
+            // Recreate the no-checkout clone state: no index and no tracked files.
+            fs::remove_file(path.join(".git/index")).expect("remove index");
+            for index in 0..count {
+                fs::remove_file(path.join(format!("file-{index}"))).expect("remove file");
+            }
+            checkout_detached(path, &sha).expect("checkout despite stat preference");
+            #[cfg(unix)]
+            let _monitor = {
+                use std::os::unix::fs::PermissionsExt;
+                let monitor = tempfile::tempdir().expect("monitor directory");
+                let hook = monitor.path().join("hook");
+                fs::write(&hook, "#!/bin/sh\nprintf 'token\\0'\n").expect("write monitor hook");
+                fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+                    .expect("executable monitor hook");
+                run_git_owned(
+                    vec![os("config"), os("core.fsmonitor"), os(hook)],
+                    Some(path),
+                )
+                .expect("configure monitor");
+                // Prime fsmonitor-valid index bits as an ordinary Git client can.
+                run_git_owned(vec![os("status"), os("--porcelain")], Some(path))
+                    .expect("prime monitor");
+                monitor
+            };
+            assert!(!workspace_is_dirty(path).expect("clean status"));
+            fs::write(path.join("file-0"), "dirty\n").expect("tracked edit");
+            assert!(workspace_is_dirty(path).expect("tracked dirty status"));
+            fs::write(path.join("file-0"), "clean\n").expect("restore tracked file");
+            fs::create_dir(path.join("untracked-directory")).expect("directory");
+            fs::write(path.join("untracked-directory/.hidden"), "untracked").expect("untracked");
+            assert!(workspace_is_dirty(path).expect("dirty status"));
+        }
+    }
 }
