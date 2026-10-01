@@ -1,3 +1,20 @@
+/// Private early dispatcher: only the first raw argument selects the helper.
+#[cfg(windows)]
+pub(crate) fn run_cache_helper_if_requested() -> Option<crate::error::Result<i32>> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(std::ffi::OsStr::new("__wt-cache-git")) {
+        return None;
+    }
+    Some(
+        cache_windows::run_helper(args)
+            .map_err(|e| crate::error::AppError::git(format!("cache Git helper failed: {e}"))),
+    )
+}
+
+#[cfg(windows)]
+#[path = "cache_windows.rs"]
+mod cache_windows;
+
 use std::ffi::OsString;
 use std::fs;
 use std::io;
@@ -72,44 +89,267 @@ struct ValidatedOptions {
     object_source: Option<PathBuf>,
 }
 
+/// Persistent lock files are never unlinked: removing one could split ownership
+/// between different inodes. The separate lease survives the owner through Git
+/// and descendants, while the parent lock excludes new cooperating owners.
 struct CacheLock {
-    path: PathBuf,
+    parent: fs::File,
+    #[cfg(unix)]
+    lease: fs::File,
+    #[cfg(unix)]
+    lease_path: PathBuf,
+    #[cfg(windows)]
+    descendants: cache_windows::Descendants,
 }
 
 impl Drop for CacheLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the parent descriptor remains open throughout this call.
+            unsafe { libc::flock(self.parent.as_raw_fd(), libc::LOCK_UN) };
+        }
+        // Do not explicitly unlock the lease: children share its open-file
+        // description and must retain it until their last descriptor closes.
     }
 }
 
 impl CacheLock {
     fn acquire(path: &Path) -> Result<Self> {
-        let started = Instant::now();
-        loop {
-            match fs::create_dir(path) {
-                Ok(()) => {
+        Self::acquire_for(path, CACHE_LOCK_TIMEOUT)
+    }
+
+    fn acquire_for(path: &Path, timeout: Duration) -> Result<Self> {
+        if !cfg!(any(unix, windows)) {
+            return Err(AppError::conflict(
+                "cache descendant ownership is unsupported on this platform; use --object-source or omit --cache-root",
+            ));
+        }
+        #[cfg(windows)]
+        return Self::acquire_windows(path, timeout);
+        #[cfg(not(windows))]
+        {
+            let parent = open_cache_lock(path)?;
+            #[cfg(unix)]
+            let lease_path = path.with_extension("lock.children");
+            #[cfg(unix)]
+            let lease = open_cache_lock(&lease_path)?;
+            let started = Instant::now();
+            loop {
+                let parent_owned = crate::operation_state::try_lock_exclusive(&parent)
+                    .map_err(|e| AppError::git(format!("cannot lock cache: {e}")))?;
+                #[cfg(unix)]
+                let children_finished = parent_owned
+                    && crate::operation_state::try_lock_exclusive(&lease).map_err(|e| {
+                        AppError::git(format!("cannot lock cache child lease: {e}"))
+                    })?;
+                #[cfg(not(any(unix, windows)))]
+                let children_finished = false;
+                if children_finished {
+                    #[cfg(unix)]
+                    unlock_cache_lease(&lease)?;
                     return Ok(Self {
-                        path: path.to_path_buf(),
+                        parent,
+                        #[cfg(unix)]
+                        lease,
+                        #[cfg(unix)]
+                        lease_path,
                     });
                 }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if started.elapsed() >= CACHE_LOCK_TIMEOUT {
-                        return Err(AppError::conflict(format!(
-                            "timed out waiting for cache lock {}",
-                            path.display()
-                        )));
-                    }
-                    thread::sleep(CACHE_LOCK_RETRY);
+                #[cfg(unix)]
+                if parent_owned {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: parent is open and owned by this acquisition.
+                    unsafe { libc::flock(parent.as_raw_fd(), libc::LOCK_UN) };
                 }
-                Err(e) => {
-                    return Err(AppError::git(format!(
-                        "failed to acquire cache lock {}: {e}",
-                        path.display()
-                    )));
+                if started.elapsed() >= timeout {
+                    return Err(AppError::conflict(format!(
+                    "timed out waiting for cache lock {}; wait for the owner and its Git descendants to finish; do not remove lock files",
+                    path.display()
+                )));
                 }
+                thread::sleep(CACHE_LOCK_RETRY);
             }
         }
     }
+
+    #[cfg(windows)]
+    fn acquire_windows(path: &Path, timeout: Duration) -> Result<Self> {
+        let started = Instant::now();
+        loop {
+            match cache_windows::open_file(path) {
+                Ok(parent) => {
+                    let descendants = cache_windows::Descendants::open(&parent).map_err(|e| {
+                        AppError::git(format!("cannot open cache descendant job: {e}"))
+                    })?;
+                    if descendants.is_empty().map_err(|e| {
+                        AppError::git(format!("cannot query cache descendant job: {e}"))
+                    })? {
+                        return Ok(Self {
+                            parent,
+                            descendants,
+                        });
+                    }
+                    // Drop share denial before retrying; retain no byte-range lock.
+                }
+                Err(e) if e.raw_os_error() == Some(32) => {}
+                Err(e) => {
+                    return Err(AppError::conflict(format!(
+                        "cannot open cache lock safely: {e}"
+                    )))
+                }
+            }
+            if started.elapsed() >= timeout {
+                return Err(AppError::conflict(format!("timed out waiting for cache lock {}; wait for the owner and its Git descendants to finish; do not remove lock files", path.display())));
+            }
+            thread::sleep(CACHE_LOCK_RETRY);
+        }
+    }
+
+    fn output(&self, command: &mut Command) -> io::Result<std::process::Output> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::process::CommandExt;
+            // A fresh open-file description per child avoids sharing the probe's
+            // exclusive lock with descendants. Parent ownership excludes new owners.
+            let child_lease =
+                open_cache_lock(&self.lease_path).map_err(|e| io::Error::other(e.to_string()))?;
+            // SAFETY: child_lease is open throughout flock and command execution.
+            if unsafe { libc::flock(child_lease.as_raw_fd(), libc::LOCK_SH) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let descriptor = child_lease.as_raw_fd();
+            // SAFETY: only async-signal-safe fcntl runs after fork. The lease
+            // stays open until output returns, and no path is reopened here.
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::fcntl(descriptor, libc::F_SETFD, 0) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let output = command.output();
+            // Close only: explicit unlock would release descendants' shared OFD.
+            drop(child_lease);
+            output
+        }
+        #[cfg(windows)]
+        {
+            cache_windows::output(&self.parent, command)
+        }
+        #[cfg(not(any(unix, windows)))]
+        command.output()
+    }
+
+    /// Probe from an otherwise unlocked OFD, after the parent's child FD closes.
+    fn wait_for_descendants(&self, timeout: Duration) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            #[cfg(unix)]
+            if crate::operation_state::try_lock_exclusive(&self.lease)
+                .map_err(|e| AppError::git(format!("cannot probe cache descendants: {e}")))?
+            {
+                return unlock_cache_lease(&self.lease);
+            }
+            #[cfg(windows)]
+            if self
+                .descendants
+                .is_empty()
+                .map_err(|e| AppError::git(format!("cannot probe cache descendants: {e}")))?
+            {
+                return Ok(());
+            }
+            if started.elapsed() >= timeout {
+                return Err(AppError::conflict(
+                    "timed out waiting for cache Git descendants; snapshot refused",
+                ));
+            }
+            thread::sleep(CACHE_LOCK_RETRY);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_cache_lease(file: &fs::File) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the probe descriptor remains open; no child inherits this OFD.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            return Err(AppError::git(format!(
+                "cannot unlock cache probe: {}",
+                io::Error::last_os_error()
+            )));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn open_cache_lock(path: &Path) -> Result<fs::File> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => {
+            return Err(AppError::conflict(format!(
+                "legacy cache directory lock {} requires manual recovery: stop all users of this cache, confirm their Git descendants have exited, inspect and preserve unknown contents, then remove only the confirmed obsolete directory and retry",
+                path.display()
+            )));
+        }
+        Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+            return Err(AppError::conflict(
+                "cache lock must be a private regular file",
+            ));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(AppError::git(format!("cannot inspect cache lock: {e}"))),
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options
+        .open(path)
+        .map_err(|e| AppError::conflict(format!("cannot open cache lock safely: {e}")))?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| AppError::git(format!("cannot inspect opened cache lock: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: geteuid has no preconditions.
+        let owner = unsafe { libc::geteuid() };
+        if metadata.uid() != owner || metadata.mode() & 0o777 != 0o600 || metadata.nlink() != 1 {
+            return Err(AppError::conflict(
+                "cache lock has unsafe ownership, permissions, or links",
+            ));
+        }
+    }
+    if !metadata.is_file() || metadata.len() != 0 {
+        return Err(AppError::conflict("cache lock has unknown native state; preserve it and inspect manually with all cache users stopped"));
+    }
+    let opened = same_file::Handle::from_file(
+        file.try_clone()
+            .map_err(|e| AppError::git(format!("cannot retain cache lock identity: {e}")))?,
+    )
+    .map_err(|e| AppError::git(format!("cannot inspect cache lock identity: {e}")))?;
+    let current = same_file::Handle::from_path(path)
+        .map_err(|e| AppError::git(format!("cannot inspect cache lock entry: {e}")))?;
+    if opened != current {
+        return Err(AppError::conflict(
+            "cache lock entry changed during acquisition",
+        ));
+    }
+    Ok(file)
 }
 
 pub fn materialize(options: MaterializeOptions) -> Result<MaterializeResult> {
@@ -219,20 +459,43 @@ fn materialize_from_cache(
     create_dir_all(cache_root, "cache root")?;
     let lock_path = cache_path.with_extension("git.lock");
     let lock_started = Instant::now();
-    let _lock = CacheLock::acquire(&lock_path)?;
+    let lock = CacheLock::acquire(&lock_path)?;
     timings.cache_lock = elapsed_ms(lock_started);
 
     let refresh_started = Instant::now();
-    let cache_status = refresh_cache(cache_path, remote_url)?;
+    let cache_status = refresh_cache(cache_path, remote_url, &lock)?;
     timings.cache_refresh = elapsed_ms(refresh_started);
 
-    verify_commit_exists(cache_path, &request.sha)?;
+    run_cache_git(
+        vec![
+            os("--git-dir"),
+            os(cache_path),
+            os("cat-file"),
+            os("-e"),
+            os(format!("{}^{{commit}}", request.sha)),
+        ],
+        &lock,
+    )?;
     let checkout_started = Instant::now();
+    let snapshot = tempfile::Builder::new()
+        .prefix(".wt-cache-snapshot-")
+        .tempdir_in(cache_root)
+        .map_err(|e| AppError::git(format!("cannot stage cache snapshot: {e}")))?;
+    let staged = snapshot.path().join("repository");
+    let source = independent_local_source(cache_path)?;
+    clone_independent_snapshot(&source, &staged, request.copy_mode, Some(&lock))?;
+    // All source reads are complete. Checkout, both verification passes, and
+    // copying into an existing destination use only the independent snapshot.
+    drop(lock);
     let identity = clone_local_bare(
-        cache_path,
+        &staged.join(".git"),
         &request.workspace_root,
         &request.sha,
         request.copy_mode,
+    )?;
+    run_git_owned(
+        vec![os("remote"), os("set-url"), os("origin"), os(&source)],
+        Some(&request.workspace_root),
     )?;
     timings.workspace_checkout = elapsed_ms(checkout_started);
     Ok((cache_status, identity))
@@ -491,9 +754,9 @@ fn ensure_existing_workspace_available(path: &Path) -> Result<()> {
     }
 }
 
-fn refresh_cache(cache_path: &Path, remote_url: &str) -> Result<&'static str> {
+fn refresh_cache(cache_path: &Path, remote_url: &str, lock: &CacheLock) -> Result<&'static str> {
     if cache_path.exists() {
-        refresh_existing_cache(cache_path, remote_url)?;
+        refresh_existing_cache(cache_path, remote_url, lock)?;
         return Ok("refreshed");
     }
 
@@ -501,19 +764,19 @@ fn refresh_cache(cache_path: &Path, remote_url: &str) -> Result<&'static str> {
         .parent()
         .ok_or_else(|| AppError::invariant("cache path has no parent"))?;
     create_dir_all(parent, "cache parent")?;
-    run_git_owned(
+    run_cache_git(
         vec![
             os("clone"),
             os("--mirror"),
             os(remote_url),
             cache_path.as_os_str().to_os_string(),
         ],
-        None,
+        lock,
     )?;
     Ok("cold")
 }
 
-fn refresh_existing_cache(cache_path: &Path, remote_url: &str) -> Result<()> {
+fn refresh_existing_cache(cache_path: &Path, remote_url: &str, lock: &CacheLock) -> Result<()> {
     if !cache_path.is_dir() {
         return Err(AppError::conflict(format!(
             "cache path exists and is not a directory: {}",
@@ -521,8 +784,20 @@ fn refresh_existing_cache(cache_path: &Path, remote_url: &str) -> Result<()> {
         )));
     }
 
-    verify_bare_repo(cache_path)?;
-    run_git_owned(
+    let source = independent_local_source(cache_path)?;
+    if run_cache_git(
+        vec![
+            os("--git-dir"),
+            os(&source),
+            os("rev-parse"),
+            os("--is-bare-repository"),
+        ],
+        lock,
+    )? != "true"
+    {
+        return Err(AppError::usage("cache is not a bare Git repository"));
+    }
+    run_cache_git(
         vec![
             os("--git-dir"),
             cache_path.as_os_str().to_os_string(),
@@ -531,9 +806,9 @@ fn refresh_existing_cache(cache_path: &Path, remote_url: &str) -> Result<()> {
             os("origin"),
             os(remote_url),
         ],
-        None,
+        lock,
     )?;
-    run_git_owned(
+    run_cache_git(
         vec![
             os("--git-dir"),
             cache_path.as_os_str().to_os_string(),
@@ -543,7 +818,7 @@ fn refresh_existing_cache(cache_path: &Path, remote_url: &str) -> Result<()> {
             os("+refs/heads/*:refs/heads/*"),
             os("+refs/tags/*:refs/tags/*"),
         ],
-        None,
+        lock,
     )?;
     Ok(())
 }
@@ -635,8 +910,8 @@ fn clone_local_bare(
     if !workspace.exists() {
         return clone_new_workspace(&source, workspace, sha, copy_mode).map(Some);
     }
-    // Preverify existing-directory checkouts privately. Keep the cache lock
-    // throughout, and remove only this task-owned staging tree on failure.
+    // Preverify existing-directory checkouts privately, and remove only this
+    // task-owned staging tree on failure.
     let staging = tempfile::Builder::new()
         .prefix(".wt-materialize-")
         .tempdir_in(parent)
@@ -726,7 +1001,23 @@ fn clone_independent_checkout(
     sha: &str,
     copy_mode: MaterializeCopyMode,
 ) -> Result<()> {
-    run_git_owned(
+    clone_independent_snapshot(source, workspace, copy_mode, None)?;
+    checkout_detached(workspace, sha)?;
+    verify_workspace(workspace, sha)?;
+    Ok(())
+}
+
+/// Finish every source read before releasing cache ownership.
+fn clone_independent_snapshot(
+    source: &Path,
+    workspace: &Path,
+    copy_mode: MaterializeCopyMode,
+    lock: Option<&CacheLock>,
+) -> Result<()> {
+    if let Some(lock) = lock {
+        lock.wait_for_descendants(CACHE_LOCK_TIMEOUT)?;
+    }
+    run_snapshot_git(
         vec![
             os("clone"),
             os("--local"),
@@ -735,7 +1026,7 @@ fn clone_independent_checkout(
             source.as_os_str().to_os_string(),
             workspace.as_os_str().to_os_string(),
         ],
-        None,
+        lock,
     )?;
     // Git creates metadata, but the temporary alternate is replaced with all
     // source objects (including unreachable ones), without repacking.
@@ -748,8 +1039,6 @@ fn clone_independent_checkout(
         .map_err(|e| AppError::git(format!("cannot remove temporary alternate: {e}")))?;
     // Defense in depth: never publish a clone that depends on source objects.
     independent_local_source(&workspace.join(".git"))?;
-    checkout_detached(workspace, sha)?;
-    verify_workspace(workspace, sha)?;
     Ok(())
 }
 
@@ -890,6 +1179,30 @@ fn status_for_paths(workspace: &Path, paths: &[&str]) -> Result<String> {
     run_git_command(command, Some(workspace))
 }
 
+fn run_cache_git(args: Vec<OsString>, lock: &CacheLock) -> Result<String> {
+    run_snapshot_git(args, Some(lock))
+}
+
+fn run_snapshot_git(args: Vec<OsString>, lock: Option<&CacheLock>) -> Result<String> {
+    let mut command = Command::new("git");
+    command.args(args);
+    git::sanitize_git_environment(&mut command);
+    let output = match lock {
+        Some(lock) => lock.output(&mut command),
+        None => command.output(),
+    }
+    .map_err(|e| AppError::git(format!("failed to run git: {e}")))?;
+    if let Some(lock) = lock {
+        lock.wait_for_descendants(CACHE_LOCK_TIMEOUT)?;
+    }
+    if !output.status.success() {
+        return Err(AppError::git(redact_credentials(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
 fn run_git_owned(args: Vec<OsString>, cwd: Option<&Path>) -> Result<String> {
     let mut command = Command::new("git");
     command.args(args);
@@ -981,6 +1294,173 @@ fn os(value: impl Into<OsString>) -> OsString {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_lock_refuses_unknown_entries_and_times_out() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let root = tempfile::tempdir().expect("fixture");
+        let path = root.path().join("cache.lock");
+        fs::create_dir(&path).expect("legacy lock");
+        let error = CacheLock::acquire(&path).err().expect("refuse legacy");
+        assert!(error.to_string().contains("manual recovery"));
+        fs::remove_dir(&path).expect("remove fixture");
+        let target = root.path().join("target");
+        fs::write(&target, "preserve").expect("target");
+        symlink(&target, &path).expect("link");
+        assert!(CacheLock::acquire(&path).is_err());
+        assert_eq!(fs::read_to_string(&target).expect("target"), "preserve");
+        fs::remove_file(&path).expect("remove link");
+        fs::write(&path, "unknown").expect("native state");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("mode");
+        assert!(CacheLock::acquire(&path).is_err());
+        fs::remove_file(&path).expect("remove fixture");
+        let lock = CacheLock::acquire(&path).expect("owner");
+        assert!(CacheLock::acquire_for(&path, Duration::ZERO).is_err());
+        drop(lock);
+        CacheLock::acquire_for(&path, Duration::ZERO).expect("immediate recovery");
+        let lease = path.with_extension("lock.children");
+        fs::remove_file(&lease).expect("remove fixture lease");
+        symlink(&target, &lease).expect("malicious lease");
+        assert!(CacheLock::acquire(&path).is_err());
+    }
+
+    // A separate harness process lets the test kill the owner, rather than
+    // relying on Drop to simulate a crash. Its shell grandchild retains the
+    // lease after both the owner and the initial shell have exited.
+    #[cfg(unix)]
+    #[test]
+    fn cache_crash_owner_helper() {
+        let Some(root) = std::env::var_os("WT_CACHE_CRASH_FIXTURE") else {
+            return;
+        };
+        let root = PathBuf::from(root);
+        let lock = CacheLock::acquire(&root.join("cache.lock")).expect("owner");
+        run_git_owned(vec![os("init"), os(&root)], None).expect("fixture repository");
+        let mut command = Command::new("git");
+        command.current_dir(&root).args([
+            "-c",
+            "alias.cache-lease=! (printf ready > ready; while test ! -f finish; do sleep 0.05; done) &",
+            "cache-lease",
+        ]);
+        git::sanitize_git_environment(&mut command);
+        lock.output(&mut command).expect("leased child");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_crash_retains_descendant_lease_until_exit() {
+        let root = tempfile::tempdir().expect("fixture");
+        let mut owner = Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "materialize::tests::cache_crash_owner_helper",
+                "--nocapture",
+            ])
+            .env("WT_CACHE_CRASH_FIXTURE", root.path())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn owner");
+        let started = Instant::now();
+        while !root.path().join("ready").exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "child readiness timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        owner.kill().expect("crash owner");
+        owner.wait().expect("reap owner");
+        let path = root.path().join("cache.lock");
+        assert!(CacheLock::acquire_for(&path, Duration::ZERO).is_err());
+        fs::write(root.path().join("finish"), "").expect("release descendants");
+        CacheLock::acquire_for(&path, Duration::from_secs(10)).expect("recover after descendants");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_snapshot_waits_for_background_mutator() {
+        let root = tempfile::tempdir().expect("fixture");
+        let source = root.path().join("source.git");
+        run_git_owned(vec![os("init"), os("--bare"), os(&source)], None).expect("repository");
+        let lock = CacheLock::acquire(&root.path().join("cache.lock")).expect("owner");
+        let mut command = Command::new("git");
+        command.current_dir(&source).args([
+            "-c",
+            "alias.background=! (printf ready > ready; while test ! -f finish; do sleep 0.05; done) >/dev/null 2>&1 &",
+            "background",
+        ]);
+        lock.output(&mut command).expect("initial Git exits");
+        assert!(lock.wait_for_descendants(Duration::ZERO).is_err());
+        let snapshot = root.path().join("snapshot");
+        thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let source = &source;
+            let snapshot = &snapshot;
+            let lock = &lock;
+            scope.spawn(move || {
+                let result = clone_independent_snapshot(
+                    source,
+                    snapshot,
+                    MaterializeCopyMode::Auto,
+                    Some(lock),
+                );
+                sent.send(result).expect("report snapshot");
+            });
+            assert!(matches!(
+                received.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            // No source-dependent snapshot work can start before quiescence.
+            assert!(!snapshot.exists());
+            fs::write(source.join("finish"), "").expect("finish mutator");
+            received
+                .recv_timeout(Duration::from_secs(10))
+                .expect("snapshot resumes")
+                .expect("stable snapshot");
+        });
+        assert!(!snapshot.join(".git/objects/info/alternates").exists());
+        lock.wait_for_descendants(Duration::ZERO)
+            .expect("probe stays unlocked");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cache_snapshot_finishes_reads_before_checkout() {
+        let fixture = tempfile::tempdir().expect("fixture");
+        let source = fixture.path().join("source.git");
+        run_git_owned(vec![os("init"), os("--bare"), os(&source)], None).expect("source");
+        let blob = Command::new("git")
+            .args(["hash-object", "-w", "--stdin"])
+            .env("GIT_DIR", &source)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .expect("unreachable blob");
+        assert!(blob.status.success());
+        let object = String::from_utf8_lossy(&blob.stdout).trim().to_string();
+        let lock_path = fixture.path().join("cache.lock");
+        let lock = CacheLock::acquire(&lock_path).expect("lock");
+        let snapshot = fixture.path().join("snapshot");
+        clone_independent_snapshot(&source, &snapshot, MaterializeCopyMode::Auto, Some(&lock))
+            .expect("snapshot");
+        drop(lock);
+        let _next =
+            CacheLock::acquire_for(&lock_path, Duration::ZERO).expect("released before validation");
+        fs::remove_dir_all(&source).expect("remove original source");
+        run_git_owned(
+            vec![
+                os("--git-dir"),
+                os(snapshot.join(".git")),
+                os("cat-file"),
+                os("-e"),
+                os(object),
+            ],
+            None,
+        )
+        .expect("independent unreachable object");
+        assert!(!snapshot.join(".git/objects/info/alternates").exists());
+    }
 
     #[test]
     fn cleanliness_ignores_status_and_stat_preferences() {

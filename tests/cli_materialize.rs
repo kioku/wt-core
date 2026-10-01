@@ -559,7 +559,7 @@ fn concurrent_cached_materializations_share_cache_safely() {
     ));
     #[cfg(unix)]
     assert_independent_files(&cache, &workspace_one.join(".git"));
-    assert!(!cache_root.join("owner__repo.git.lock").exists());
+    assert!(cache_root.join("owner__repo.git.lock").is_file());
 }
 
 fn spawn_materialize(
@@ -1428,4 +1428,87 @@ fn both_copy_modes_preserve_unrelated_unreachable_blobs_in_existing_workspaces()
             "unrelated unreachable content"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn cached_checkout_releases_lock_before_independent_checkout() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("fixture");
+    let cache = root.path().join("cache");
+    let workspace = root.path().join("workspace");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).expect("wrapper directory");
+    let real_git = StdCommand::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(real_git.status.success());
+    let wrapper = bin.join("git");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+for arg do
+    if [ "$arg" = checkout ]; then
+        printf ready > "$WT_CACHE_GATE/ready"
+        while [ ! -f "$WT_CACHE_GATE/finish" ]; do sleep 0.05; done
+        break
+    fi
+done
+exec "$WT_REAL_GIT" "$@"
+"#,
+    )
+    .expect("wrapper");
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+        .expect("executable wrapper");
+    let paths = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+        &std::env::var_os("PATH").expect("PATH"),
+    )))
+    .expect("wrapper PATH");
+    let mut owner = StdCommand::new(assert_cmd::cargo_bin!("wt-core"))
+        .args(["materialize", "--repo-slug", "owner/repo", "--remote-url"])
+        .arg(file_url(&repo.origin_path()))
+        .args(["--sha", &sha, "--cache-root"])
+        .arg(&cache)
+        .arg("--workspace-root")
+        .arg(&workspace)
+        .env("PATH", paths)
+        .env("WT_CACHE_GATE", root.path())
+        .env(
+            "WT_REAL_GIT",
+            String::from_utf8(real_git.stdout).expect("git path").trim(),
+        )
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn checkout");
+    let started = Instant::now();
+    while !root.path().join("ready").exists() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "checkout readiness timeout"
+        );
+        assert!(owner.try_wait().expect("owner status").is_none());
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The first checkout remains blocked, but another caller must finish.
+    materialize_cached(&repo, &sha, &cache, &root.path().join("second"));
+    assert!(owner.try_wait().expect("still blocked").is_none());
+    std::fs::write(root.path().join("finish"), "").expect("release checkout");
+    let result = owner.wait_with_output().expect("checkout result");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_checkout(&workspace, &sha);
+    assert_eq!(
+        git_output(&["remote", "get-url", "origin"], &workspace),
+        dunce::canonicalize(cache.join("owner__repo.git"))
+            .expect("cache identity")
+            .to_string_lossy()
+    );
 }

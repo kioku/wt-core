@@ -311,7 +311,14 @@ ownership checks also apply. Git creates fresh metadata using a temporary shared
 clone; all objects, including unreachable objects, are copied and the alternate
 is removed before checkout or verification. Keep an external `--object-source` stable during
 materialization (do not concurrently refresh or prune it). Managed cache refresh
-and checkout remain serialized by the cache lock. Local materialization requires
+and complete snapshot copying remain serialized by the cache lock. Once the
+snapshot owns its objects, checkout and both verification passes run outside
+cache ownership. Persistent lock files are never removed: OS-backed ownership
+and ordinary Git descendant leases make crashes recoverable without guessing
+from PID or age. Unix uses inherited file leases; Windows uses an inherited
+exclusive-sharing file handle and a native job, entered before launching Git.
+Legacy directory locks or unknown lock contents require manual inspection after
+stopping all cache users and their Git descendants; do not delete a live lock. Local materialization requires
 a writable workspace parent. New destinations are atomically claimed at their
 requested path, so native parent access controls apply directly; failed checkouts
 remove that newly created task-owned directory only after checking its captured

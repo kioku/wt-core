@@ -15,6 +15,16 @@ use std::process;
 use clap::Parser;
 
 fn main() -> process::ExitCode {
+    #[cfg(windows)]
+    if let Some(result) = materialize::run_cache_helper_if_requested() {
+        match result {
+            Ok(code) => process::exit(code),
+            Err(error) => {
+                eprintln!("error: {error}");
+                return error.code.into();
+            }
+        }
+    }
     let cli = cli::Cli::parse();
 
     let json = match &cli.command {
