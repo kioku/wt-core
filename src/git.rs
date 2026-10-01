@@ -315,6 +315,12 @@ pub fn remove_worktree(
     force: bool,
     lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
+    // Windows holds a non-deletable handle to the process working directory.
+    // Selection/identity checks are complete before reaching this boundary;
+    // leave the source so Git can remove it when invoked from inside it.
+    #[cfg(windows)]
+    std::env::set_current_dir(repo.as_ref())
+        .map_err(|error| AppError::git(format!("cannot leave worktree before removal: {error}")))?;
     let dir_str = dir.display().to_string();
     let mut args = vec!["worktree", "remove"];
     if force {

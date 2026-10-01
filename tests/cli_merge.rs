@@ -2020,7 +2020,7 @@ fn merge_print_paths_returns_six_lines() {
 
     // Line 1: repo root
     assert!(
-        !lines[0].contains(".worktrees/"),
+        !lines[0].replace('\\', "/").contains(".worktrees/"),
         "line 1 should be repo root: {}",
         lines[0]
     );
@@ -2036,7 +2036,7 @@ fn merge_print_paths_returns_six_lines() {
 
     // Line 5: removed_path (non-empty when cleaned_up)
     assert!(
-        lines[4].contains(".worktrees/"),
+        lines[4].replace('\\', "/").contains(".worktrees/"),
         "line 5 should be the removed worktree path: {}",
         lines[4]
     );

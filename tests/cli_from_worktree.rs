@@ -77,13 +77,13 @@ fn add_from_inside_worktree_creates_at_repo_root() {
     let new_path = new_path.trim();
 
     // Must be under <repo-root>/.worktrees/, NOT under the current worktree
-    let expected_prefix = format!("{}/.worktrees/", repo_str);
+    let expected_prefix = repo.path().join(".worktrees");
     assert!(
-        new_path.starts_with(&expected_prefix),
+        std::path::Path::new(new_path).starts_with(&expected_prefix),
         "new worktree should be under repo root .worktrees/: {new_path}"
     );
     assert!(
-        !new_path.contains(".worktrees/base-wt"),
+        !std::path::Path::new(new_path).starts_with(&wt_path),
         "must not be nested under existing worktree: {new_path}"
     );
 }
@@ -171,9 +171,9 @@ fn add_from_subdirectory_of_main_worktree() {
     let new_path = new_path.trim();
 
     // Must be under <repo-root>/.worktrees/
-    let expected_prefix = format!("{}/.worktrees/", repo_str);
+    let expected_prefix = repo.path().join(".worktrees");
     assert!(
-        new_path.starts_with(&expected_prefix),
+        std::path::Path::new(new_path).starts_with(&expected_prefix),
         "worktree should be under repo root: {new_path}"
     );
 }
