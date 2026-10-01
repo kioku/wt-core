@@ -150,3 +150,114 @@ fn no_subcommand_shows_help() {
         .failure()
         .stderr(predicate::str::contains("Usage"));
 }
+
+#[test]
+fn json_repository_failures_emit_one_envelope() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for command in ["list", "doctor", "setup", "prune", "go", "remove", "merge"] {
+        let output = wt_core()
+            .args([command, "--json", "--repo"])
+            .arg(dir.path())
+            .output()
+            .expect("run CLI");
+        assert_eq!(output.status.code(), Some(3), "{command}");
+        let value: serde_json::Value =
+            serde_json::from_slice(&output.stdout).expect("one JSON response");
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["exit_code"], 3);
+    }
+}
+
+#[test]
+fn doctor_reports_unreadable_managed_directory() {
+    let repo = fixtures::TestRepo::new();
+    std::fs::write(repo.path().join(".worktrees"), "not a directory").expect("fixture");
+    let output = wt_core()
+        .args(["doctor", "--json", "--repo"])
+        .arg(repo.path())
+        .output()
+        .expect("doctor");
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert!(value.to_string().contains("cannot inspect"));
+    assert!(!value.to_string().contains("all worktrees healthy"));
+}
+
+#[test]
+fn doctor_checks_external_stale_registration_without_managed_directory() {
+    let repo = fixtures::TestRepo::new();
+    let external = tempfile::tempdir().expect("external parent");
+    let path = external.path().join("checkout");
+    fixtures::run_git(
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "external",
+            path.to_str().expect("path"),
+        ],
+        &repo.path(),
+    );
+    std::fs::remove_dir_all(&path).expect("remove disposable checkout");
+    let before = std::fs::read_dir(repo.path().join(".git/worktrees"))
+        .expect("registrations")
+        .count();
+    let output = wt_core()
+        .args(["doctor", "--json", "--repo"])
+        .arg(repo.path())
+        .output()
+        .expect("doctor");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("stale worktree metadata"));
+    assert_eq!(
+        before,
+        std::fs::read_dir(repo.path().join(".git/worktrees"))
+            .expect("registrations retained")
+            .count()
+    );
+}
+
+#[test]
+fn long_branch_creates_bounded_collision_safe_directory() {
+    let repo = fixtures::TestRepo::new();
+    let mut paths = Vec::new();
+    for suffix in ["a", "b"] {
+        let branch = format!("{}{}", "x".repeat(248), suffix);
+        let output = wt_core()
+            .args(["add", &branch, "--json", "--repo"])
+            .arg(repo.path())
+            .output()
+            .expect("add");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
+        let path = std::path::PathBuf::from(value["worktree_path"].as_str().expect("path"));
+        assert!(path.is_dir());
+        assert_eq!(path.file_name().expect("component").len(), 120);
+        paths.push(path);
+    }
+    assert_ne!(paths[0], paths[1]);
+}
+
+#[test]
+fn json_failure_after_repository_resolution_is_structured() {
+    let repo = fixtures::TestRepo::new();
+    let output = wt_core()
+        .args([
+            "list",
+            "--json",
+            "--stats",
+            "--against",
+            "missing-revision",
+            "--repo",
+        ])
+        .arg(repo.path())
+        .output()
+        .expect("list");
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON response");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["exit_code"], 1);
+}

@@ -549,3 +549,30 @@ fn list_stats_handles_detached_worktree_as_unavailable() {
     assert_eq!(stats["available"], false);
     assert_eq!(stats["reason"], "no_branch");
 }
+
+#[test]
+fn parallel_stats_preserve_order_metrics_and_unavailable_entries() {
+    let repo = fixtures::TestRepo::new();
+    for index in 0..12 {
+        add_worktree(&repo.path(), &format!("ordered-{index:02}"));
+    }
+    fixtures::run_git(&["update-ref", "-d", "refs/heads/ordered-05"], &repo.path());
+    let ordinary = list_json(&repo.path(), &[]);
+    for _ in 0..3 {
+        let stats = list_json(&repo.path(), &["--stats", "--against", "main"]);
+        let ordinary = ordinary["worktrees"].as_array().expect("entries");
+        let compared = stats["worktrees"].as_array().expect("stats entries");
+        assert_eq!(ordinary.len(), compared.len());
+        for (expected, actual) in ordinary.iter().zip(compared) {
+            assert_eq!(expected["branch"], actual["branch"]);
+            assert_eq!(expected["path"], actual["path"]);
+            if actual["branch"] == "ordered-05" {
+                assert_eq!(actual["stats"]["reason"], "git_error");
+            } else {
+                assert_eq!(actual["stats"]["commits_ahead"], 0);
+                assert_eq!(actual["stats"]["commits_behind"], 0);
+                assert_eq!(actual["stats"]["files_changed"], 0);
+            }
+        }
+    }
+}
