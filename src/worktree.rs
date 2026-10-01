@@ -3422,6 +3422,18 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn doctor_reports_directory_iterator_errors() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "synthetic iterator failure",
+        );
+        let diagnostic = doctor_directory_entry(Err(error), Path::new("managed"), &[])
+            .expect("iterator failure must be reported");
+        assert!(matches!(diagnostic.level, DiagLevel::Error));
+        assert!(diagnostic.message.contains("synthetic iterator failure"));
+    }
+
     fn wt(path: &str, branch: Option<&str>, is_main: bool) -> Worktree {
         Worktree {
             path: PathBuf::from(path),

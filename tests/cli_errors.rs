@@ -239,3 +239,25 @@ fn long_branch_creates_bounded_collision_safe_directory() {
     }
     assert_ne!(paths[0], paths[1]);
 }
+
+#[test]
+fn json_failure_after_repository_resolution_is_structured() {
+    let repo = fixtures::TestRepo::new();
+    let output = wt_core()
+        .args([
+            "list",
+            "--json",
+            "--stats",
+            "--against",
+            "missing-revision",
+            "--repo",
+        ])
+        .arg(repo.path())
+        .output()
+        .expect("list");
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("one JSON response");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["exit_code"], 1);
+}
