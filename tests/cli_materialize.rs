@@ -200,6 +200,76 @@ fn materialize_from_object_source_without_permanent_alternates() {
 }
 
 #[test]
+fn materialize_large_checkout_preserves_older_sha_and_file_modes() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let nested = repo.path().join("nested");
+    std::fs::create_dir(&nested).expect("create nested directory");
+    // Exceed Git's default 100-entry parallel-checkout threshold.
+    for index in 0..160 {
+        std::fs::write(
+            nested.join(format!("file-{index}.txt")),
+            format!("content {index}\n"),
+        )
+        .expect("write checkout fixture");
+    }
+    git_output(&["add", "."], &repo.path());
+    git_output(
+        &["update-index", "--chmod=+x", "nested/file-0.txt"],
+        &repo.path(),
+    );
+    git_output(&["commit", "-m", "large checkout fixture"], &repo.path());
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    fixtures::commit_file(&repo.path(), "later.txt", "not requested", "later commit");
+    git_output(&["push", "origin", "main"], &repo.path());
+
+    let root = tempfile::tempdir().expect("temp dir");
+    for mode in ["object_source", "cache", "remote"] {
+        let workspace = root.path().join(mode);
+        let mut command = wt_core();
+        command.args(["materialize", "--repo-slug", "owner/repo", "--sha", &sha]);
+        if mode == "object_source" {
+            command.arg("--object-source").arg(repo.origin_path());
+        } else {
+            command
+                .arg("--remote-url")
+                .arg(file_url(&repo.origin_path()));
+        }
+        if mode == "cache" {
+            command
+                .arg("--cache-root")
+                .arg(root.path().join("cache-root"));
+        }
+        command
+            .arg("--workspace-root")
+            .arg(&workspace)
+            .arg("--json")
+            .assert()
+            .success();
+        assert_eq!(git_output(&["rev-parse", "HEAD"], &workspace), sha);
+        assert_eq!(git_output(&["status", "--porcelain"], &workspace), "");
+        assert!(!git_success(&["symbolic-ref", "-q", "HEAD"], &workspace));
+        assert!(!workspace.join("later.txt").exists());
+        assert!(!workspace.join(".git/objects/info/alternates").exists());
+        // The optimization must not persist a repository config override.
+        assert!(!git_success(
+            &["config", "--local", "--get", "checkout.workers"],
+            &workspace
+        ));
+        assert!(
+            git_output(&["ls-files", "--stage", "nested/file-0.txt"], &workspace)
+                .starts_with("100755 ")
+        );
+        for index in 0..160 {
+            assert_eq!(
+                std::fs::read_to_string(workspace.join(format!("nested/file-{index}.txt")))
+                    .expect("read materialized file"),
+                format!("content {index}\n")
+            );
+        }
+    }
+}
+
+#[test]
 fn materialize_rejects_existing_non_empty_workspace() {
     let repo = fixtures::ClonedTestRepo::new();
     let sha = git_output(&["rev-parse", "HEAD"], &repo.path());

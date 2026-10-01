@@ -735,8 +735,17 @@ fn checkout_from_remote(
 }
 
 fn checkout_detached(workspace: &Path, sha: &str) -> Result<()> {
+    // Bound parallelism instead of using every available CPU. Git retains its
+    // small-checkout threshold and handles ineligible entries serially. Keep
+    // this command-local so workspace and caller configuration are unchanged.
     run_git_owned(
-        vec![os("checkout"), os("--detach"), os(sha)],
+        vec![
+            os("-c"),
+            os("checkout.workers=4"),
+            os("checkout"),
+            os("--detach"),
+            os(sha),
+        ],
         Some(workspace),
     )?;
     Ok(())

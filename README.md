@@ -282,6 +282,9 @@ workspace path. This is intended for automation that needs to materialize an
 exact repository state without creating or managing a local branch. `--cache-root`
 keeps a conservative bare mirror cache per repository slug; `--object-source`
 uses a read-only bare repository instead and takes precedence over cache use.
+Checkout uses up to four Git workers, retaining Git's small-checkout threshold.
+This setting applies only to the checkout command; it does not change repository
+configuration, cache refresh policy, or object-copy independence.
 
 Local sources are copied without hardlinks or object alternates, so the workspace
 remains independent of later source pruning or removal. Sources with object
