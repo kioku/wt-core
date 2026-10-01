@@ -5,6 +5,7 @@ source ../../bindings/nu/wt.nu
 use std assert
 
 let binding = ($env.FILE_PWD | path join "../../bindings/nu/wt.nu" | path expand)
+let binding_literal = ($binding | to nuon)
 let work = (mktemp --directory)
 let repo = ($work | path join "repo")
 ^git init --initial-branch=main $repo o+e>| ignore
@@ -41,14 +42,15 @@ assert ((pwd | path expand) == ($repo | path expand))
 assert (not ($merge_root | path exists))
 
 # Catching a failed command must not discard its structured stdout or change cwd.
-let failed_script = $'source "($binding)"; try { wt remove missing --repo "($repo)" --json } catch { print --stderr "expected failure"; exit 1 }'
+let repo_literal = ($repo | to nuon)
+let failed_script = $'source ($binding_literal); try { wt remove missing --repo ($repo_literal) --json } catch { print --stderr "expected failure"; exit 1 }'
 let failure = (^nu -c $failed_script | complete)
 assert ($failure.exit_code != 0)
 assert ($failure.stderr | str contains "no worktree found")
 assert ((pwd | path expand) == ($repo | path expand))
 
 # Direct forwarding survives error unwinding without external printf.
-let forward_script = $'source "($binding)"; try { forward-core-failure { stdout: "structured-output", stderr: "diagnostic", exit_code: 5 }; error make {msg: "expected"} } catch { exit 1 }'
+let forward_script = $'source ($binding_literal); try { forward-core-failure { stdout: "structured-output", stderr: "diagnostic", exit_code: 5 }; error make {msg: "expected"} } catch { exit 1 }'
 let forwarded = (^nu -c $forward_script | complete)
 assert ($forwarded.exit_code != 0)
 assert ($forwarded.stdout == "structured-output")
