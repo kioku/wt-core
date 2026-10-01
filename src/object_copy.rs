@@ -1,6 +1,6 @@
 //! Independent object copies. Git remains responsible for repository metadata.
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use crate::cli::MaterializeCopyMode;
@@ -92,10 +92,25 @@ fn copy_file(source: &Path, destination: &Path, mode: MaterializeCopyMode) -> io
         .create_new(true)
         .open(destination)?;
     if mode == MaterializeCopyMode::Copy || !try_reflink(&input, &output)? {
-        // Unlike fs::copy, explicit stream copying never selects a reflink.
-        io::copy(&mut input, &mut output)?;
+        copy_bytes(&mut input, &mut output)?;
     }
     output.set_permissions(metadata.permissions())
+}
+
+/// Explicit reads/writes avoid kernel offloads in both fs::copy and io::copy,
+/// which can share extents and would violate the force-copy contract.
+fn copy_bytes(input: &mut File, output: &mut File) -> io::Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let length = match input.read(&mut buffer) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if length == 0 {
+            return Ok(());
+        }
+        output.write_all(&buffer[..length])?;
+    }
 }
 
 #[cfg(target_os = "linux")]
