@@ -525,7 +525,7 @@ cargo install --path . --no-default-features
 | Dependency | Minimum Version |
 |------------|-----------------|
 | Git        | 2.39            |
-| Rust       | stable (MSRV pinned in `Cargo.toml`) |
+| Rust       | 1.85 (checked in CI) |
 | Nushell    | 0.109           |
 | Bash       | 4.4             |
 | Zsh        | 5.8             |
