@@ -3121,7 +3121,7 @@ fn continue_merge_commit(
 /// Continue a managed merge after its conflicts have been resolved.
 pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
     let lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
-    let (_, mut state) = load_valid_merge_state(repo)?;
+    let (state_path, mut state) = load_valid_merge_state(repo)?;
     git::recover_branch_ref_lock(
         &state.destination_path,
         &BranchName::new(&state.destination),
@@ -3133,7 +3133,9 @@ pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
         // progress write. Persist reconciliation before taking another action.
         write_operation_state(repo, &mut state)?;
     }
-    let report = merge_operation_status(repo)?;
+    // We own the lifecycle lock. Inspect our validated state directly instead
+    // of probing a second handle, which Windows correctly reports as busy.
+    let report = inspect_operation_state(repo, &state, state_path)?;
     if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
         return Err(operation_recovery_error(&report));
     }
@@ -3163,7 +3165,7 @@ pub fn merge_continue(repo: &RepoRoot) -> Result<MergeResult> {
 /// Abort a managed merge and clear only the matching operation record.
 pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
     let lifecycle_lock = acquire_merge_lifecycle_lock(repo)?;
-    let (_, mut state) = load_valid_merge_state(repo)?;
+    let (state_path, mut state) = load_valid_merge_state(repo)?;
     git::recover_branch_ref_lock(
         &state.destination_path,
         &BranchName::new(&state.destination),
@@ -3173,7 +3175,8 @@ pub fn merge_abort_operation(repo: &RepoRoot) -> Result<MergeOperationReport> {
     if reconcile_operation_progress(repo, &mut state)? {
         write_operation_state(repo, &mut state)?;
     }
-    let report = merge_operation_status(repo)?;
+    // Ownership is already established; the read-only probe is for observers.
+    let report = inspect_operation_state(repo, &state, state_path)?;
     if matches!(report.state.as_str(), "stale" | "interrupted" | "corrupt") {
         return Err(operation_recovery_error(&report));
     }

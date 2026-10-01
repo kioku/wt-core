@@ -1250,6 +1250,7 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
 
     if let Some(refusal) = &preflight.refusal {
         let error = AppError::conflict(refusal.message.clone());
+        drop(lifecycle_lock);
         return report_merge_failure(&repo, &preflight, fmt, error, None);
     }
 
@@ -1270,6 +1271,7 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
                         message: Some(failure.error.message.clone()),
                     },
                 };
+                drop(lifecycle_lock);
                 return report_merge_failure(
                     &repo,
                     &preflight_for_error,
@@ -1280,6 +1282,9 @@ fn cmd_merge(options: MergeCommandOptions) -> Result<()> {
             }
         };
 
+    // Finalization is complete. Release ownership before read-only reporting,
+    // so Windows mandatory locks cannot make this command appear busy itself.
+    drop(lifecycle_lock);
     print_merge_result(&repo, result, fmt, navigation_file.as_deref())
 }
 

@@ -49,10 +49,7 @@ impl TestRepo {
     }
 
     pub fn path(&self) -> PathBuf {
-        self.dir
-            .path()
-            .canonicalize()
-            .expect("failed to canonicalize temp dir")
+        dunce::canonicalize(self.dir.path()).expect("failed to canonicalize temp dir")
     }
 }
 
@@ -147,18 +144,12 @@ impl ClonedTestRepo {
 
     /// Return the canonicalized path of the clone (working copy).
     pub fn path(&self) -> PathBuf {
-        self.clone
-            .path()
-            .canonicalize()
-            .expect("failed to canonicalize clone dir")
+        dunce::canonicalize(self.clone.path()).expect("failed to canonicalize clone dir")
     }
 
     /// Return the canonicalized path of the bare "origin" repo.
     pub fn origin_path(&self) -> PathBuf {
-        self._origin
-            .path()
-            .canonicalize()
-            .expect("failed to canonicalize origin dir")
+        dunce::canonicalize(self._origin.path()).expect("failed to canonicalize origin dir")
     }
 }
 
@@ -179,4 +170,17 @@ pub fn find_worktree_dir(repo: &std::path::Path, slug_prefix: &str) -> std::path
         slug_prefix,
         worktrees_dir.display()
     );
+}
+
+/// Match Git porcelain path spelling without changing native path semantics.
+pub fn git_path_string(path: &std::path::Path) -> String {
+    let path = path.display().to_string();
+    #[cfg(windows)]
+    {
+        path.replace('\\', "/")
+    }
+    #[cfg(not(windows))]
+    {
+        path
+    }
 }

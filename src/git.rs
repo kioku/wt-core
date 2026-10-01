@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 use std::process::Stdio;
@@ -174,7 +174,9 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
         git(&["rev-parse", "--git-common-dir"], start).unwrap_or_else(|_| ".git".to_string());
 
     let common_path = PathBuf::from(start).join(&common);
-    let common_canonical = common_path.canonicalize().unwrap_or(common_path);
+    // Git for Windows rejects verbatim drive prefixes in worktree arguments.
+    // Dunce removes them only where the ordinary Win32 path is equivalent.
+    let common_canonical = dunce::canonicalize(&common_path).unwrap_or(common_path);
 
     // The main repo root is the parent of the common .git directory.
     let root = common_canonical
@@ -313,6 +315,12 @@ pub fn remove_worktree(
     force: bool,
     lifecycle_lock: &operation_state::MergeLifecycleLock,
 ) -> Result<()> {
+    // Windows holds a non-deletable handle to the process working directory.
+    // Selection/identity checks are complete before reaching this boundary;
+    // leave the source so Git can remove it when invoked from inside it.
+    #[cfg(windows)]
+    std::env::set_current_dir(repo.as_ref())
+        .map_err(|error| AppError::git(format!("cannot leave worktree before removal: {error}")))?;
     let dir_str = dir.display().to_string();
     let mut args = vec!["worktree", "remove"];
     if force {
@@ -584,7 +592,11 @@ fn open_recoverable_branch_lock(path: &Path) -> Result<fs::File> {
                     path.display()
                 )));
             }
-            let contents = fs::read_to_string(path).map_err(|inspect| {
+            // Windows byte-range locks deny reads through separately opened
+            // handles. Inspect the file through the handle holding our lock.
+            let mut contents = String::new();
+            let mut reader = &file;
+            reader.read_to_string(&mut contents).map_err(|inspect| {
                 AppError::conflict(format!(
                     "cannot inspect destination branch lock '{}': {inspect}",
                     path.display()
@@ -613,6 +625,7 @@ fn write_branch_lock_owner(file: &fs::File) -> Result<()> {
     })?;
     writer
         .set_len(0)
+        .and_then(|_| writer.seek(SeekFrom::Start(0)))
         .and_then(|_| writer.write_all(owner.as_bytes()))
         .and_then(|_| writer.sync_all())
         .map_err(|error| {
@@ -2095,6 +2108,32 @@ mod tests {
     }
 
     #[test]
+    fn canonical_repo_root_is_usable_as_a_git_worktree_path() {
+        let repo = test_repo();
+        let canonical = repo
+            .path()
+            .canonicalize()
+            .expect("canonical repository path");
+        let root = repo_root(&canonical).expect("repository root should resolve");
+        assert_eq!(
+            root.as_ref(),
+            dunce::canonicalize(repo.path()).expect("Git-compatible canonical path")
+        );
+        let linked = root.as_ref().join("linked");
+        test_git(
+            root.as_ref(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/path",
+                &linked.display().to_string(),
+            ],
+        );
+        assert!(linked.join(".git").is_file());
+    }
+
+    #[test]
     fn branch_ref_lock_rejects_empty_native_lock() {
         let repo = test_repo();
         let branch = BranchName::new("main");
@@ -2115,6 +2154,26 @@ mod tests {
             "native lock must remain for Git recovery"
         );
         assert_eq!(fs::read_to_string(lock_path).expect("read native lock"), "");
+    }
+
+    #[test]
+    fn branch_ref_lock_recovers_valid_unlocked_owner_without_padding() {
+        let directory = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = directory.path().join("main.lock");
+        fs::write(&path, format!("{BRANCH_LOCK_HEADER}pid=4294967295\n"))
+            .expect("stale lock owner should write");
+
+        let file =
+            open_recoverable_branch_lock(&path).expect("valid unlocked owner should recover");
+        let busy = open_recoverable_branch_lock(&path).expect_err("live owner must remain busy");
+        assert_eq!(busy.code, crate::error::ExitCode::Conflict);
+        assert!(busy.message.contains("busy"));
+        drop(file);
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("recovered owner should read"),
+            format!("{BRANCH_LOCK_HEADER}pid={}\n", std::process::id())
+        );
     }
 
     #[test]

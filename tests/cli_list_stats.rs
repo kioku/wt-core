@@ -299,7 +299,7 @@ fn list_stats_human_output_dynamically_aligns_wide_stats_columns() {
     let base_start = column_start(header, "BASE");
     let path_start = column_start(header, "PATH");
     let path_char_start = char_column_start(header, "PATH");
-    let repo_prefix = repo_path.display().to_string();
+    let repo_prefix = fixtures::git_path_string(&repo_path);
 
     assert!(lines.iter().any(|line| line.contains("+1200 -0")));
     assert!(lines.iter().any(|line| line.contains("+1 -2")));
@@ -338,7 +338,7 @@ fn list_stats_human_output_aligns_visible_columns_for_wide_unicode_text() {
     );
     let header = plain.lines().next().expect("header line");
     let path_display_start = display_column_start(header, "PATH");
-    let repo_prefix = repo_path.display().to_string();
+    let repo_prefix = fixtures::git_path_string(&repo_path);
 
     let unicode_row = plain
         .lines()

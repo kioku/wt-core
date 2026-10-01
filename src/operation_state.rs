@@ -90,8 +90,7 @@ impl MergeLifecycleLock {
     }
 }
 
-/// Report whether an already-created lifecycle lock is currently owned by
-/// another process, without creating the state directory or lock file.
+/// Report whether an already-created lifecycle lock is currently owned, without creating the state directory or lock file.
 ///
 /// Read-only status uses this probe so a live pre-merge hook is reported as
 /// `busy` rather than as an interrupted/conflicted operation. A lock that is
@@ -134,19 +133,7 @@ pub(crate) fn lock_is_held(path: &Path) -> Result<bool> {
         ))
     })?;
     if locked {
-        // Internal status inspection occurs while the owning command holds the
-        // same lock. Its owner record lets that code continue to inspect its
-        // own operation, while a status subprocess has a different PID and
-        // truthfully reports `busy`.
-        let owner_is_current = fs::read_to_string(path)
-            .ok()
-            .and_then(|contents| {
-                contents
-                    .lines()
-                    .find_map(|line| line.strip_prefix("pid=")?.parse::<u32>().ok())
-            })
-            .is_some_and(|pid| pid == std::process::id());
-        return Ok(!owner_is_current);
+        return Ok(true);
     }
     #[cfg(unix)]
     return child_lock_is_held(path);
@@ -612,7 +599,9 @@ mod tests {
         let second = acquire_merge_lifecycle_lock(&second_path)
             .expect("a distinct repository has an independent lifecycle");
 
+        assert!(lock_is_held(&first_path).expect("read-only probe sees the owner"));
         drop(first);
+        assert!(!lock_is_held(&first_path).expect("dropped owner releases the lock"));
         let _recovered =
             acquire_merge_lifecycle_lock(&first_path).expect("released lock is recoverable");
         drop(second);

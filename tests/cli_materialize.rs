@@ -202,6 +202,10 @@ fn materialize_from_object_source_without_permanent_alternates() {
 #[test]
 fn materialize_large_checkout_preserves_older_sha_and_file_modes() {
     let repo = fixtures::ClonedTestRepo::new();
+    // Assert exact LF bytes on every platform, independently of the runner
+    // Git installation's core.autocrlf default. Checkout must honor attributes.
+    std::fs::write(repo.path().join(".gitattributes"), "* text eol=lf\n")
+        .expect("write checkout attributes");
     let nested = repo.path().join("nested");
     std::fs::create_dir(&nested).expect("create nested directory");
     // Exceed Git's default checkout and status parallelism thresholds.
@@ -1034,8 +1038,7 @@ fn local_copy_populates_existing_destination_without_changing_access_controls() 
     assert_checkout(&workspace, &sha);
     assert_eq!(
         git_output(&["remote", "get-url", "origin"], &workspace),
-        repo.origin_path()
-            .canonicalize()
+        dunce::canonicalize(repo.origin_path())
             .expect("source path")
             .display()
             .to_string()

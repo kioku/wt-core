@@ -1888,7 +1888,10 @@ fn merge_json_output_structure() {
     assert_eq!(json["event"], "reset");
     assert_eq!(json["branch"], "feature/json-merge");
     assert_eq!(json["mainline"], "main");
-    assert_eq!(json["destination_path"], repo_str);
+    assert_eq!(
+        std::path::Path::new(json["destination_path"].as_str().expect("destination path")),
+        repo.path()
+    );
     assert!(json["repo_root"].as_str().is_some());
     assert_eq!(json["cleaned_up"], true);
     assert!(
@@ -2020,7 +2023,7 @@ fn merge_print_paths_returns_six_lines() {
 
     // Line 1: repo root
     assert!(
-        !lines[0].contains(".worktrees/"),
+        !lines[0].replace('\\', "/").contains(".worktrees/"),
         "line 1 should be repo root: {}",
         lines[0]
     );
@@ -2036,7 +2039,7 @@ fn merge_print_paths_returns_six_lines() {
 
     // Line 5: removed_path (non-empty when cleaned_up)
     assert!(
-        lines[4].contains(".worktrees/"),
+        lines[4].replace('\\', "/").contains(".worktrees/"),
         "line 5 should be the removed worktree path: {}",
         lines[4]
     );
@@ -2079,7 +2082,7 @@ fn merge_print_paths_v2_appends_destination_path() {
     assert_eq!(lines[2], "main");
     assert_eq!(lines[3], "true");
     assert_eq!(lines[5], "false");
-    assert_eq!(lines[6], repo_str);
+    assert_eq!(std::path::Path::new(lines[6]), repo.path());
 }
 
 #[test]
@@ -2242,7 +2245,6 @@ fn merge_into_linked_worktree_succeeds_and_cleans_only_source() {
     let (repo, upstream) = setup_repo_with_upstream();
     let repo_str = repo.path().display().to_string();
     let destination = add_linked_destination(&repo, "release/linked");
-    let destination_str = destination.display().to_string();
 
     run_git(&["push", "-u", "origin", "release/linked"], &repo.path());
 
@@ -2270,7 +2272,8 @@ fn merge_into_linked_worktree_succeeds_and_cleans_only_source() {
             "Merged 'feature/linked' into release/linked",
         ))
         .stdout(predicate::str::contains(format!(
-            "Destination worktree: {destination_str}"
+            "Destination worktree: {}",
+            fixtures::git_path_string(&destination)
         )))
         .stdout(predicate::str::contains("Pushed release/linked to origin"));
 
@@ -3208,8 +3211,12 @@ fn merge_inspect_reports_linked_destination_topology() {
 
     assert_eq!(json["preflight"]["destination"], "release/inspect");
     assert_eq!(
-        json["preflight"]["destination_path"],
-        destination.display().to_string()
+        std::path::Path::new(
+            json["preflight"]["destination_path"]
+                .as_str()
+                .expect("destination path")
+        ),
+        destination
     );
     assert_eq!(json["preflight"]["topology"], "synchronized");
     assert_eq!(git_rev_parse(&destination, "HEAD"), destination_before);
@@ -3992,14 +3999,13 @@ fn worktree_admin_snapshot(repo: &std::path::Path) -> Vec<(String, String)> {
 /// the stale record during a normal merge preflight.
 fn lock_worktree_metadata(repo: &std::path::Path, worktree: &std::path::Path) {
     let admin_dir = repo.join(".git/worktrees");
-    let worktree_prefix = worktree.display().to_string();
     for entry in std::fs::read_dir(&admin_dir)
         .expect("worktree admin directory")
         .flatten()
     {
         let path = entry.path();
         let gitdir = std::fs::read_to_string(path.join("gitdir")).unwrap_or_default();
-        if gitdir.trim().starts_with(&worktree_prefix) {
+        if std::path::Path::new(gitdir.trim()).starts_with(worktree) {
             std::fs::write(path.join("locked"), "repair test").expect("lock worktree");
             return;
         }
@@ -4075,7 +4081,7 @@ fn add_linked_destination(repo: &fixtures::TestRepo, branch: &str) -> std::path:
 fn setup_repo_with_upstream() -> (fixtures::TestRepo, tempfile::TempDir) {
     // Create bare upstream
     let upstream = tempfile::TempDir::new().expect("failed to create upstream dir");
-    let upstream_path = upstream.path().canonicalize().expect("canonicalize failed");
+    let upstream_path = dunce::canonicalize(upstream.path()).expect("canonicalize failed");
     run_git(&["init", "--bare", "-b", "main"], &upstream_path);
 
     // Create the working repo

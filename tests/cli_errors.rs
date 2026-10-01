@@ -113,7 +113,7 @@ fn path_convention_worktrees_dir() {
     let path = path.trim();
 
     // Must be under .worktrees/
-    assert!(path.contains("/.worktrees/"));
+    assert!(std::path::Path::new(path).starts_with(repo.path().join(".worktrees")));
 
     // Must use collision-safe naming: slug--8hex
     let dir_name = std::path::Path::new(path)

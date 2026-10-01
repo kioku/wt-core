@@ -96,7 +96,7 @@ fn add_creates_worktree_and_branch() {
 
     let stdout = String::from_utf8(output).expect("invalid utf8");
     assert!(stdout.contains("feature/login"));
-    assert!(stdout.contains(".worktrees/"));
+    assert!(stdout.replace('\\', "/").contains(".worktrees/"));
 
     // Verify the worktree directory exists
     let entries: Vec<_> = std::fs::read_dir(repo.path().join(".worktrees"))
@@ -153,8 +153,8 @@ fn add_print_cd_path_returns_bare_path() {
 
     let path = String::from_utf8(output).expect("invalid utf8");
     let path = path.trim();
-    assert!(path.starts_with('/'));
-    assert!(path.contains(".worktrees/"));
+    assert!(std::path::Path::new(path).is_absolute());
+    assert!(path.replace('\\', "/").contains(".worktrees/"));
     // Must not be JSON
     assert!(!path.starts_with('{'));
 }
@@ -628,7 +628,7 @@ fn remove_json_writes_nul_delimited_navigation_metadata() {
     let removed_path = fixtures::find_worktree_dir(&repo.path(), "navigation-protocol");
     let navigation_file = tempfile::NamedTempFile::new().expect("navigation file");
 
-    wt_core()
+    let output = wt_core()
         .args([
             "remove",
             "navigation-protocol",
@@ -639,13 +639,17 @@ fn remove_json_writes_nul_delimited_navigation_metadata() {
             &navigation_file.path().display().to_string(),
         ])
         .assert()
-        .success();
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let response: serde_json::Value = serde_json::from_slice(&output).expect("remove JSON");
+    let reported_path = response["removed_path"].as_str().expect("removed path");
+    let reported_root = response["repo_root"].as_str().expect("repository root");
+    assert_eq!(std::path::Path::new(reported_path), removed_path);
+    assert_eq!(std::path::Path::new(reported_root), repo.path());
 
-    let expected = format!(
-        "reset\0{}\0{}\0",
-        removed_path.display(),
-        repo.path().display()
-    );
+    let expected = format!("reset\0{}\0{}\0", reported_path, reported_root);
     assert_eq!(
         std::fs::read(navigation_file.path()).expect("read navigation file"),
         expected.as_bytes()
@@ -683,14 +687,14 @@ fn remove_print_paths_returns_three_lines() {
 
     // Line 1: removed worktree path (under .worktrees/)
     assert!(
-        lines[0].contains(".worktrees/"),
+        lines[0].replace('\\', "/").contains(".worktrees/"),
         "line 1 should be removed path: {}",
         lines[0]
     );
 
     // Line 2: repo root (not under .worktrees/)
     assert!(
-        !lines[1].contains(".worktrees/"),
+        !lines[1].replace('\\', "/").contains(".worktrees/"),
         "line 2 should be repo root, not a worktree path: {}",
         lines[1]
     );

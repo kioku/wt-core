@@ -65,8 +65,8 @@ fn go_print_cd_path_returns_bare_path() {
 
     let path = String::from_utf8(output).expect("invalid utf8");
     let path = path.trim();
-    assert!(path.starts_with('/'));
-    assert!(path.contains(".worktrees/"));
+    assert!(std::path::Path::new(path).is_absolute());
+    assert!(path.replace('\\', "/").contains(".worktrees/"));
 }
 
 #[test]
@@ -301,8 +301,8 @@ fn go_no_branch_print_cd_path_auto_selects_single_worktree() {
 
     let path = String::from_utf8(output).expect("invalid utf8");
     let path = path.trim();
-    assert!(path.starts_with('/'));
-    assert!(path.contains(".worktrees/"));
+    assert!(std::path::Path::new(path).is_absolute());
+    assert!(path.replace('\\', "/").contains(".worktrees/"));
     assert!(path.contains("sole-wt"));
 }
 

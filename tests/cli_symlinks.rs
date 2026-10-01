@@ -436,10 +436,8 @@ fn setup_json_returns_structured_response() {
     let json: serde_json::Value = serde_json::from_slice(&output).expect("invalid json");
     assert_eq!(json["ok"], true);
     assert!(
-        json["config_path"]
-            .as_str()
-            .expect("config_path")
-            .ends_with(".wt/symlinks"),
+        std::path::Path::new(json["config_path"].as_str().expect("config_path"))
+            .ends_with(std::path::Path::new(".wt").join("symlinks")),
         "config_path should end with .wt/symlinks"
     );
     let ecosystems = json["ecosystems"]

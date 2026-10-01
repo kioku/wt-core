@@ -757,7 +757,7 @@ fn prune_mainline_override_invalid_fails() {
 fn prune_mainline_detects_master() {
     // Create repo with 'master' as default branch
     let dir = tempfile::TempDir::new().expect("failed to create temp dir");
-    let path = dir.path().canonicalize().expect("failed to canonicalize");
+    let path = dunce::canonicalize(dir.path()).expect("failed to canonicalize");
 
     run_git(&["init", "-b", "master"], &path);
     run_git(&["config", "user.email", "test@test.com"], &path);
