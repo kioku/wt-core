@@ -20,9 +20,7 @@ fn add_worktree(repo: &fixtures::TestRepo, branch: &str) {
 }
 
 fn canonicalize_reported_path(value: &str) -> PathBuf {
-    PathBuf::from(value)
-        .canonicalize()
-        .expect("reported path should exist")
+    dunce::canonicalize(value).expect("reported path should exist")
 }
 
 #[cfg(unix)]
@@ -30,8 +28,7 @@ fn canonicalize_reported_path(value: &str) -> PathBuf {
 fn exec_uses_worktree_cwd_and_preserves_argument_boundaries_and_stdio() {
     let repo = fixtures::TestRepo::new();
     add_worktree(&repo, "exec-target");
-    let worktree = fixtures::find_worktree_dir(&repo.path(), "exec-target")
-        .canonicalize()
+    let worktree = dunce::canonicalize(fixtures::find_worktree_dir(&repo.path(), "exec-target"))
         .expect("worktree should exist");
 
     let output = wt_core()
@@ -67,8 +64,7 @@ fn exec_uses_worktree_cwd_and_preserves_argument_boundaries_and_stdio() {
 fn exec_uses_windows_command_cwd_and_status() {
     let repo = fixtures::TestRepo::new();
     add_worktree(&repo, "exec-windows");
-    let expected = fixtures::find_worktree_dir(&repo.path(), "exec-windows")
-        .canonicalize()
+    let expected = dunce::canonicalize(fixtures::find_worktree_dir(&repo.path(), "exec-windows"))
         .expect("worktree should exist");
 
     let output = wt_core()
@@ -114,8 +110,7 @@ fn exec_json_metadata_is_on_stderr_and_child_stdout_is_unchanged() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).expect("stdout should be utf8");
-    let expected = fixtures::find_worktree_dir(&repo.path(), "exec-json")
-        .canonicalize()
+    let expected = dunce::canonicalize(fixtures::find_worktree_dir(&repo.path(), "exec-json"))
         .expect("worktree should exist");
     assert_eq!(canonicalize_reported_path(stdout.trim()), expected);
 

@@ -603,7 +603,7 @@ fn independent_local_source(source: &Path) -> Result<PathBuf> {
             "local source must be a non-symlink directory",
         ));
     }
-    let source = fs::canonicalize(&source)
+    let source = dunce::canonicalize(&source)
         .map_err(|e| AppError::git(format!("cannot resolve local source: {e}")))?;
     crate::object_copy::validate_source(&source)?;
     match fs::symlink_metadata(source.join("objects/info/alternates")) {

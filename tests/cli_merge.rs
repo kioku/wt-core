@@ -4075,7 +4075,7 @@ fn add_linked_destination(repo: &fixtures::TestRepo, branch: &str) -> std::path:
 fn setup_repo_with_upstream() -> (fixtures::TestRepo, tempfile::TempDir) {
     // Create bare upstream
     let upstream = tempfile::TempDir::new().expect("failed to create upstream dir");
-    let upstream_path = upstream.path().canonicalize().expect("canonicalize failed");
+    let upstream_path = dunce::canonicalize(upstream.path()).expect("canonicalize failed");
     run_git(&["init", "--bare", "-b", "main"], &upstream_path);
 
     // Create the working repo

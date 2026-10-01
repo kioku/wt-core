@@ -1034,8 +1034,7 @@ fn local_copy_populates_existing_destination_without_changing_access_controls() 
     assert_checkout(&workspace, &sha);
     assert_eq!(
         git_output(&["remote", "get-url", "origin"], &workspace),
-        repo.origin_path()
-            .canonicalize()
+        dunce::canonicalize(repo.origin_path())
             .expect("source path")
             .display()
             .to_string()

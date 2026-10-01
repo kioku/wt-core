@@ -174,7 +174,9 @@ pub fn repo_root(start: &Path) -> Result<RepoRoot> {
         git(&["rev-parse", "--git-common-dir"], start).unwrap_or_else(|_| ".git".to_string());
 
     let common_path = PathBuf::from(start).join(&common);
-    let common_canonical = common_path.canonicalize().unwrap_or(common_path);
+    // Git for Windows rejects verbatim drive prefixes in worktree arguments.
+    // Dunce removes them only where the ordinary Win32 path is equivalent.
+    let common_canonical = dunce::canonicalize(&common_path).unwrap_or(common_path);
 
     // The main repo root is the parent of the common .git directory.
     let root = common_canonical
@@ -2097,6 +2099,32 @@ mod tests {
         assert!(preserved_branch_oid(&root, &branch)
             .expect("marker lookup should succeed")
             .is_none());
+    }
+
+    #[test]
+    fn canonical_repo_root_is_usable_as_a_git_worktree_path() {
+        let repo = test_repo();
+        let canonical = repo
+            .path()
+            .canonicalize()
+            .expect("canonical repository path");
+        let root = repo_root(&canonical).expect("repository root should resolve");
+        assert_eq!(
+            root.as_ref(),
+            dunce::canonicalize(repo.path()).expect("Git-compatible canonical path")
+        );
+        let linked = root.as_ref().join("linked");
+        test_git(
+            root.as_ref(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature/path",
+                &linked.display().to_string(),
+            ],
+        );
+        assert!(linked.join(".git").is_file());
     }
 
     #[test]
