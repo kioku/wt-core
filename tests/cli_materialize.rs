@@ -1803,10 +1803,21 @@ fn managed_existing_checkout_rejects_hook_object_tree_mutations() {
     let repo = fixtures::ClonedTestRepo::new();
     let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
     for mode in ["auto", "copy"] {
-        for mutation in ["alternates", "symlink", "fifo"] {
+        for (mutation, use_alias) in ["alternates", "symlink", "fifo"]
+            .into_iter()
+            .flat_map(|mutation| [(mutation, false), (mutation, true)])
+        {
             let root = tempfile::tempdir().expect("fixture");
             let workspace = root.path().join("workspace");
             std::fs::create_dir(&workspace).expect("caller-owned destination");
+            // Alias only the hook's target; production still receives the allowed real path.
+            let expected_workspace = if use_alias {
+                let alias = root.path().join("workspace-alias");
+                std::os::unix::fs::symlink(&workspace, &alias).expect("workspace alias");
+                alias
+            } else {
+                workspace.clone()
+            };
             let identity = same_file::Handle::from_path(&workspace).expect("root identity");
             std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o750))
                 .expect("destination permissions");
@@ -1825,7 +1836,8 @@ fn managed_existing_checkout_rejects_hook_object_tree_mutations() {
             std::fs::write(
                 &hook,
                 r#"#!/bin/sh
-[ "$PWD" = "$WT_HOOK_WORKSPACE" ] || exit 0
+# macOS may resolve /var to /private/var in cwd; compare directory identity.
+[ . -ef "$WT_HOOK_WORKSPACE" ] || exit 0
 case "$WT_HOOK_MUTATION" in
     alternates) printf '%s\n' "$WT_HOOK_OBJECTS" > .git/objects/info/alternates ;;
     symlink) ln -s "$WT_HOOK_OBJECTS" .git/objects/hook-entry ;;
@@ -1846,7 +1858,7 @@ esac
                 .env("HOME", &home)
                 .env("XDG_CONFIG_HOME", home.join("xdg"))
                 .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("WT_HOOK_WORKSPACE", &workspace)
+                .env("WT_HOOK_WORKSPACE", &expected_workspace)
                 .env("WT_HOOK_MUTATION", mutation)
                 .env("WT_HOOK_OBJECTS", repo.path().join(".git/objects"))
                 .assert()
