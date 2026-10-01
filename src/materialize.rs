@@ -646,19 +646,11 @@ fn clone_local_bare(
     ensure_workspace_available(workspace)?;
     // Populate the original directory in place: replacing it would lose
     // native ACLs, security labels, and other filesystem-specific controls.
-    // Clone the verified private snapshot via the protocol so even an old,
-    // now-unreferenced requested commit (the snapshot's HEAD) is transferred.
+    // Copy the complete verified snapshot, including objects unrelated to HEAD.
+    // A protocol clone would silently discard unreachable objects. Keep the
+    // selected copy mode for this final transfer as well as private staging.
     // Do not recursively clean this user-owned destination on failure.
-    run_git_owned(
-        vec![
-            os("clone"),
-            os("--no-local"),
-            os("--no-checkout"),
-            checkout.join(".git").as_os_str().to_os_string(),
-            workspace.as_os_str().to_os_string(),
-        ],
-        None,
-    )?;
+    clone_independent_checkout(&checkout.join(".git"), workspace, sha, copy_mode)?;
     run_git_owned(
         vec![
             os("remote"),

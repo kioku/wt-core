@@ -50,7 +50,9 @@ pub fn copy_tree(source: &Path, destination: &Path, mode: MaterializeCopyMode) -
 }
 
 fn copy_directory(source: &Path, destination: &Path, mode: MaterializeCopyMode) -> io::Result<()> {
+    require_real_directory(source)?;
     fs::create_dir_all(destination)?;
+    require_real_directory(destination)?;
     for entry in fs::read_dir(source)? {
         let entry = entry?;
         let kind = entry.file_type()?;
@@ -65,6 +67,20 @@ fn copy_directory(source: &Path, destination: &Path, mode: MaterializeCopyMode) 
                 "unsafe object entry",
             ));
         }
+    }
+    Ok(())
+}
+
+/// Recheck directory entries during traversal, including Git-created output.
+/// This rejects already substituted links; parent replacement after the check
+/// still requires a stable tree, as with Git's local clone.
+fn require_real_directory(path: &Path) -> io::Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "unsafe object directory",
+        ));
     }
     Ok(())
 }
@@ -151,6 +167,37 @@ fn copy_error(error: io::Error) -> AppError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_substituted_directories_files_and_special_entries() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().expect("temp directory");
+        let source = root.path().join("source");
+        let destination = root.path().join("destination");
+        let outside = root.path().join("outside");
+        fs::create_dir_all(source.join("ab")).expect("source directory");
+        fs::create_dir_all(&destination).expect("destination directory");
+        fs::create_dir_all(&outside).expect("outside directory");
+        fs::write(source.join("ab/object"), "object bytes").expect("source object");
+        symlink(&outside, destination.join("ab")).expect("substituted directory");
+        for mode in [MaterializeCopyMode::Auto, MaterializeCopyMode::Copy] {
+            assert!(copy_tree(&source, &destination, mode).is_err());
+            assert!(!outside.join("object").exists());
+            let link = root.path().join(format!("link-{mode:?}"));
+            symlink(source.join("ab/object"), &link).expect("source link");
+            assert!(copy_file(&link, &outside.join("copy"), mode).is_err());
+            assert!(copy_file(&source.join("ab/object"), &link, mode).is_err());
+        }
+        let fifo = source.join("fifo");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("create fifo")
+            .success());
+        assert!(validate_tree(&source).is_err());
+        assert!(copy_file(&fifo, &outside.join("fifo-copy"), MaterializeCopyMode::Copy).is_err());
+    }
 
     #[test]
     fn forced_copy_and_auto_have_independent_writes() {

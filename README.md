@@ -317,9 +317,10 @@ remove that newly created task-owned directory only after checking its captured
 identity. If the root is moved, replaced, or cannot be identified, materialization
 fails without deleting the unexpected destination or chasing the moved root.
 Existing empty destinations
-are populated in place via a protocol clone of the verified snapshot, retaining
-native access controls and directory identity on every platform. This compatibility
-path uses private sibling staging and does not receive the local-copy speedup.
+are populated in place using an independent copy of the complete verified snapshot,
+retaining native access controls and directory identity on every platform. This
+compatibility path uses private sibling staging and applies the selected copy mode
+to both transfers, preserving unreachable objects as well as the requested commit.
 Failures clean up staging without deleting existing destination contents; an in-place failure
 can leave partial Git output in an existing destination.
 

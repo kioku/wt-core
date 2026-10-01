@@ -1392,3 +1392,37 @@ fn both_copy_modes_reject_nested_object_symlinks_before_git_reads_them() {
         }
     }
 }
+
+#[test]
+fn both_copy_modes_preserve_unrelated_unreachable_blobs_in_existing_workspaces() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp directory");
+    let blob_file = root.path().join("unreachable");
+    std::fs::write(&blob_file, "unrelated unreachable content\n").expect("blob fixture");
+    let source = repo.origin_path();
+    let blob = git_output(
+        &["hash-object", "-w", &blob_file.display().to_string()],
+        &source,
+    );
+    for mode in ["auto", "copy"] {
+        let workspace = root.path().join(mode);
+        std::fs::create_dir(&workspace).expect("existing empty workspace");
+        materialize_object(&source, &sha, &workspace)
+            .args(["--copy-mode", mode])
+            .assert()
+            .success();
+        assert_checkout(&workspace, &sha);
+        assert_eq!(
+            git_output(&["cat-file", "blob", &blob], &workspace),
+            "unrelated unreachable content"
+        );
+    }
+    std::fs::remove_dir_all(source).expect("remove source");
+    for mode in ["auto", "copy"] {
+        assert_eq!(
+            git_output(&["cat-file", "blob", &blob], &root.path().join(mode)),
+            "unrelated unreachable content"
+        );
+    }
+}
