@@ -289,6 +289,10 @@ pub enum Command {
         #[arg(long, value_enum, default_value_t = MaterializeMode::Detached)]
         mode: MaterializeMode,
 
+        /// Object copies: auto tries independent reflinks; copy forces byte copying
+        #[arg(long, value_enum, default_value_t = MaterializeCopyMode::Auto)]
+        copy_mode: MaterializeCopyMode,
+
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -402,4 +406,11 @@ pub enum ColorChoice {
     Auto,
     Always,
     Never,
+}
+
+/// Filesystem assistance never introduces hardlinks or permanent alternates.
+#[derive(ValueEnum, Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterializeCopyMode {
+    Auto,
+    Copy,
 }

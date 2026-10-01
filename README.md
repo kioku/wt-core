@@ -291,10 +291,20 @@ remain enabled, and both verification passes still run. These checks do not
 refresh the on-disk index's stat cache; a later Git status may perform that refresh.
 Smaller checkouts use the normal single-process status check.
 
-Local sources are copied without hardlinks or object alternates, so the workspace
+`--copy-mode auto` (the default) attempts a Linux reflink for each local object
+file, falling back to byte copying when the filesystem does not support it or
+the copy crosses devices. Reflinks have independent inodes and copy-on-write
+extents. Other platforms use byte copying. `--copy-mode copy` forces byte copying
+and skips reflink attempts; it does not change cache refresh, repacking, checkout,
+or remote protocol transfers. Genuine copy failures are reported rather than
+silently retried as ordinary copies. No external copy utility is required.
+
+Local sources are copied without hardlinks or permanent object alternates, so the workspace
 remains independent of later source pruning or removal. Sources with object
-alternates or symlinked repository/object paths are rejected; Git's local-clone
-ownership checks also apply. Keep an external `--object-source` stable during
+alternates or symlinked repository/object paths are rejected; local-source
+ownership checks also apply. Git creates fresh metadata using a temporary shared
+clone; all objects, including unreachable objects, are copied and the alternate
+is removed before checkout or verification. Keep an external `--object-source` stable during
 materialization (do not concurrently refresh or prune it). Managed cache refresh
 and checkout remain serialized by the cache lock. Local materialization requires
 a writable workspace parent. New destinations are atomically claimed at their

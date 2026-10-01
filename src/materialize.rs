@@ -6,7 +6,7 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::cli::MaterializeMode;
+use crate::cli::{MaterializeCopyMode, MaterializeMode};
 use crate::error::{AppError, Result};
 use crate::git;
 
@@ -36,6 +36,7 @@ pub struct MaterializeOptions {
     pub workspace_root: PathBuf,
     pub object_source: Option<PathBuf>,
     pub mode: MaterializeMode,
+    pub copy_mode: MaterializeCopyMode,
 }
 
 #[derive(Debug)]
@@ -61,6 +62,7 @@ pub struct MaterializeTimings {
 }
 
 struct ValidatedOptions {
+    copy_mode: MaterializeCopyMode,
     repo_slug: String,
     remote_url: Option<String>,
     ref_name: Option<String>,
@@ -190,7 +192,12 @@ fn materialize_from_object_source(
     verify_bare_repo(source)?;
     verify_commit_exists(source, &request.sha)?;
     let started = Instant::now();
-    let identity = clone_local_bare(source, &request.workspace_root, &request.sha)?;
+    let identity = clone_local_bare(
+        source,
+        &request.workspace_root,
+        &request.sha,
+        request.copy_mode,
+    )?;
     timings.workspace_checkout = elapsed_ms(started);
     Ok(identity)
 }
@@ -221,7 +228,12 @@ fn materialize_from_cache(
 
     verify_commit_exists(cache_path, &request.sha)?;
     let checkout_started = Instant::now();
-    let identity = clone_local_bare(cache_path, &request.workspace_root, &request.sha)?;
+    let identity = clone_local_bare(
+        cache_path,
+        &request.workspace_root,
+        &request.sha,
+        request.copy_mode,
+    )?;
     timings.workspace_checkout = elapsed_ms(checkout_started);
     Ok((cache_status, identity))
 }
@@ -268,6 +280,7 @@ fn validate_options(options: MaterializeOptions) -> Result<ValidatedOptions> {
 
     Ok(ValidatedOptions {
         repo_slug,
+        copy_mode: options.copy_mode,
         remote_url: options.remote_url,
         ref_name: options.ref_name,
         sha: options.sha,
@@ -592,6 +605,7 @@ fn independent_local_source(source: &Path) -> Result<PathBuf> {
     }
     let source = fs::canonicalize(&source)
         .map_err(|e| AppError::git(format!("cannot resolve local source: {e}")))?;
+    crate::object_copy::validate_source(&source)?;
     match fs::symlink_metadata(source.join("objects/info/alternates")) {
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(source),
         Err(e) => Err(AppError::git(format!(
@@ -607,6 +621,7 @@ fn clone_local_bare(
     source: &Path,
     workspace: &Path,
     sha: &str,
+    copy_mode: MaterializeCopyMode,
 ) -> Result<Option<same_file::Handle>> {
     // Treat a final `/.` as the directory entry for creation and cloning.
     let normalized_workspace: PathBuf = workspace.components().collect();
@@ -618,7 +633,7 @@ fn clone_local_bare(
         .parent()
         .ok_or_else(|| AppError::usage("--workspace-root has no parent directory"))?;
     if !workspace.exists() {
-        return clone_new_workspace(&source, workspace, sha).map(Some);
+        return clone_new_workspace(&source, workspace, sha, copy_mode).map(Some);
     }
     // Preverify existing-directory checkouts privately. Keep the cache lock
     // throughout, and remove only this task-owned staging tree on failure.
@@ -627,7 +642,7 @@ fn clone_local_bare(
         .tempdir_in(parent)
         .map_err(|e| AppError::git(format!("cannot stage local checkout: {e}")))?;
     let checkout = staging.path().join("workspace");
-    clone_independent_checkout(&source, &checkout, sha)?;
+    clone_independent_checkout(&source, &checkout, sha, copy_mode)?;
     ensure_workspace_available(workspace)?;
     // Populate the original directory in place: replacing it would lose
     // native ACLs, security labels, and other filesystem-specific controls.
@@ -660,7 +675,12 @@ fn clone_local_bare(
 }
 
 /// Claim a fresh root at its final path and clean only our own output on failure.
-fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<same_file::Handle> {
+fn clone_new_workspace(
+    source: &Path,
+    workspace: &Path,
+    sha: &str,
+    copy_mode: MaterializeCopyMode,
+) -> Result<same_file::Handle> {
     // Creating under the actual parent preserves one-generation native ACLs and
     // path-based labels; renaming a nested checkout would not re-inherit them.
     fs::create_dir(workspace).map_err(|e| match e.kind() {
@@ -673,7 +693,7 @@ fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<sam
     // execution. If capture fails, preserve the root rather than guess ownership.
     let root = same_file::Handle::from_path(workspace)
         .map_err(|e| AppError::git(format!("cannot capture new workspace identity: {e}")))?;
-    let result = clone_independent_checkout(source, workspace, sha);
+    let result = clone_independent_checkout(source, workspace, sha, copy_mode);
     verify_new_workspace_identity(workspace, &root)?;
     if result.is_err() {
         fs::remove_dir_all(workspace)
@@ -708,18 +728,32 @@ fn verify_new_workspace_identity(workspace: &Path, root: &same_file::Handle) -> 
 }
 
 /// Copy objects and mutable metadata independently, then verify before success.
-fn clone_independent_checkout(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+fn clone_independent_checkout(
+    source: &Path,
+    workspace: &Path,
+    sha: &str,
+    copy_mode: MaterializeCopyMode,
+) -> Result<()> {
     run_git_owned(
         vec![
             os("clone"),
             os("--local"),
-            os("--no-hardlinks"),
+            os("--shared"),
             os("--no-checkout"),
             source.as_os_str().to_os_string(),
             workspace.as_os_str().to_os_string(),
         ],
         None,
     )?;
+    // Git creates metadata, but the temporary alternate is replaced with all
+    // source objects (including unreachable ones), without repacking.
+    crate::object_copy::copy_tree(
+        &source.join("objects"),
+        &workspace.join(".git/objects"),
+        copy_mode,
+    )?;
+    fs::remove_file(workspace.join(".git/objects/info/alternates"))
+        .map_err(|e| AppError::git(format!("cannot remove temporary alternate: {e}")))?;
     // Defense in depth: never publish a clone that depends on source objects.
     independent_local_source(&workspace.join(".git"))?;
     checkout_detached(workspace, sha)?;
