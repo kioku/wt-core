@@ -4,6 +4,7 @@ mod domain;
 mod error;
 mod git;
 mod materialize;
+mod object_copy;
 mod operation_state;
 mod output;
 mod symlinks;

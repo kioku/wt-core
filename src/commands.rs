@@ -125,6 +125,7 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
             cache_root,
             workspace_root,
             object_source,
+            copy_mode,
             mode,
             json,
         } => success(cmd_materialize(
@@ -136,6 +137,7 @@ pub fn run(cli: Cli) -> Result<RunOutcome> {
                 cache_root,
                 workspace_root,
                 object_source,
+                copy_mode,
                 mode,
             },
             json,

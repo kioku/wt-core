@@ -295,10 +295,20 @@ disables `core.ignoreStat` for that command so it cannot create assume-unchanged
 entries that conceal tracked edits. Verification disables `core.fsmonitor`
 command-locally so stale monitor results cannot hide tracked or untracked changes.
 
-Local sources are copied without hardlinks or object alternates, so the workspace
+`--copy-mode auto` (the default) attempts a Linux reflink for each local object
+file, falling back to byte copying when the filesystem does not support it or
+the copy crosses devices. Reflinks have independent inodes and copy-on-write
+extents. Other platforms use byte copying. `--copy-mode copy` forces byte copying
+and skips reflink attempts; it does not change cache refresh, repacking, checkout,
+or remote protocol transfers. Genuine copy failures are reported rather than
+silently retried as ordinary copies. No external copy utility is required.
+
+Local sources are copied without hardlinks or permanent object alternates, so the workspace
 remains independent of later source pruning or removal. Sources with object
-alternates or symlinked repository/object paths are rejected; Git's local-clone
-ownership checks also apply. Keep an external `--object-source` stable during
+alternates or symlinked repository/object paths are rejected; local-source
+ownership checks also apply. Git creates fresh metadata using a temporary shared
+clone; all objects, including unreachable objects, are copied and the alternate
+is removed before checkout or verification. Keep an external `--object-source` stable during
 materialization (do not concurrently refresh or prune it). Managed cache refresh
 and checkout remain serialized by the cache lock. Local materialization requires
 a writable workspace parent. New destinations are atomically claimed at their
@@ -307,9 +317,10 @@ remove that newly created task-owned directory only after checking its captured
 identity. If the root is moved, replaced, or cannot be identified, materialization
 fails without deleting the unexpected destination or chasing the moved root.
 Existing empty destinations
-are populated in place via a protocol clone of the verified snapshot, retaining
-native access controls and directory identity on every platform. This compatibility
-path uses private sibling staging and does not receive the local-copy speedup.
+are populated in place using an independent copy of the complete verified snapshot,
+retaining native access controls and directory identity on every platform. This
+compatibility path uses private sibling staging and applies the selected copy mode
+to both transfers, preserving unreachable objects as well as the requested commit.
 Failures clean up staging without deleting existing destination contents; an in-place failure
 can leave partial Git output in an existing destination.
 

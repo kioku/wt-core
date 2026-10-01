@@ -635,7 +635,16 @@ fn assert_independent_files(source: &Path, destination: &Path) {
 
 #[test]
 fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() {
-    for (packed, existed) in [(false, false), (false, true), (true, false), (true, true)] {
+    for (packed, existed, copy_mode) in [
+        (false, false, "auto"),
+        (false, true, "auto"),
+        (true, false, "auto"),
+        (true, true, "auto"),
+        (false, false, "copy"),
+        (false, true, "copy"),
+        (true, false, "copy"),
+        (true, true, "copy"),
+    ] {
         let repo = fixtures::ClonedTestRepo::new();
         let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
         fixtures::commit_file(&repo.path(), "new.txt", "new head", "new commit");
@@ -660,6 +669,7 @@ fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() 
             std::fs::create_dir(&workspace).expect("empty workspace");
         }
         materialize_object(&source, &sha, &workspace)
+            .args(["--copy-mode", copy_mode])
             .assert()
             .success();
         assert_checkout(&workspace, &sha);
@@ -1303,5 +1313,116 @@ fn local_copy_reports_new_root_io_failure_as_git_error() {
         let output = output.expect("run materialize");
         assert_eq!(output.status.code(), Some(2));
         assert!(!workspace.exists());
+    }
+}
+
+#[test]
+fn materialize_copy_mode_rejects_invalid_and_conflicting_values() {
+    let root = tempfile::tempdir().expect("temp directory");
+    for flags in [
+        vec!["--copy-mode", "reflink"],
+        vec!["--copy-mode", "AUTO"],
+        vec!["--copy-mode", "--copy"],
+        vec!["--copy-mode", "auto", "--copy-mode", "copy"],
+        vec!["--copy-mode=auto", "--copy-mode=auto"],
+    ] {
+        let workspace = root.path().join("workspace");
+        materialize_object(
+            root.path(),
+            "0123456789abcdef0123456789abcdef01234567",
+            &workspace,
+        )
+        .args(flags)
+        .assert()
+        .failure()
+        .code(2);
+        assert!(!workspace.exists());
+    }
+}
+
+#[test]
+fn both_copy_modes_preserve_unreachable_objects_in_new_workspaces() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let source = repo.origin_path();
+    git_output(&["update-ref", "-d", "refs/heads/main"], &source);
+    let root = tempfile::tempdir().expect("temp directory");
+    for mode in ["auto", "copy"] {
+        let workspace = root.path().join(mode);
+        materialize_object(&source, &sha, &workspace)
+            .args(["--copy-mode", mode])
+            .assert()
+            .success();
+        assert_checkout(&workspace, &sha);
+        #[cfg(unix)]
+        assert_independent_files(&source, &workspace.join(".git"));
+    }
+    std::fs::remove_dir_all(source).expect("remove private source");
+    for mode in ["auto", "copy"] {
+        assert_checkout(&root.path().join(mode), &sha);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn both_copy_modes_reject_nested_object_symlinks_before_git_reads_them() {
+    use std::os::unix::fs::symlink;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp directory");
+    let source = repo.origin_path();
+    let unsafe_path = source.join("objects/info/unsafe-link");
+    symlink(root.path().join("missing"), &unsafe_path).expect("dangling symlink");
+    for mode in ["auto", "copy"] {
+        for existed in [false, true] {
+            let workspace = root.path().join(format!("{mode}-{existed}"));
+            if existed {
+                std::fs::create_dir(&workspace).expect("empty workspace");
+            }
+            materialize_object(&source, &sha, &workspace)
+                .args(["--copy-mode", mode])
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("symlinks"));
+            assert_eq!(workspace.exists(), existed);
+            if existed {
+                assert_eq!(std::fs::read_dir(workspace).expect("empty").count(), 0);
+            }
+            assert_no_staging(root.path());
+        }
+    }
+}
+
+#[test]
+fn both_copy_modes_preserve_unrelated_unreachable_blobs_in_existing_workspaces() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp directory");
+    let blob_file = root.path().join("unreachable");
+    std::fs::write(&blob_file, "unrelated unreachable content\n").expect("blob fixture");
+    let source = repo.origin_path();
+    let blob = git_output(
+        &["hash-object", "-w", &blob_file.display().to_string()],
+        &source,
+    );
+    for mode in ["auto", "copy"] {
+        let workspace = root.path().join(mode);
+        std::fs::create_dir(&workspace).expect("existing empty workspace");
+        materialize_object(&source, &sha, &workspace)
+            .args(["--copy-mode", mode])
+            .assert()
+            .success();
+        assert_checkout(&workspace, &sha);
+        assert_eq!(
+            git_output(&["cat-file", "blob", &blob], &workspace),
+            "unrelated unreachable content"
+        );
+    }
+    std::fs::remove_dir_all(source).expect("remove source");
+    for mode in ["auto", "copy"] {
+        assert_eq!(
+            git_output(&["cat-file", "blob", &blob], &root.path().join(mode)),
+            "unrelated unreachable content"
+        );
     }
 }
