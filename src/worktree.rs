@@ -1135,40 +1135,56 @@ pub fn prune_execute(
     })
 }
 
-/// Run health diagnostics on the repository's worktree state.
+fn doctor_listing_error(path: &Path, error: &std::io::Error) -> Diagnostic {
+    Diagnostic {
+        level: DiagLevel::Error,
+        message: format!("cannot inspect {}: {error}", path.display()),
+    }
+}
+
+fn doctor_directory_entry(
+    entry: std::io::Result<std::fs::DirEntry>,
+    directory: &Path,
+    managed_paths: &[&PathBuf],
+) -> Option<Diagnostic> {
+    let entry = match entry {
+        Ok(entry) => entry,
+        Err(error) => return Some(doctor_listing_error(directory, &error)),
+    };
+    let path = entry.path();
+    match entry.file_type() {
+        Ok(kind) if kind.is_dir() && !managed_paths.contains(&&path) => Some(Diagnostic {
+            level: DiagLevel::Warn,
+            message: format!("orphaned directory not tracked by git: {}", path.display()),
+        }),
+        Err(error) => Some(doctor_listing_error(&path, &error)),
+        _ => None,
+    }
+}
+
+/// Run read-only health diagnostics, including external registrations.
 pub fn doctor(repo: &RepoRoot) -> Result<Vec<Diagnostic>> {
     let mut diags = Vec::new();
 
-    // Check .worktrees directory exists.
-    let wt_dir = repo.worktrees_dir();
-    if !wt_dir.exists() {
-        diags.push(Diagnostic {
-            level: DiagLevel::Ok,
-            message: "no .worktrees directory (no worktrees created yet)".to_string(),
-        });
-        return Ok(diags);
-    }
-
-    // List worktrees and check for orphaned directories without pruning
-    // metadata; doctor must be safe to run while diagnosing a stale entry.
+    // Always inspect registrations, including worktrees outside .worktrees.
     let worktrees = git::list_worktrees_readonly(repo)?;
-
     let managed_paths: Vec<_> = worktrees.iter().map(|wt| &wt.path).collect();
-
-    let orphaned = std::fs::read_dir(&wt_dir)
-        .into_iter()
-        .flat_map(|entries| entries.flatten())
-        .map(|entry| entry.path())
-        .filter(|p| p.is_dir() && !managed_paths.contains(&p));
-
-    for orphan in orphaned {
-        diags.push(Diagnostic {
-            level: DiagLevel::Warn,
-            message: format!(
-                "orphaned directory not tracked by git: {}",
-                orphan.display()
-            ),
-        });
+    let wt_dir = repo.worktrees_dir();
+    match std::fs::read_dir(&wt_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                if let Some(diag) = doctor_directory_entry(entry, &wt_dir, &managed_paths) {
+                    diags.push(diag);
+                }
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            diags.push(Diagnostic {
+                level: DiagLevel::Ok,
+                message: "no .worktrees directory (no managed directory found)".to_string(),
+            });
+        }
+        Err(error) => diags.push(doctor_listing_error(&wt_dir, &error)),
     }
 
     // Check each worktree has a valid branch.
