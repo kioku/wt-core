@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as Cmd;
 use std::process::Stdio;
@@ -584,7 +584,11 @@ fn open_recoverable_branch_lock(path: &Path) -> Result<fs::File> {
                     path.display()
                 )));
             }
-            let contents = fs::read_to_string(path).map_err(|inspect| {
+            // Windows byte-range locks deny reads through separately opened
+            // handles. Inspect the file through the handle holding our lock.
+            let mut contents = String::new();
+            let mut reader = &file;
+            reader.read_to_string(&mut contents).map_err(|inspect| {
                 AppError::conflict(format!(
                     "cannot inspect destination branch lock '{}': {inspect}",
                     path.display()
@@ -613,6 +617,7 @@ fn write_branch_lock_owner(file: &fs::File) -> Result<()> {
     })?;
     writer
         .set_len(0)
+        .and_then(|_| writer.seek(SeekFrom::Start(0)))
         .and_then(|_| writer.write_all(owner.as_bytes()))
         .and_then(|_| writer.sync_all())
         .map_err(|error| {
@@ -2115,6 +2120,26 @@ mod tests {
             "native lock must remain for Git recovery"
         );
         assert_eq!(fs::read_to_string(lock_path).expect("read native lock"), "");
+    }
+
+    #[test]
+    fn branch_ref_lock_recovers_valid_unlocked_owner_without_padding() {
+        let directory = tempfile::TempDir::new().expect("temporary directory should be created");
+        let path = directory.path().join("main.lock");
+        fs::write(&path, format!("{BRANCH_LOCK_HEADER}pid=4294967295\n"))
+            .expect("stale lock owner should write");
+
+        let file =
+            open_recoverable_branch_lock(&path).expect("valid unlocked owner should recover");
+        let busy = open_recoverable_branch_lock(&path).expect_err("live owner must remain busy");
+        assert_eq!(busy.code, crate::error::ExitCode::Conflict);
+        assert!(busy.message.contains("busy"));
+        drop(file);
+
+        assert_eq!(
+            fs::read_to_string(&path).expect("recovered owner should read"),
+            format!("{BRANCH_LOCK_HEADER}pid={}\n", std::process::id())
+        );
     }
 
     #[test]
