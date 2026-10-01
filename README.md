@@ -368,7 +368,10 @@ wt doctor
 
 Worktrees are placed under `<repo>/.worktrees/` with collision-safe directory names.
 Long branch slugs are shortened to keep each directory component at most 120
-ASCII bytes; the hash still uses the full branch name. Short names are unchanged:
+ASCII bytes; the hash still uses the full branch name. Short names are unchanged.
+Git for Windows may still need `core.longpaths=true` for long branch ref paths
+or deeply nested repository roots; shortening the worktree slug does not shorten
+the branch name itself:
 
 ```
 <slug>--<8hex>

@@ -218,6 +218,15 @@ fn doctor_checks_external_stale_registration_without_managed_directory() {
 #[test]
 fn long_branch_creates_bounded_collision_safe_directory() {
     let repo = fixtures::TestRepo::new();
+    // Git for Windows needs its opt-in for the long ref path itself; wt only
+    // bounds the separate worktree/admin-directory component it generates.
+    #[cfg(windows)]
+    assert!(std::process::Command::new("git")
+        .args(["config", "core.longpaths", "true"])
+        .current_dir(repo.path())
+        .status()
+        .expect("configure long ref paths")
+        .success());
     let mut paths = Vec::new();
     for suffix in ["a", "b"] {
         let branch = format!("{}{}", "x".repeat(248), suffix);

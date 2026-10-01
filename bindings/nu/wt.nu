@@ -22,13 +22,26 @@ def --wrapped wt [
 # complete path components instead of treating successful normalization as a
 # containment proof.
 def path-is-within [child: string parent: string] {
-    let child = ($child | path expand)
-    let parent = ($parent | path expand)
-    let child_parts = ($child | path split)
-    let parent_parts = ($parent | path split)
+    let child_parts = (navigation-path-components $child)
+    let parent_parts = (navigation-path-components $parent)
     ($child_parts | length) >= ($parent_parts | length) and (
         ($child_parts | take ($parent_parts | length)) == $parent_parts
     )
+}
+
+# Canonicalize the nearest surviving ancestor, then append missing components.
+# A removed worktree cannot itself be canonicalized; on Windows, temporary
+# directory aliases can otherwise differ between existing and missing paths.
+def navigation-path-components [path: string] {
+    mut ancestor = ($path | path expand --no-symlink)
+    mut suffix = []
+    while not ($ancestor | path exists) {
+        let parent = ($ancestor | path dirname)
+        if $parent == $ancestor { break }
+        $suffix = ([($ancestor | path basename)] | append $suffix)
+        $ancestor = $parent
+    }
+    ($ancestor | path expand | path split) | append $suffix
 }
 
 # Read the NUL-delimited navigation record written by wt-core. This keeps
