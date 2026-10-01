@@ -283,6 +283,24 @@ exact repository state without creating or managing a local branch. `--cache-roo
 keeps a conservative bare mirror cache per repository slug; `--object-source`
 uses a read-only bare repository instead and takes precedence over cache use.
 
+Local sources are copied without hardlinks or object alternates, so the workspace
+remains independent of later source pruning or removal. Sources with object
+alternates or symlinked repository/object paths are rejected; Git's local-clone
+ownership checks also apply. Keep an external `--object-source` stable during
+materialization (do not concurrently refresh or prune it). Managed cache refresh
+and checkout remain serialized by the cache lock. Local materialization requires
+a writable workspace parent. New destinations are atomically claimed at their
+requested path, so native parent access controls apply directly; failed checkouts
+remove that newly created task-owned directory only after checking its captured
+identity. If the root is moved, replaced, or cannot be identified, materialization
+fails without deleting the unexpected destination or chasing the moved root.
+Existing empty destinations
+are populated in place via a protocol clone of the verified snapshot, retaining
+native access controls and directory identity on every platform. This compatibility
+path uses private sibling staging and does not receive the local-copy speedup.
+Failures clean up staging without deleting existing destination contents; an in-place failure
+can leave partial Git output in an existing destination.
+
 ```
 wt materialize \
   --repo-slug owner/repo \

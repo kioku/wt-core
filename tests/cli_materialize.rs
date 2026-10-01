@@ -331,15 +331,29 @@ fn concurrent_cached_materializations_share_cache_safely() {
     let workspace_one = root.path().join("workspace-one");
     let workspace_two = root.path().join("workspace-two");
     let origin_url = file_url(&repo.origin_path());
+    git_output(
+        &["push", "origin", "HEAD:refs/heads/obsolete"],
+        &repo.path(),
+    );
+    let initial = root.path().join("initial");
+    materialize_cached(&repo, &sha, &cache_root, &initial);
+    git_output(&["push", "origin", ":refs/heads/obsolete"], &repo.path());
 
     let first = spawn_materialize(&sha, &origin_url, &cache_root, &workspace_one);
     let second = spawn_materialize(&sha, &origin_url, &cache_root, &workspace_two);
     first.join().expect("first thread panicked");
     second.join().expect("second thread panicked");
 
-    assert_eq!(git_output(&["rev-parse", "HEAD"], &workspace_one), sha);
-    assert_eq!(git_output(&["rev-parse", "HEAD"], &workspace_two), sha);
-    assert!(cache_root.join("owner__repo.git").is_dir());
+    assert_checkout(&workspace_one, &sha);
+    assert_checkout(&workspace_two, &sha);
+    let cache = cache_root.join("owner__repo.git");
+    assert!(!git_success(
+        &["show-ref", "--verify", "refs/heads/obsolete"],
+        &cache
+    ));
+    #[cfg(unix)]
+    assert_independent_files(&cache, &workspace_one.join(".git"));
+    assert!(!cache_root.join("owner__repo.git.lock").exists());
 }
 
 fn spawn_materialize(
@@ -371,4 +385,707 @@ fn spawn_materialize(
             .assert()
             .success();
     })
+}
+
+fn materialize_object(source: &Path, sha: &str, workspace: &Path) -> Command {
+    let mut command = wt_core();
+    command
+        .args([
+            "materialize",
+            "--repo-slug",
+            "owner/repo",
+            "--object-source",
+        ])
+        .arg(source)
+        .args(["--sha", sha, "--workspace-root"])
+        .arg(workspace);
+    command
+}
+
+fn assert_checkout(workspace: &Path, sha: &str) {
+    assert_eq!(git_output(&["rev-parse", "HEAD"], workspace), sha);
+    assert_eq!(git_output(&["status", "--porcelain"], workspace), "");
+    assert!(!git_success(&["symbolic-ref", "-q", "HEAD"], workspace));
+    assert!(!workspace.join(".git/objects/info/alternates").exists());
+    git_output(&["fsck", "--full"], workspace);
+}
+
+#[cfg(unix)]
+fn assert_independent_files(source: &Path, destination: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    for entry in std::fs::read_dir(destination).expect("read directory") {
+        let entry = entry.expect("directory entry");
+        let src = source.join(entry.file_name());
+        let dst = entry.path();
+        let metadata = std::fs::symlink_metadata(&dst).expect("metadata");
+        if metadata.is_dir() {
+            assert_independent_files(&src, &dst);
+        } else if metadata.is_file() && src.is_file() {
+            let original = std::fs::metadata(&src).expect("source metadata");
+            assert_ne!(
+                (metadata.dev(), metadata.ino()),
+                (original.dev(), original.ino())
+            );
+            assert_eq!(metadata.nlink(), 1, "shared file: {}", dst.display());
+        }
+    }
+}
+
+#[test]
+fn local_copy_owns_loose_and_packed_objects_and_metadata_after_source_pruning() {
+    for (packed, existed) in [(false, false), (false, true), (true, false), (true, true)] {
+        let repo = fixtures::ClonedTestRepo::new();
+        let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+        fixtures::commit_file(&repo.path(), "new.txt", "new head", "new commit");
+        git_output(&["push", "origin", "main"], &repo.path());
+        let root = tempfile::tempdir().expect("temp dir");
+        let source = root.path().join("source.git");
+        git_output(
+            &[
+                "clone",
+                "--bare",
+                "--no-hardlinks",
+                &repo.origin_path().display().to_string(),
+                &source.display().to_string(),
+            ],
+            root.path(),
+        );
+        if packed {
+            git_output(&["repack", "-ad"], &source);
+        }
+        let workspace = root.path().join("workspace");
+        if existed {
+            std::fs::create_dir(&workspace).expect("empty workspace");
+        }
+        materialize_object(&source, &sha, &workspace)
+            .assert()
+            .success();
+        assert_checkout(&workspace, &sha);
+        #[cfg(unix)]
+        assert_independent_files(&source, &workspace.join(".git"));
+        let original_config = std::fs::read(source.join("config")).expect("source config");
+        git_output(&["config", "materialize.test", "changed"], &workspace);
+        assert_eq!(
+            std::fs::read(source.join("config")).expect("source config"),
+            original_config
+        );
+        git_output(&["update-ref", "-d", "refs/heads/main"], &source);
+        git_output(&["reflog", "expire", "--expire=now", "--all"], &source);
+        git_output(&["gc", "--prune=now"], &source);
+        assert_checkout(&workspace, &sha);
+        std::fs::remove_dir_all(&source).expect("remove private source");
+        assert_checkout(&workspace, &sha);
+    }
+}
+
+#[test]
+fn local_copy_accepts_empty_destination_with_trailing_dot() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let spelling = PathBuf::from(format!("{}/.", workspace.display()));
+    materialize_object(&repo.origin_path(), &sha, &spelling)
+        .assert()
+        .success();
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_preserves_private_empty_destination_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o700))
+        .expect("private workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    assert_eq!(
+        std::fs::metadata(&workspace)
+            .expect("workspace metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_preserves_empty_destination_group() {
+    use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let original_group = std::fs::metadata(&workspace).expect("metadata").gid();
+    let groups = StdCommand::new("id")
+        .arg("-G")
+        .output()
+        .expect("list groups");
+    assert!(groups.status.success());
+    let Some(group) = String::from_utf8(groups.stdout)
+        .expect("group ids")
+        .split_whitespace()
+        .filter_map(|group| group.parse::<u32>().ok())
+        .find(|group| *group != original_group)
+    else {
+        // Changing directory groups requires membership in another group.
+        return;
+    };
+    chown(&workspace, None, Some(group)).expect("set workspace group");
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o770))
+        .expect("group-private workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    let metadata = std::fs::metadata(&workspace).expect("workspace metadata");
+    assert_eq!(metadata.gid(), group);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o770);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[test]
+fn local_copy_rejects_alternates_without_leaving_workspace_or_staging() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let source = root.path().join("shared.git");
+    git_output(
+        &[
+            "clone",
+            "--bare",
+            "--shared",
+            &repo.origin_path().display().to_string(),
+            &source.display().to_string(),
+        ],
+        root.path(),
+    );
+    let workspace = root.path().join("workspace");
+    materialize_object(&source, &sha, &workspace)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("alternates"));
+    assert!(!workspace.exists());
+    assert_no_staging(root.path());
+}
+
+fn assert_no_staging(parent: &Path) {
+    assert!(std::fs::read_dir(parent)
+        .expect("read parent")
+        .all(|entry| !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".wt-materialize-")));
+}
+
+#[test]
+fn local_checkout_failure_preserves_empty_destination_and_cleans_staging() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path()).to_uppercase();
+    let root = tempfile::tempdir().expect("temp dir");
+    for existed in [false, true] {
+        let workspace = root.path().join(if existed { "empty" } else { "missing" });
+        if existed {
+            std::fs::create_dir(&workspace).expect("empty workspace");
+        }
+        // Git accepts uppercase full SHAs, but the existing exact-SHA contract
+        // rejects the lowercase resolved HEAD. This fails after clone/checkout.
+        materialize_object(&repo.origin_path(), &sha, &workspace)
+            .assert()
+            .failure()
+            .code(4);
+        assert_eq!(workspace.exists(), existed);
+        if existed {
+            assert_eq!(
+                std::fs::read_dir(&workspace)
+                    .expect("empty workspace")
+                    .count(),
+                0
+            );
+        }
+        assert_no_staging(root.path());
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_rejects_symlink_source_and_object_paths() {
+    use std::os::unix::fs::symlink;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let source_link = root.path().join("source.git");
+    symlink(repo.origin_path(), &source_link).expect("source symlink");
+    let workspace = root.path().join("workspace");
+    for suffix in ["", "/", "/."] {
+        let spelling = PathBuf::from(format!("{}{suffix}", source_link.display()));
+        materialize_object(&spelling, &sha, &workspace)
+            .assert()
+            .failure()
+            .stderr(predicate::str::contains("non-symlink directory"));
+        assert!(!workspace.exists());
+        assert_no_staging(root.path());
+    }
+    let objects = repo.origin_path().join("objects");
+    let moved = repo.origin_path().join("original-objects");
+    std::fs::rename(&objects, &moved).expect("move objects");
+    symlink(&moved, &objects).expect("objects symlink");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .failure();
+    assert!(!workspace.exists());
+    assert_no_staging(root.path());
+}
+
+#[test]
+fn remote_only_materialization_keeps_detached_clean_contract() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    let output = wt_core()
+        .args(["materialize", "--repo-slug", "owner/repo", "--remote-url"])
+        .arg(file_url(&repo.origin_path()))
+        .args(["--sha", &sha, "--workspace-root"])
+        .arg(&workspace)
+        .arg("--json")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: serde_json::Value = serde_json::from_slice(&output).expect("json");
+    assert_eq!(json["source"], "remote");
+    assert_eq!(json["cache_status"], "bypassed");
+    assert_checkout(&workspace, &sha);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_copy_preserves_empty_destination_access_and_default_acls() {
+    use std::os::unix::fs::MetadataExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    // The normal test filesystem may have ACLs disabled; Linux tmpfs supports
+    // them, so exercise the security regression there when available.
+    let root = tempfile::tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    let owner = std::fs::metadata(&workspace).expect("metadata").uid();
+    let denied_user = if owner == 65534 { 65533 } else { 65534 };
+    // Linux POSIX ACL xattr format: version 2, then (tag, permissions, id).
+    // A named-user deny must survive even though mode bits permit others.
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (1_u16, 7_u16, u32::MAX),
+        (2, 0, denied_user),
+        (4, 5, u32::MAX),
+        (16, 5, u32::MAX),
+        (32, 5, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    if let Err(error) = xattr::set(&workspace, "system.posix_acl_access", &acl) {
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        panic!("set access ACL: {error}");
+    }
+    xattr::set(&workspace, "system.posix_acl_default", &acl).expect("set default ACL");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    for path in [&workspace, &workspace.join(".git")] {
+        assert_eq!(
+            xattr::get(path, "system.posix_acl_access").expect("access ACL"),
+            Some(acl.clone())
+        );
+        assert_eq!(
+            xattr::get(path, "system.posix_acl_default").expect("default ACL"),
+            Some(acl.clone())
+        );
+    }
+    // Regular files inherit the named-user restriction, with a narrower mask.
+    let file_acl = xattr::get(workspace.join(".git/config"), "system.posix_acl_access")
+        .expect("file ACL")
+        .expect("inherited file ACL");
+    assert_eq!(&file_acl[12..20], &acl[12..20]);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn local_copy_does_not_add_parent_acls_to_existing_destination() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir_in("/dev/shm")
+        .or_else(|_| tempfile::tempdir())
+        .expect("temp dir");
+    let owner = std::fs::metadata(root.path()).expect("metadata").uid();
+    let extra_user = if owner == 65534 { 65533 } else { 65534 };
+    let mut acl = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (1_u16, 7_u16, u32::MAX),
+        (2, 7, extra_user),
+        (4, 5, u32::MAX),
+        (16, 7, u32::MAX),
+        (32, 0, u32::MAX),
+    ] {
+        acl.extend(tag.to_le_bytes());
+        acl.extend(permissions.to_le_bytes());
+        acl.extend(id.to_le_bytes());
+    }
+    if let Err(error) = xattr::set(root.path(), "system.posix_acl_default", &acl) {
+        if error.raw_os_error() == Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        panic!("set parent default ACL: {error}");
+    }
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    // Deliberately opt this destination out of the parent's named-user grant.
+    for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+        xattr::remove(&workspace, name).expect("remove inherited ACL");
+    }
+    std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o770))
+        .expect("group-private workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    for path in [
+        &workspace,
+        &workspace.join(".git"),
+        &workspace.join(".git/config"),
+    ] {
+        for name in ["system.posix_acl_access", "system.posix_acl_default"] {
+            assert_eq!(xattr::get(path, name).expect("inspect ACL"), None);
+        }
+    }
+    assert_eq!(
+        std::fs::metadata(&workspace)
+            .expect("metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o770
+    );
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[test]
+fn local_copy_populates_existing_destination_without_changing_access_controls() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    #[cfg(target_os = "macos")]
+    {
+        // A named-user deny is not represented by fs::Permissions or uid/gid.
+        assert!(StdCommand::new("chmod")
+            .args(["+a", "nobody deny read,execute"])
+            .arg(&workspace)
+            .status()
+            .expect("set native ACL")
+            .success());
+    }
+    let before = std::fs::metadata(&workspace).expect("metadata");
+    #[cfg(target_os = "macos")]
+    let acl_before = StdCommand::new("ls")
+        .arg("-lde")
+        .arg(&workspace)
+        .output()
+        .expect("inspect native ACL");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    assert_checkout(&workspace, &sha);
+    assert_eq!(
+        git_output(&["remote", "get-url", "origin"], &workspace),
+        repo.origin_path()
+            .canonicalize()
+            .expect("source path")
+            .display()
+            .to_string()
+    );
+    let after = std::fs::metadata(&workspace).expect("metadata");
+    assert_eq!(before.permissions(), after.permissions());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let acl_after = StdCommand::new("ls")
+            .arg("-lde")
+            .arg(&workspace)
+            .output()
+            .expect("inspect native ACL");
+        assert!(acl_before.status.success() && acl_after.status.success());
+        // Directory size/timestamps change when populated; compare ACL entries.
+        let entries = |bytes: &[u8]| {
+            String::from_utf8_lossy(bytes)
+                .lines()
+                .skip(1)
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(entries(&acl_before.stdout), entries(&acl_after.stdout));
+    }
+    assert_no_staging(root.path());
+}
+
+#[test]
+fn existing_destination_receives_unreferenced_commit_from_verified_snapshot() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let source = repo.origin_path();
+    git_output(&["update-ref", "-d", "refs/heads/main"], &source);
+    let root = tempfile::tempdir().expect("temp dir");
+    let workspace = root.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("empty workspace");
+    materialize_object(&source, &sha, &workspace)
+        .assert()
+        .success();
+    assert_checkout(&workspace, &sha);
+    std::fs::remove_dir_all(&source).expect("remove source");
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn new_destination_inherits_one_generation_native_deny_like_direct_clone() {
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    // The parent ACE is not effective on the parent, but denies traversal of
+    // immediate children. limit_inherit prevents inheritance by grandchildren.
+    assert!(StdCommand::new("chmod")
+        .args([
+            "+a",
+            "nobody deny read,execute,directory_inherit,only_inherit,limit_inherit",
+        ])
+        .arg(root.path())
+        .status()
+        .expect("set one-generation native ACL")
+        .success());
+    let protocol = root.path().join("protocol");
+    git_output(
+        &[
+            "clone",
+            "--no-local",
+            "--no-checkout",
+            &repo.origin_path().display().to_string(),
+            &protocol.display().to_string(),
+        ],
+        root.path(),
+    );
+    let entries = |path: &Path| {
+        let output = StdCommand::new("ls")
+            .arg("-lde")
+            .arg(path)
+            .output()
+            .expect("inspect native ACL");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("native ACL text")
+            .lines()
+            .skip(1)
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let expected = entries(&protocol);
+    assert!(
+        expected.contains("user:nobody inherited deny list,search"),
+        "{expected}"
+    );
+    // Demonstrate why nesting then renaming is incompatible: the second
+    // generation lacks the deny, and moving it does not restore inheritance.
+    let staging = root.path().join("staging");
+    std::fs::create_dir(&staging).expect("staging");
+    let nested = staging.join("workspace");
+    std::fs::create_dir(&nested).expect("nested root");
+    let moved = root.path().join("moved");
+    std::fs::rename(&nested, &moved).expect("move nested root");
+    assert!(!entries(&moved).contains("user:nobody"));
+    let workspace = root.path().join("workspace");
+    materialize_object(&repo.origin_path(), &sha, &workspace)
+        .assert()
+        .success();
+    assert_eq!(entries(&workspace), expected);
+    assert_checkout(&workspace, &sha);
+    assert_no_staging(root.path());
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_preserves_replaced_root_on_failure_and_rejects_replaced_success() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let real_git = StdCommand::new("sh")
+        .args(["-c", "command -v git"])
+        .output()
+        .expect("locate git");
+    assert!(real_git.status.success());
+    let real_git = String::from_utf8(real_git.stdout).expect("git path");
+    for phase in [
+        "symbolic-ref",
+        "final-verification",
+        "final-symlink-dot",
+        "final-symlink-slash",
+        "clone",
+        "symlink",
+        "missing",
+    ] {
+        let root = tempfile::tempdir().expect("temp dir");
+        let workspace = root.path().join("workspace");
+        let moved = root.path().join("moved");
+        let bin = root.path().join("bin");
+        std::fs::create_dir(&bin).expect("wrapper directory");
+        let wrapper = bin.join("git");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+if [ "$1" = symbolic-ref ] && [ ! -e "$WT_MOVED_ROOT.verified" ] && { [ "$WT_REPLACEMENT" = final-verification ] || [ "$WT_REPLACEMENT" = final-symlink-dot ] || [ "$WT_REPLACEMENT" = final-symlink-slash ]; }; then
+    touch "$WT_MOVED_ROOT.verified" || exit 94
+    exec "$WT_REAL_GIT" "$@"
+fi
+if [ "$1" = "$WT_REPLACE_PHASE" ] && [ ! -e "$WT_MOVED_ROOT" ]; then
+    if [ "$WT_REPLACEMENT" = symlink ] || [ "$WT_REPLACEMENT" = missing ] || [ "$WT_REPLACEMENT" = final-symlink-dot ] || [ "$WT_REPLACEMENT" = final-symlink-slash ]; then
+        mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
+        printf 'unrelated data' > "$WT_MOVED_ROOT/user-data"
+        if [ "$WT_REPLACEMENT" != missing ]; then
+            ln -s "$WT_MOVED_ROOT" "$WT_WORKSPACE" || exit 91
+        fi
+        exit 93
+    fi
+    if [ "$1" = symbolic-ref ]; then
+        "$WT_REAL_GIT" "$@"
+        result=$?
+        mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
+        mkdir "$WT_WORKSPACE" || exit 91
+        cp -R "$WT_MOVED_ROOT/." "$WT_WORKSPACE" || exit 92
+    else
+        mv "$WT_WORKSPACE" "$WT_MOVED_ROOT" || exit 90
+        mkdir "$WT_WORKSPACE" || exit 91
+        result=93
+    fi
+    printf 'unrelated data' > "$WT_WORKSPACE/user-data"
+    # Keep a substituted successful checkout clean as well as exact/detached.
+    if [ "$1" = symbolic-ref ]; then
+        printf '\n/user-data\n' >> "$WT_WORKSPACE/.git/info/exclude"
+    fi
+    exit "$result"
+fi
+exec "$WT_REAL_GIT" "$@"
+"#,
+        )
+        .expect("write wrapper");
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("executable wrapper");
+        let paths = std::env::join_paths(std::iter::once(bin).chain(std::env::split_paths(
+            &std::env::var_os("PATH").expect("PATH"),
+        )))
+        .expect("wrapper PATH");
+        let spelling = match phase {
+            "final-symlink-dot" => PathBuf::from(format!("{}/.", workspace.display())),
+            "final-symlink-slash" => PathBuf::from(format!("{}/", workspace.display())),
+            _ => workspace.clone(),
+        };
+        materialize_object(&repo.origin_path(), &sha, &spelling)
+            .env("PATH", paths)
+            .env("WT_REAL_GIT", real_git.trim())
+            .env(
+                "WT_REPLACE_PHASE",
+                if matches!(
+                    phase,
+                    "symbolic-ref"
+                        | "final-verification"
+                        | "final-symlink-dot"
+                        | "final-symlink-slash"
+                ) {
+                    "symbolic-ref"
+                } else {
+                    "clone"
+                },
+            )
+            .env("WT_REPLACEMENT", phase)
+            .env("WT_WORKSPACE", &workspace)
+            .env("WT_MOVED_ROOT", &moved)
+            .assert()
+            .failure();
+        let preserved = if phase == "missing" {
+            &moved
+        } else {
+            &workspace
+        };
+        assert_eq!(
+            std::fs::read_to_string(preserved.join("user-data")).expect("preserved replacement"),
+            "unrelated data"
+        );
+        if matches!(
+            phase,
+            "symlink" | "final-symlink-dot" | "final-symlink-slash"
+        ) {
+            assert!(std::fs::symlink_metadata(&workspace)
+                .expect("preserved symlink")
+                .file_type()
+                .is_symlink());
+        }
+        if phase == "missing" {
+            assert!(!workspace.exists());
+        }
+        assert!(moved.is_dir(), "do not chase and delete a moved task root");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn local_copy_reports_new_root_io_failure_as_git_error() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    let root = tempfile::tempdir().expect("temp dir");
+    let permissions = std::fs::metadata(root.path())
+        .expect("metadata")
+        .permissions();
+    std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o500))
+        .expect("read-only parent");
+    let workspace = root.path().join("workspace");
+    // Privileged users can bypass the fixture's write restriction.
+    let probe = std::fs::create_dir(root.path().join("probe"));
+    let output = if probe.is_err() {
+        Some(materialize_object(&repo.origin_path(), &sha, &workspace).output())
+    } else {
+        None
+    };
+    std::fs::set_permissions(root.path(), permissions).expect("restore parent permissions");
+    if let Some(output) = output {
+        let output = output.expect("run materialize");
+        assert_eq!(output.status.code(), Some(2));
+        assert!(!workspace.exists());
+    }
 }

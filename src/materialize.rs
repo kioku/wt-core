@@ -110,6 +110,9 @@ pub fn materialize(options: MaterializeOptions) -> Result<MaterializeResult> {
 
     let source_result = materialize_from_best_source(&request, &cache_path, &mut timings)?;
     let resolved_commit = verify_workspace(&request.workspace_root, &request.sha)?;
+    if let Some(root) = &source_result.workspace_identity {
+        verify_new_workspace_identity(&request.workspace_root, root)?;
+    }
     timings.total = elapsed_ms(started);
 
     Ok(MaterializeResult {
@@ -129,6 +132,9 @@ pub fn materialize(options: MaterializeOptions) -> Result<MaterializeResult> {
 struct SourceResult {
     cache_status: &'static str,
     source: &'static str,
+    // Retain fresh-root ownership through the public entry point's final Git
+    // verification, not just through the local clone helper.
+    workspace_identity: Option<same_file::Handle>,
 }
 
 fn materialize_from_best_source(
@@ -137,18 +143,21 @@ fn materialize_from_best_source(
     timings: &mut MaterializeTimings,
 ) -> Result<SourceResult> {
     if let Some(source) = &request.object_source {
-        materialize_from_object_source(source, request, timings)?;
+        let workspace_identity = materialize_from_object_source(source, request, timings)?;
         return Ok(SourceResult {
             cache_status: "bypassed",
             source: "object_source",
+            workspace_identity,
         });
     }
 
     if let Some(cache_path) = cache_path {
-        let cache_status = materialize_from_cache(cache_path, request, timings)?;
+        let (cache_status, workspace_identity) =
+            materialize_from_cache(cache_path, request, timings)?;
         return Ok(SourceResult {
             cache_status,
             source: "cache",
+            workspace_identity,
         });
     }
 
@@ -156,6 +165,7 @@ fn materialize_from_best_source(
     Ok(SourceResult {
         cache_status: "bypassed",
         source: "remote",
+        workspace_identity: None,
     })
 }
 
@@ -163,20 +173,20 @@ fn materialize_from_object_source(
     source: &Path,
     request: &ValidatedOptions,
     timings: &mut MaterializeTimings,
-) -> Result<()> {
+) -> Result<Option<same_file::Handle>> {
     verify_bare_repo(source)?;
     verify_commit_exists(source, &request.sha)?;
     let started = Instant::now();
-    clone_local_bare(source, &request.workspace_root, &request.sha)?;
+    let identity = clone_local_bare(source, &request.workspace_root, &request.sha)?;
     timings.workspace_checkout = elapsed_ms(started);
-    Ok(())
+    Ok(identity)
 }
 
 fn materialize_from_cache(
     cache_path: &Path,
     request: &ValidatedOptions,
     timings: &mut MaterializeTimings,
-) -> Result<&'static str> {
+) -> Result<(&'static str, Option<same_file::Handle>)> {
     let remote_url = request
         .remote_url
         .as_deref()
@@ -198,9 +208,9 @@ fn materialize_from_cache(
 
     verify_commit_exists(cache_path, &request.sha)?;
     let checkout_started = Instant::now();
-    clone_local_bare(cache_path, &request.workspace_root, &request.sha)?;
+    let identity = clone_local_bare(cache_path, &request.workspace_root, &request.sha)?;
     timings.workspace_checkout = elapsed_ms(checkout_started);
-    Ok(cache_status)
+    Ok((cache_status, identity))
 }
 
 fn materialize_from_remote(
@@ -520,6 +530,7 @@ fn verify_bare_repo(path: &Path) -> Result<()> {
         )));
     }
 
+    let path = independent_local_source(path)?;
     let output = run_git_owned(
         vec![
             os("--git-dir"),
@@ -553,19 +564,154 @@ fn verify_commit_exists(git_dir: &Path, sha: &str) -> Result<()> {
     Ok(())
 }
 
-fn clone_local_bare(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+/// Local clones must own their objects, including when the source uses alternates.
+/// Git additionally rejects foreign-owned sources and symlinks in the object tree.
+fn independent_local_source(source: &Path) -> Result<PathBuf> {
+    // Strip trailing separators and `.` components before lstat: otherwise
+    // the OS follows a final repository symlink despite symlink_metadata.
+    let source: PathBuf = source.components().collect();
+    let metadata = fs::symlink_metadata(&source)
+        .map_err(|e| AppError::git(format!("cannot inspect local source: {e}")))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(AppError::usage(
+            "local source must be a non-symlink directory",
+        ));
+    }
+    let source = fs::canonicalize(&source)
+        .map_err(|e| AppError::git(format!("cannot resolve local source: {e}")))?;
+    match fs::symlink_metadata(source.join("objects/info/alternates")) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(source),
+        Err(e) => Err(AppError::git(format!(
+            "cannot inspect source alternates: {e}"
+        ))),
+        Ok(_) => Err(AppError::usage(
+            "local source must not use object alternates",
+        )),
+    }
+}
+
+fn clone_local_bare(
+    source: &Path,
+    workspace: &Path,
+    sha: &str,
+) -> Result<Option<same_file::Handle>> {
+    // Treat a final `/.` as the directory entry for creation and cloning.
+    let normalized_workspace: PathBuf = workspace.components().collect();
+    let workspace = normalized_workspace.as_path();
+    ensure_workspace_available(workspace)?;
+    let source = independent_local_source(source)?;
     create_workspace_parent(workspace)?;
+    let parent = workspace
+        .parent()
+        .ok_or_else(|| AppError::usage("--workspace-root has no parent directory"))?;
+    if !workspace.exists() {
+        return clone_new_workspace(&source, workspace, sha).map(Some);
+    }
+    // Preverify existing-directory checkouts privately. Keep the cache lock
+    // throughout, and remove only this task-owned staging tree on failure.
+    let staging = tempfile::Builder::new()
+        .prefix(".wt-materialize-")
+        .tempdir_in(parent)
+        .map_err(|e| AppError::git(format!("cannot stage local checkout: {e}")))?;
+    let checkout = staging.path().join("workspace");
+    clone_independent_checkout(&source, &checkout, sha)?;
+    ensure_workspace_available(workspace)?;
+    // Populate the original directory in place: replacing it would lose
+    // native ACLs, security labels, and other filesystem-specific controls.
+    // Clone the verified private snapshot via the protocol so even an old,
+    // now-unreferenced requested commit (the snapshot's HEAD) is transferred.
+    // Do not recursively clean this user-owned destination on failure.
     run_git_owned(
         vec![
             os("clone"),
             os("--no-local"),
+            os("--no-checkout"),
+            checkout.join(".git").as_os_str().to_os_string(),
+            workspace.as_os_str().to_os_string(),
+        ],
+        None,
+    )?;
+    run_git_owned(
+        vec![
+            os("remote"),
+            os("set-url"),
+            os("origin"),
+            source.as_os_str().to_os_string(),
+        ],
+        Some(workspace),
+    )?;
+    independent_local_source(&workspace.join(".git"))?;
+    checkout_detached(workspace, sha)?;
+    verify_workspace(workspace, sha)?;
+    Ok(None)
+}
+
+/// Claim a fresh root at its final path and clean only our own output on failure.
+fn clone_new_workspace(source: &Path, workspace: &Path, sha: &str) -> Result<same_file::Handle> {
+    // Creating under the actual parent preserves one-generation native ACLs and
+    // path-based labels; renaming a nested checkout would not re-inherit them.
+    fs::create_dir(workspace).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => {
+            AppError::conflict(format!("cannot claim new workspace: {e}"))
+        }
+        _ => AppError::git(format!("cannot create new workspace: {e}")),
+    })?;
+    // Keep the handle open so directory IDs cannot be recycled during Git's
+    // execution. If capture fails, preserve the root rather than guess ownership.
+    let root = same_file::Handle::from_path(workspace)
+        .map_err(|e| AppError::git(format!("cannot capture new workspace identity: {e}")))?;
+    let result = clone_independent_checkout(source, workspace, sha);
+    verify_new_workspace_identity(workspace, &root)?;
+    if result.is_err() {
+        fs::remove_dir_all(workspace)
+            .map_err(|e| AppError::git(format!("cannot clean failed new workspace: {e}")))?;
+    }
+    result.map(|()| root)
+}
+
+/// Fail closed if the requested entry disappeared, became a symlink, or changed
+/// identity. This bounds ordinary root-replacement cleanup; it is not a lock
+/// against a same-privilege actor racing every filesystem operation.
+fn verify_new_workspace_identity(workspace: &Path, root: &same_file::Handle) -> Result<()> {
+    // Inspect the root entry itself even when the public request ends in `/`
+    // or `/.`; those spellings otherwise make lstat follow a replacement link.
+    let workspace: PathBuf = workspace.components().collect();
+    let workspace = workspace.as_path();
+    let metadata = fs::symlink_metadata(workspace)
+        .map_err(|e| AppError::git(format!("cannot inspect new workspace identity: {e}")))?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(AppError::conflict(
+            "new workspace root was replaced; preserving unexpected destination",
+        ));
+    }
+    let current = same_file::Handle::from_path(workspace)
+        .map_err(|e| AppError::git(format!("cannot inspect new workspace identity: {e}")))?;
+    if &current != root {
+        return Err(AppError::conflict(
+            "new workspace root was replaced; preserving unexpected destination",
+        ));
+    }
+    Ok(())
+}
+
+/// Copy objects and mutable metadata independently, then verify before success.
+fn clone_independent_checkout(source: &Path, workspace: &Path, sha: &str) -> Result<()> {
+    run_git_owned(
+        vec![
+            os("clone"),
+            os("--local"),
+            os("--no-hardlinks"),
             os("--no-checkout"),
             source.as_os_str().to_os_string(),
             workspace.as_os_str().to_os_string(),
         ],
         None,
     )?;
-    checkout_detached(workspace, sha)
+    // Defense in depth: never publish a clone that depends on source objects.
+    independent_local_source(&workspace.join(".git"))?;
+    checkout_detached(workspace, sha)?;
+    verify_workspace(workspace, sha)?;
+    Ok(())
 }
 
 fn checkout_from_remote(
