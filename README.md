@@ -285,6 +285,11 @@ uses a read-only bare repository instead and takes precedence over cache use.
 Checkout uses up to four Git workers, retaining Git's small-checkout threshold.
 This setting applies only to the checkout command; it does not change repository
 configuration, cache refresh policy, or object-copy independence.
+For checkouts with at least 1,000 indexed entries, each cleanliness verification
+uses four read-only Git status processes. Git's timestamp and content checks
+remain enabled, and both verification passes still run. These checks do not
+refresh the on-disk index's stat cache; a later Git status may perform that refresh.
+Smaller checkouts use the normal single-process status check.
 
 Local sources are copied without hardlinks or object alternates, so the workspace
 remains independent of later source pruning or removal. Sources with object

@@ -12,6 +12,19 @@ use crate::git;
 
 const CACHE_LOCK_TIMEOUT: Duration = Duration::from_secs(30);
 const CACHE_LOCK_RETRY: Duration = Duration::from_millis(50);
+const PARALLEL_STATUS_THRESHOLD: usize = 1_000;
+// Match final path components, not repository-specific directory names. The
+// exclusion-only shard is the complement, including punctuation and Unicode.
+const STATUS_PATH_GROUPS: [&[&str]; 4] = [
+    &[":(top,glob)**/[a-eA-E]*"],
+    &[":(top,glob)**/[f-mF-M]*"],
+    &[":(top,glob)**/[n-rN-R]*"],
+    &[
+        ":(top,glob,exclude)**/[a-eA-E]*",
+        ":(top,glob,exclude)**/[f-mF-M]*",
+        ":(top,glob,exclude)**/[n-rN-R]*",
+    ],
+];
 
 #[derive(Debug)]
 pub struct MaterializeOptions {
@@ -760,8 +773,7 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
         )));
     }
 
-    let status = run_git_owned(vec![os("status"), os("--porcelain")], Some(workspace))?;
-    if !status.is_empty() {
+    if workspace_is_dirty(workspace)? {
         return Err(AppError::conflict(
             "materialized workspace is not clean".to_string(),
         ));
@@ -779,9 +791,68 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
     Ok(head)
 }
 
+/// Keep Git's racy-index/content validation, but split large checks across four
+/// read-only processes. Optional index writes must be disabled: concurrent
+/// writers contend on index.lock and can revalidate other shards while writing.
+/// Both public and prepublication verification still run; no timestamps or
+/// assume-unchanged flags are modified. Small checkouts retain normal status.
+fn workspace_is_dirty(workspace: &Path) -> Result<bool> {
+    let entries = run_git_owned(vec![os("ls-files"), os("-z")], Some(workspace))?;
+    if entries.bytes().filter(|byte| *byte == 0).count() < PARALLEL_STATUS_THRESHOLD {
+        let status = run_git_owned(vec![os("status"), os("--porcelain")], Some(workspace))?;
+        return Ok(!status.is_empty());
+    }
+
+    let results = thread::scope(|scope| {
+        let workers: Vec<_> = STATUS_PATH_GROUPS
+            .iter()
+            .map(|paths| scope.spawn(move || status_for_paths(workspace, paths)))
+            .collect();
+        // Join every worker even if another reports dirt or a Git failure.
+        workers
+            .into_iter()
+            .map(|worker| {
+                worker.join().unwrap_or_else(|_| {
+                    Err(AppError::invariant("workspace status worker panicked"))
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let statuses = results.into_iter().collect::<Result<Vec<_>>>()?;
+    Ok(statuses.iter().any(|status| !status.is_empty()))
+}
+
+fn status_for_paths(workspace: &Path, paths: &[&str]) -> Result<String> {
+    let mut args = vec![
+        os("--no-optional-locks"),
+        os("status"),
+        os("--porcelain"),
+        os("--"),
+    ];
+    args.extend(paths.iter().map(os));
+    let mut command = Command::new("git");
+    command.args(args);
+    // These are internal magic pathspecs. In particular, inherited literal
+    // mode would treat every shard as a nonexistent literal path and falsely
+    // report a dirty workspace clean.
+    for name in [
+        "GIT_LITERAL_PATHSPECS",
+        "GIT_GLOB_PATHSPECS",
+        "GIT_NOGLOB_PATHSPECS",
+        "GIT_ICASE_PATHSPECS",
+    ] {
+        command.env_remove(name);
+    }
+    run_git_command(command, Some(workspace))
+}
+
 fn run_git_owned(args: Vec<OsString>, cwd: Option<&Path>) -> Result<String> {
     let mut command = Command::new("git");
     command.args(args);
+    run_git_command(command, cwd)
+}
+
+fn run_git_command(mut command: Command, cwd: Option<&Path>) -> Result<String> {
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
