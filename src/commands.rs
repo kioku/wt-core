@@ -348,22 +348,46 @@ fn list_stats(
         None => git::resolve_mainline_readonly(repo)?,
     };
 
-    Ok(worktrees
-        .iter()
-        .map(|wt| match &wt.branch {
-            Some(branch) => git::worktree_stats(repo, &base, branch).map_or_else(
-                |_| WorktreeStatsStatus::Unavailable {
-                    base: base.clone(),
-                    reason: "git_error".to_string(),
-                },
-                WorktreeStatsStatus::Available,
-            ),
-            None => WorktreeStatsStatus::Unavailable {
-                base: base.clone(),
-                reason: "no_branch".to_string(),
-            },
-        })
-        .collect())
+    // Each worker runs at most one Git subprocess at a time. Disjoint output
+    // chunks retain Git's listing order regardless of completion order.
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(4)
+        .min(worktrees.len().max(1));
+    let chunk_size = worktrees.len().max(1).div_ceil(workers);
+    let mut results = vec![
+        WorktreeStatsStatus::Unavailable {
+            base: base.clone(),
+            reason: "no_branch".to_string(),
+        };
+        worktrees.len()
+    ];
+    std::thread::scope(|scope| {
+        for (trees, output) in worktrees
+            .chunks(chunk_size)
+            .zip(results.chunks_mut(chunk_size))
+        {
+            let base = &base;
+            scope.spawn(move || {
+                for (wt, slot) in trees.iter().zip(output) {
+                    *slot = match &wt.branch {
+                        Some(branch) => git::worktree_stats(repo, base, branch).map_or_else(
+                            |_| WorktreeStatsStatus::Unavailable {
+                                base: base.clone(),
+                                reason: "git_error".to_string(),
+                            },
+                            WorktreeStatsStatus::Available,
+                        ),
+                        None => WorktreeStatsStatus::Unavailable {
+                            base: base.clone(),
+                            reason: "no_branch".to_string(),
+                        },
+                    };
+                }
+            });
+        }
+    });
+    Ok(results)
 }
 
 fn print_list_default(worktrees: &[domain::Worktree], cwd: Option<&std::path::Path>) {

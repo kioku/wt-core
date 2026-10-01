@@ -22,12 +22,26 @@ def --wrapped wt [
 # complete path components instead of treating successful normalization as a
 # containment proof.
 def path-is-within [child: string parent: string] {
-    let child = ($child | path expand)
-    let parent = ($parent | path expand)
-    if $child == $parent { true } else {
-        let prefix = if $parent == "/" { "/" } else { $"($parent)/" }
-        $child | str starts-with $prefix
+    let child_parts = (navigation-path-components $child)
+    let parent_parts = (navigation-path-components $parent)
+    ($child_parts | length) >= ($parent_parts | length) and (
+        ($child_parts | take ($parent_parts | length)) == $parent_parts
+    )
+}
+
+# Canonicalize the nearest surviving ancestor, then append missing components.
+# A removed worktree cannot itself be canonicalized; on Windows, temporary
+# directory aliases can otherwise differ between existing and missing paths.
+def navigation-path-components [path: string] {
+    mut ancestor = ($path | path expand --no-symlink)
+    mut suffix = []
+    while not ($ancestor | path exists) {
+        let parent = ($ancestor | path dirname)
+        if $parent == $ancestor { break }
+        $suffix = ([($ancestor | path basename)] | append $suffix)
+        $ancestor = $parent
     }
+    ($ancestor | path expand | path split) | append $suffix
 }
 
 # Read the NUL-delimited navigation record written by wt-core. This keeps
@@ -39,8 +53,7 @@ def read-navigation [file: path] {
 }
 
 def navigation-file [] {
-    let tmpdir = ($env.TMPDIR? | default "/tmp")
-    ^mktemp $"($tmpdir)/wt-core-nav.XXXXXX" | str trim
+    mktemp --tmpdir "wt-core-nav.XXXXXX"
 }
 
 # Capture the complete child result so structured stdout is not discarded
@@ -59,10 +72,10 @@ def run-core [args: list<string>] {
 }
 
 def forward-core-failure [result: record] {
-    # External printf writes survive Nushell's error unwinding, unlike values
-    # emitted by a pipeline that is later caught by the caller.
+    # Print directly rather than returning a pipeline value: stdout must survive
+    # the error raised after forwarding, without requiring a POSIX executable.
     if not ($result.stdout | is-empty) {
-        ^printf "%s" $result.stdout
+        print --raw --no-newline $result.stdout
     }
     if not ($result.stderr | is-empty) {
         print --raw --no-newline --stderr $result.stderr
@@ -191,7 +204,7 @@ export def --env "wt remove" [
         let child = (^wt-core ...$full_args | complete)
         if $child.exit_code != 0 {
             cd $cwd_before
-            ^rm -f $nav_file
+            rm --force $nav_file
             forward-core-failure $child
             error make {msg: ($child.stderr | str trim | default $"wt-core exited with ($child.exit_code)")}
         }
@@ -211,7 +224,7 @@ export def --env "wt remove" [
         } else {
             cd $cwd_before
         }
-        ^rm -f $nav_file
+        rm --force $nav_file
         $output
     } else {
         # --print-paths allows the interactive picker to render on
@@ -238,7 +251,7 @@ export def --env "wt remove" [
         let full_args = (build-args $args $effective_repo false false | append ["--print-paths" "--navigation-file" $nav_file])
         let output = try { run-core $full_args } catch { |err|
             cd $cwd_before
-            ^rm -f $nav_file
+            rm --force $nav_file
             error make $err
         }
         let lines = ($output | lines)
@@ -251,7 +264,7 @@ export def --env "wt remove" [
             []
         }
         let branch_deleted = (($navigation | get 3 | default "false") == "true")
-        ^rm -f $nav_file
+        rm --force $nav_file
 
         if (path-is-within $cwd_before $removed_path) {
             cd $repo_root
@@ -328,11 +341,11 @@ export def --env "wt merge" [
                 cd $cwd_before
             }
             forward-core-stderr $child
-            ^rm -f $nav_file
+            rm --force $nav_file
             $child.stdout | str trim
         } else {
             cd $cwd_before
-            ^rm -f $nav_file
+            rm --force $nav_file
             forward-core-failure $child
             error make {msg: ($child.stderr | str trim | default $"wt-core exited with ($child.exit_code)")}
         }
@@ -360,7 +373,7 @@ export def --env "wt merge" [
         let child = (^wt-core ...$full_args | complete)
         if $child.exit_code != 0 {
             cd $cwd_before
-            ^rm -f $nav_file
+            rm --force $nav_file
             forward-core-failure $child
             error make {msg: ($child.stderr | str trim | default $"wt-core exited with ($child.exit_code)")}
         }
@@ -380,7 +393,7 @@ export def --env "wt merge" [
         } else {
             cd $cwd_before
         }
-        ^rm -f $nav_file
+        rm --force $nav_file
         $output
     } else {
         # Resolve the branch before moving to the main worktree. Running the

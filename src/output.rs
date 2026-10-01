@@ -626,6 +626,16 @@ pub fn write_navigation_file_with_cleanup(
     Ok(())
 }
 
+// One CLI invocation emits at most one application-error envelope. Remember
+// command-specific responses so the top-level fallback cannot duplicate them.
+static JSON_RESPONSE_WRITTEN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a command already emitted its command-specific stdout envelope.
+pub fn json_response_written() -> bool {
+    JSON_RESPONSE_WRITTEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Serialize a value as a compact single-line JSON object to stdout.
 pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
     println!(
@@ -633,6 +643,7 @@ pub fn print_json(value: &impl Serialize) -> crate::error::Result<()> {
         serde_json::to_string(value)
             .map_err(|e| crate::error::AppError::invariant(format!("json error: {e}")))?
     );
+    JSON_RESPONSE_WRITTEN.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 

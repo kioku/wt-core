@@ -137,7 +137,8 @@ and descendant behavior follows native operating-system semantics.
 Lists all worktrees with branch, commit, and status information. The current
 worktree (based on `cwd`) is marked with `← here`. Use `--stats` to include
 commit and diff statistics for each non-main worktree against the resolved
-mainline, or `--against <rev>` to compare against another revision.
+mainline, or `--against <rev>` to compare against another revision. Stats run
+with at most four workers, bounded by available CPUs, and retain listing order.
 
 ```
 /home/user/repo                                    main                 a1b2c3d [main]
@@ -310,7 +311,14 @@ ownership checks also apply. Git creates fresh metadata using a temporary shared
 clone; all objects, including unreachable objects, are copied and the alternate
 is removed before checkout or verification. Keep an external `--object-source` stable during
 materialization (do not concurrently refresh or prune it). Managed cache refresh
-and checkout remain serialized by the cache lock. Local materialization requires
+and complete snapshot copying remain serialized by the cache lock. Once the
+snapshot owns its objects, checkout and both verification passes run outside
+cache ownership. Persistent lock files are never removed: OS-backed ownership
+and ordinary Git descendant leases make crashes recoverable without guessing
+from PID or age. Unix uses inherited file leases; Windows uses an inherited
+exclusive-sharing file handle and a native job, entered before launching Git.
+Legacy directory locks or unknown lock contents require manual inspection after
+stopping all cache users and their Git descendants; do not delete a live lock. Local materialization requires
 a writable workspace parent. New destinations are atomically claimed at their
 requested path, so native parent access controls apply directly; failed checkouts
 remove that newly created task-owned directory only after checking its captured
@@ -354,7 +362,10 @@ wt prune --mainline develop                   # backwards-compatible alias
 ### `wt doctor`
 
 Diagnoses worktree and repository health — orphaned directories, detached
-HEADs, and general consistency.
+HEADs, and general consistency. Registered worktrees outside `.worktrees` are
+checked too. Filesystem inspection failures appear as error diagnostics; JSON
+`ok` is false for those errors. The command exits successfully when it finishes
+producing diagnostics, so inspect diagnostic levels when automating health checks.
 
 ```
 wt doctor
@@ -362,7 +373,12 @@ wt doctor
 
 ## Path Convention
 
-Worktrees are placed under `<repo>/.worktrees/` with collision-safe directory names:
+Worktrees are placed under `<repo>/.worktrees/` with collision-safe directory names.
+Long branch slugs are shortened to keep each directory component at most 120
+ASCII bytes; the hash still uses the full branch name. Short names are unchanged.
+Git for Windows may still need `core.longpaths=true` for long branch ref paths
+or deeply nested repository roots; shortening the worktree slug does not shorten
+the branch name itself:
 
 ```
 <slug>--<8hex>
@@ -400,6 +416,12 @@ null prune `path` because no worktree remains. For commands other than `exec`,
 first resolution line as JSON on stderr; post-metadata stderr may contain
 inherited child diagnostics or a `wt-core` launch error if the command cannot
 be started.
+
+Application failures in JSON mode produce one stdout response. Existing command
+error schemas take precedence; otherwise the fallback contains `ok: false`,
+`message`, and the stable numeric `exit_code`. Human stderr diagnostics remain.
+Argument-parse errors remain native Clap errors, and `exec` retains its native
+child streams and stderr-only metadata contract.
 
 JSON envelope example (`add`, `go`, `remove`):
 
@@ -525,7 +547,7 @@ cargo install --path . --no-default-features
 | Dependency | Minimum Version |
 |------------|-----------------|
 | Git        | 2.39            |
-| Rust       | stable (MSRV pinned in `Cargo.toml`) |
+| Rust       | 1.85 (checked in CI) |
 | Nushell    | 0.109           |
 | Bash       | 4.4             |
 | Zsh        | 5.8             |

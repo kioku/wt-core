@@ -50,7 +50,10 @@ impl BranchName {
     /// Format: `<slug>--<8hex>`
     /// Example: `feature/auth` → `feature-auth--a1b2c3d4`
     pub fn to_dir_name(&self) -> String {
-        let slug = slugify(&self.0);
+        // Leave room for the separator and full hash within a conservative
+        // 120-byte component budget (also useful on Windows). Slugs are ASCII.
+        let mut slug = slugify(&self.0);
+        slug.truncate(110);
         let hash = hash8(&self.0);
         format!("{slug}--{hash}")
     }
