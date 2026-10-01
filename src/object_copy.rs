@@ -116,11 +116,11 @@ fn copy_bytes(input: &mut File, output: &mut File) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn try_reflink(input: &File, output: &File) -> io::Result<bool> {
     use std::os::fd::AsRawFd;
-    // FICLONE from Linux uapi/linux/fs.h; independent inode, shared COW extents.
-    const FICLONE: libc::c_ulong = 0x4004_9409;
+    // libc supplies the target-specific ioctl encoding and request type;
+    // notably musl uses a different request type from glibc.
     // SAFETY: both descriptors remain open for this synchronous ioctl. FICLONE
     // takes a source fd as its integer argument, not a userspace pointer.
-    let result = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, input.as_raw_fd()) };
+    let result = unsafe { libc::ioctl(output.as_raw_fd(), libc::FICLONE, input.as_raw_fd()) };
     if result == 0 {
         return Ok(true);
     }

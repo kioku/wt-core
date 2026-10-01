@@ -289,7 +289,11 @@ For checkouts with at least 1,000 indexed entries, each cleanliness verification
 uses four read-only Git status processes. Git's timestamp and content checks
 remain enabled, and both verification passes still run. These checks do not
 refresh the on-disk index's stat cache; a later Git status may perform that refresh.
-Smaller checkouts use the normal single-process status check.
+Smaller checkouts use the normal single-process status check. Verification always
+reports untracked files regardless of `status.showUntrackedFiles`; checkout also
+disables `core.ignoreStat` for that command so it cannot create assume-unchanged
+entries that conceal tracked edits. Verification disables `core.fsmonitor`
+command-locally so stale monitor results cannot hide tracked or untracked changes.
 
 `--copy-mode auto` (the default) attempts a Linux reflink for each local object
 file, falling back to byte copying when the filesystem does not support it or

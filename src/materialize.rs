@@ -789,6 +789,10 @@ fn checkout_detached(workspace: &Path, sha: &str) -> Result<()> {
         vec![
             os("-c"),
             os("checkout.workers=4"),
+            // Never create assume-unchanged entries through caller preferences:
+            // both verification passes must retain Git's content validation.
+            os("-c"),
+            os("core.ignoreStat=false"),
             os("checkout"),
             os("--detach"),
             os(sha),
@@ -816,7 +820,7 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
     if run_git_success(
         vec![os("symbolic-ref"), os("-q"), os("HEAD")],
         Some(workspace),
-    ) {
+    )? {
         return Err(AppError::invariant(
             "materialized workspace is not detached".to_string(),
         ));
@@ -833,7 +837,16 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
 fn workspace_is_dirty(workspace: &Path) -> Result<bool> {
     let entries = run_git_owned(vec![os("ls-files"), os("-z")], Some(workspace))?;
     if entries.bytes().filter(|byte| *byte == 0).count() < PARALLEL_STATUS_THRESHOLD {
-        let status = run_git_owned(vec![os("status"), os("--porcelain")], Some(workspace))?;
+        let status = run_git_owned(
+            vec![
+                os("-c"),
+                os("core.fsmonitor=false"),
+                os("status"),
+                os("--porcelain"),
+                os("--untracked-files=all"),
+            ],
+            Some(workspace),
+        )?;
         return Ok(!status.is_empty());
     }
 
@@ -859,8 +872,13 @@ fn workspace_is_dirty(workspace: &Path) -> Result<bool> {
 fn status_for_paths(workspace: &Path, paths: &[&str]) -> Result<String> {
     let mut args = vec![
         os("--no-optional-locks"),
+        // Verify contents without trusting a caller's potentially stale monitor.
+        os("-c"),
+        os("core.fsmonitor=false"),
         os("status"),
         os("--porcelain"),
+        // Cleanliness is an invariant, independent of status display preferences.
+        os("--untracked-files=all"),
         os("--"),
     ];
     args.extend(paths.iter().map(os));
@@ -903,17 +921,24 @@ fn run_git_command(mut command: Command, cwd: Option<&Path>) -> Result<String> {
     Err(AppError::git(redact_credentials(&stderr)))
 }
 
-fn run_git_success(args: Vec<OsString>, cwd: Option<&Path>) -> bool {
+/// `symbolic-ref -q` uses exit 1 for a detached HEAD; other failures are errors.
+fn run_git_success(args: Vec<OsString>, cwd: Option<&Path>) -> Result<bool> {
     let mut command = Command::new("git");
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
     }
     git::sanitize_git_environment(&mut command);
-    command
+    let output = command
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .map_err(|e| AppError::git(format!("failed to run git: {e}")))?;
+    match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(AppError::git(redact_credentials(
+            String::from_utf8_lossy(&output.stderr).trim(),
+        ))),
+    }
 }
 
 fn redact_credentials(message: &str) -> String {
@@ -959,4 +984,78 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 fn os(value: impl Into<OsString>) -> OsString {
     value.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanliness_ignores_status_and_stat_preferences() {
+        for count in [1, PARALLEL_STATUS_THRESHOLD] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let path = workspace.path();
+            run_git_owned(vec![os("init")], Some(path)).expect("init");
+            run_git_owned(
+                vec![os("config"), os("status.showUntrackedFiles"), os("no")],
+                Some(path),
+            )
+            .expect("configure status preference");
+            for index in 0..count {
+                fs::write(path.join(format!("file-{index}")), "clean\n").expect("write file");
+            }
+            run_git_owned(vec![os("add"), os(".")], Some(path)).expect("stage");
+            run_git_owned(
+                vec![
+                    os("-c"),
+                    os("user.name=Test"),
+                    os("-c"),
+                    os("user.email=test@example.invalid"),
+                    os("commit"),
+                    os("-m"),
+                    os("fixture"),
+                ],
+                Some(path),
+            )
+            .expect("commit");
+            run_git_owned(
+                vec![os("config"), os("core.ignoreStat"), os("true")],
+                Some(path),
+            )
+            .expect("configure stat preference");
+            let sha =
+                run_git_owned(vec![os("rev-parse"), os("HEAD")], Some(path)).expect("fixture SHA");
+            // Recreate the no-checkout clone state: no index and no tracked files.
+            fs::remove_file(path.join(".git/index")).expect("remove index");
+            for index in 0..count {
+                fs::remove_file(path.join(format!("file-{index}"))).expect("remove file");
+            }
+            checkout_detached(path, &sha).expect("checkout despite stat preference");
+            #[cfg(unix)]
+            let _monitor = {
+                use std::os::unix::fs::PermissionsExt;
+                let monitor = tempfile::tempdir().expect("monitor directory");
+                let hook = monitor.path().join("hook");
+                fs::write(&hook, "#!/bin/sh\nprintf 'token\\0'\n").expect("write monitor hook");
+                fs::set_permissions(&hook, fs::Permissions::from_mode(0o755))
+                    .expect("executable monitor hook");
+                run_git_owned(
+                    vec![os("config"), os("core.fsmonitor"), os(hook)],
+                    Some(path),
+                )
+                .expect("configure monitor");
+                // Prime fsmonitor-valid index bits as an ordinary Git client can.
+                run_git_owned(vec![os("status"), os("--porcelain")], Some(path))
+                    .expect("prime monitor");
+                monitor
+            };
+            assert!(!workspace_is_dirty(path).expect("clean status"));
+            fs::write(path.join("file-0"), "dirty\n").expect("tracked edit");
+            assert!(workspace_is_dirty(path).expect("tracked dirty status"));
+            fs::write(path.join("file-0"), "clean\n").expect("restore tracked file");
+            fs::create_dir(path.join("untracked-directory")).expect("directory");
+            fs::write(path.join("untracked-directory/.hidden"), "untracked").expect("untracked");
+            assert!(workspace_is_dirty(path).expect("dirty status"));
+        }
+    }
 }

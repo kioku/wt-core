@@ -321,11 +321,18 @@ if [ "$1" = rev-parse ] && [ "$2" = HEAD ] && [ ! -e "$WT_MUTATED" ]; then
             printf 'dirty contents\n' > "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 92
             touch -r "$WT_TIMESTAMP" "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 93
             ;;
-        untracked) printf 'untracked' > "$WT_WORKSPACE/$WT_PROBE_PATH-new" || exit 94 ;;
+        untracked)
+            "$WT_REAL_GIT" -C "$WT_WORKSPACE" config status.showUntrackedFiles no || exit 94
+            printf 'untracked' > "$WT_WORKSPACE/$WT_PROBE_PATH-new" || exit 94
+            ;;
         delete) rm "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 95 ;;
         staged) "$WT_REAL_GIT" -C "$WT_WORKSPACE" mv alpha sierra-staged || exit 96 ;;
         symlink) rm "$WT_WORKSPACE/alpha" && ln -s fox "$WT_WORKSPACE/alpha" || exit 97 ;;
     esac
+fi
+if [ "$1" = symbolic-ref ] && [ "$WT_PROBE_MODE" = detached_failure ]; then
+    echo 'injected detached check failure' >&2
+    exit 99
 fi
 if [ "$1" = --no-optional-locks ]; then
     printf 'worker\n' >> "$WT_WORKERS" || exit 98
@@ -349,6 +356,7 @@ exec "$WT_REAL_GIT" "$@"
             ("staged", "alpha"),
             ("symlink", "alpha"),
             ("failure", "alpha"),
+            ("detached_failure", "alpha"),
         ])
         .collect();
     for (index, (mode, probe_path)) in probes.into_iter().enumerate() {
@@ -377,6 +385,8 @@ exec "$WT_REAL_GIT" "$@"
         let assertion = command.assert().failure();
         if mode == "failure" {
             assertion.stderr(predicate::str::contains("injected status worker failure"));
+        } else if mode == "detached_failure" {
+            assertion.stderr(predicate::str::contains("injected detached check failure"));
         } else {
             assertion.stderr(predicate::str::contains("not clean"));
         }
