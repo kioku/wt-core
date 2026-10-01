@@ -292,7 +292,8 @@ refresh the on-disk index's stat cache; a later Git status may perform that refr
 Smaller checkouts use the normal single-process status check. Verification always
 reports untracked files regardless of `status.showUntrackedFiles`; checkout also
 disables `core.ignoreStat` for that command so it cannot create assume-unchanged
-entries that conceal tracked edits.
+entries that conceal tracked edits. Verification disables `core.fsmonitor`
+command-locally so stale monitor results cannot hide tracked or untracked changes.
 
 Local sources are copied without hardlinks or object alternates, so the workspace
 remains independent of later source pruning or removal. Sources with object

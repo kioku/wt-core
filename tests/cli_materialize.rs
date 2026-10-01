@@ -330,6 +330,10 @@ if [ "$1" = rev-parse ] && [ "$2" = HEAD ] && [ ! -e "$WT_MUTATED" ]; then
         symlink) rm "$WT_WORKSPACE/alpha" && ln -s fox "$WT_WORKSPACE/alpha" || exit 97 ;;
     esac
 fi
+if [ "$1" = symbolic-ref ] && [ "$WT_PROBE_MODE" = detached_failure ]; then
+    echo 'injected detached check failure' >&2
+    exit 99
+fi
 if [ "$1" = --no-optional-locks ]; then
     printf 'worker\n' >> "$WT_WORKERS" || exit 98
     if [ "$WT_PROBE_MODE" = failure ]; then
@@ -352,6 +356,7 @@ exec "$WT_REAL_GIT" "$@"
             ("staged", "alpha"),
             ("symlink", "alpha"),
             ("failure", "alpha"),
+            ("detached_failure", "alpha"),
         ])
         .collect();
     for (index, (mode, probe_path)) in probes.into_iter().enumerate() {
@@ -380,6 +385,8 @@ exec "$WT_REAL_GIT" "$@"
         let assertion = command.assert().failure();
         if mode == "failure" {
             assertion.stderr(predicate::str::contains("injected status worker failure"));
+        } else if mode == "detached_failure" {
+            assertion.stderr(predicate::str::contains("injected detached check failure"));
         } else {
             assertion.stderr(predicate::str::contains("not clean"));
         }
