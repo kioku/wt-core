@@ -1780,3 +1780,83 @@ exec "$WT_REAL_GIT" "$@"
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn managed_existing_checkout_rejects_hook_object_tree_mutations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = fixtures::ClonedTestRepo::new();
+    let sha = git_output(&["rev-parse", "HEAD"], &repo.path());
+    for mode in ["auto", "copy"] {
+        for mutation in ["alternates", "symlink", "fifo"] {
+            let root = tempfile::tempdir().expect("fixture");
+            let workspace = root.path().join("workspace");
+            std::fs::create_dir(&workspace).expect("caller-owned destination");
+            let identity = same_file::Handle::from_path(&workspace).expect("root identity");
+            std::fs::set_permissions(&workspace, std::fs::Permissions::from_mode(0o750))
+                .expect("destination permissions");
+            let home = root.path().join("home");
+            let template = root.path().join("template");
+            std::fs::create_dir(&home).expect("isolated home");
+            std::fs::create_dir_all(template.join("hooks")).expect("template hooks");
+            std::fs::write(
+                home.join(".gitconfig"),
+                format!("[init]\n\ttemplateDir = {}\n", template.display()),
+            )
+            .expect("isolated template config");
+            let hook = template.join("hooks/post-checkout");
+            // The real template hook only mutates the final workspace, never
+            // the cache or privately verified snapshot.
+            std::fs::write(
+                &hook,
+                r#"#!/bin/sh
+[ "$PWD" = "$WT_HOOK_WORKSPACE" ] || exit 0
+case "$WT_HOOK_MUTATION" in
+    alternates) printf '%s\n' "$WT_HOOK_OBJECTS" > .git/objects/info/alternates ;;
+    symlink) ln -s "$WT_HOOK_OBJECTS" .git/objects/hook-entry ;;
+    fifo) mkfifo .git/objects/hook-entry ;;
+esac
+"#,
+            )
+            .expect("template hook");
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755))
+                .expect("executable hook");
+            let error = if mutation == "alternates" {
+                "local source must not use object alternates"
+            } else {
+                "object tree must not contain symlinks or special files"
+            };
+            managed_command(&repo, &sha, &root.path().join("cache"), &workspace)
+                .args(["--copy-mode", mode])
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", home.join("xdg"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("WT_HOOK_WORKSPACE", &workspace)
+                .env("WT_HOOK_MUTATION", mutation)
+                .env("WT_HOOK_OBJECTS", repo.path().join(".git/objects"))
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains(error));
+            assert_eq!(
+                identity,
+                same_file::Handle::from_path(&workspace).expect("preserved root")
+            );
+            assert_eq!(
+                std::fs::metadata(&workspace)
+                    .expect("root metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o750
+            );
+            assert!(workspace.join(".git").is_dir(), "never clean caller output");
+            let entry = if mutation == "alternates" {
+                "info/alternates"
+            } else {
+                "hook-entry"
+            };
+            assert!(std::fs::symlink_metadata(workspace.join(".git/objects").join(entry)).is_ok());
+        }
+    }
+}

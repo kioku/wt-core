@@ -498,6 +498,9 @@ fn materialize_from_cache(
     drop(lock);
     let identity = if let Some(root) = existing_root {
         checkout_detached(&staged, &request.sha)?;
+        // Checkout hooks can invalidate the snapshot's pre-checkout safety.
+        // Revalidate before using it as an independent transfer source.
+        independent_local_source(&staged.join(".git"))?;
         verify_workspace(&staged, &request.sha)?;
         populate_verified_checkout(&staged, &workspace, &request.sha, request.copy_mode, &root)?;
         Some(root)
@@ -971,6 +974,9 @@ fn populate_verified_checkout(
     ensure_existing_workspace_available(workspace)?;
     clone_independent_checkout(&checkout.join(".git"), workspace, sha, copy_mode)?;
     verify_new_workspace_identity(workspace, root)?;
+    // Final checkout hooks run after object copying and may recreate alternates
+    // or unsafe entries that HEAD/cleanliness verification does not inspect.
+    independent_local_source(&workspace.join(".git"))?;
     Ok(())
 }
 
