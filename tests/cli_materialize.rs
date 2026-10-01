@@ -321,7 +321,10 @@ if [ "$1" = rev-parse ] && [ "$2" = HEAD ] && [ ! -e "$WT_MUTATED" ]; then
             printf 'dirty contents\n' > "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 92
             touch -r "$WT_TIMESTAMP" "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 93
             ;;
-        untracked) printf 'untracked' > "$WT_WORKSPACE/$WT_PROBE_PATH-new" || exit 94 ;;
+        untracked)
+            "$WT_REAL_GIT" -C "$WT_WORKSPACE" config status.showUntrackedFiles no || exit 94
+            printf 'untracked' > "$WT_WORKSPACE/$WT_PROBE_PATH-new" || exit 94
+            ;;
         delete) rm "$WT_WORKSPACE/$WT_PROBE_PATH" || exit 95 ;;
         staged) "$WT_REAL_GIT" -C "$WT_WORKSPACE" mv alpha sierra-staged || exit 96 ;;
         symlink) rm "$WT_WORKSPACE/alpha" && ln -s fox "$WT_WORKSPACE/alpha" || exit 97 ;;

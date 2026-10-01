@@ -755,6 +755,10 @@ fn checkout_detached(workspace: &Path, sha: &str) -> Result<()> {
         vec![
             os("-c"),
             os("checkout.workers=4"),
+            // Never create assume-unchanged entries through caller preferences:
+            // both verification passes must retain Git's content validation.
+            os("-c"),
+            os("core.ignoreStat=false"),
             os("checkout"),
             os("--detach"),
             os(sha),
@@ -799,7 +803,10 @@ fn verify_workspace(workspace: &Path, sha: &str) -> Result<String> {
 fn workspace_is_dirty(workspace: &Path) -> Result<bool> {
     let entries = run_git_owned(vec![os("ls-files"), os("-z")], Some(workspace))?;
     if entries.bytes().filter(|byte| *byte == 0).count() < PARALLEL_STATUS_THRESHOLD {
-        let status = run_git_owned(vec![os("status"), os("--porcelain")], Some(workspace))?;
+        let status = run_git_owned(
+            vec![os("status"), os("--porcelain"), os("--untracked-files=all")],
+            Some(workspace),
+        )?;
         return Ok(!status.is_empty());
     }
 
@@ -827,6 +834,8 @@ fn status_for_paths(workspace: &Path, paths: &[&str]) -> Result<String> {
         os("--no-optional-locks"),
         os("status"),
         os("--porcelain"),
+        // Cleanliness is an invariant, independent of status display preferences.
+        os("--untracked-files=all"),
         os("--"),
     ];
     args.extend(paths.iter().map(os));
@@ -925,4 +934,60 @@ fn elapsed_ms(started: Instant) -> u64 {
 
 fn os(value: impl Into<OsString>) -> OsString {
     value.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cleanliness_ignores_status_and_stat_preferences() {
+        for count in [1, PARALLEL_STATUS_THRESHOLD] {
+            let workspace = tempfile::tempdir().expect("workspace");
+            let path = workspace.path();
+            run_git_owned(vec![os("init")], Some(path)).expect("init");
+            run_git_owned(
+                vec![os("config"), os("status.showUntrackedFiles"), os("no")],
+                Some(path),
+            )
+            .expect("configure status preference");
+            for index in 0..count {
+                fs::write(path.join(format!("file-{index}")), "clean\n").expect("write file");
+            }
+            run_git_owned(vec![os("add"), os(".")], Some(path)).expect("stage");
+            run_git_owned(
+                vec![
+                    os("-c"),
+                    os("user.name=Test"),
+                    os("-c"),
+                    os("user.email=test@example.invalid"),
+                    os("commit"),
+                    os("-m"),
+                    os("fixture"),
+                ],
+                Some(path),
+            )
+            .expect("commit");
+            run_git_owned(
+                vec![os("config"), os("core.ignoreStat"), os("true")],
+                Some(path),
+            )
+            .expect("configure stat preference");
+            let sha =
+                run_git_owned(vec![os("rev-parse"), os("HEAD")], Some(path)).expect("fixture SHA");
+            // Recreate the no-checkout clone state: no index and no tracked files.
+            fs::remove_file(path.join(".git/index")).expect("remove index");
+            for index in 0..count {
+                fs::remove_file(path.join(format!("file-{index}"))).expect("remove file");
+            }
+            checkout_detached(path, &sha).expect("checkout despite stat preference");
+            assert!(!workspace_is_dirty(path).expect("clean status"));
+            fs::write(path.join("file-0"), "dirty\n").expect("tracked edit");
+            assert!(workspace_is_dirty(path).expect("tracked dirty status"));
+            fs::write(path.join("file-0"), "clean\n").expect("restore tracked file");
+            fs::create_dir(path.join("untracked-directory")).expect("directory");
+            fs::write(path.join("untracked-directory/.hidden"), "untracked").expect("untracked");
+            assert!(workspace_is_dirty(path).expect("dirty status"));
+        }
+    }
 }
